@@ -256,18 +256,26 @@ class TerrainMotion(CommandTerm):
         # 当前地形下失败较多的动作获得更高采样权重，同时保留 20% 均匀采样。
         weights = 1 + self.stratum_failure[family, level]
         weights = 0.8 * weights / weights.sum(-1, keepdim=True) + 0.2 / 40
-        selected = torch.multinomial(weights, 1).squeeze(-1)
+        cases = getattr(self, "evaluation_cases", None)
+        selected = torch.multinomial(weights, 1).squeeze(-1) if cases is None else cases["motion"][ids]
         self.motion._assigned_env_motion_selection[ids] = selected
         # 均匀采样源动作起始帧，预留完整的 11 帧未来窗口；50 Hz 帧索引换算为秒。
         available = self.label_lengths[selected] - 11
-        self.motion._motion_buffer_start_time_s[ids] = (
-            torch.rand(len(ids), device=self.device) * available
-        ).long() / 50
+        if cases is None:
+            self.motion._motion_buffer_start_time_s[ids] = (
+                torch.rand(len(ids), device=self.device) * available
+            ).long() / 50
+        else:
+            self.motion._motion_buffer_start_time_s[ids] = cases["frame"][ids].float() / 50
         self.motion_ids[ids] = selected
         self.reference._reset_data(ids)
         raw = self.reference.get_init_reference_state(ids)
         # 仅随机 yaw；设置 XY 偏移，使选中起始帧的根部落在地形块原点。
-        yaw = torch.empty(len(ids), device=self.device).uniform_(-torch.pi, torch.pi)
+        yaw = (
+            torch.empty(len(ids), device=self.device).uniform_(-torch.pi, torch.pi)
+            if cases is None
+            else cases["yaw"][ids]
+        )
         self.rotation[ids] = quat_from_euler_xyz(yaw * 0, yaw * 0, yaw)
         local = raw.base_pos_w - self.env.scene.env_origins[ids]
         self.offset[ids] = self.env.scene.env_origins[ids]
