@@ -10,7 +10,7 @@ from torch.nn import functional as F
 from .models.terrain import TerrainActor
 
 
-def load_actor(path, device):
+def load_actor(path, device, terrain_gate=None):
     checkpoint = torch.load(path, map_location=device, weights_only=True)
     actor = TerrainActor().to(device).eval()
     state = {
@@ -34,6 +34,8 @@ def load_actor(path, device):
     elif checkpoint["infos"]["schema"] != "pgmt-lafan-terrain-v1":
         raise ValueError("Unsupported PGMT checkpoint schema")
     actor.load_state_dict(state, strict=True)
+    if terrain_gate is not None:
+        actor.terrain_gate.fill_(terrain_gate)
 
     def policy(obs):
         normalized = (obs - mean) / (std + 0.01)
@@ -66,13 +68,15 @@ def make_cases(command, levels, seed, steps, motion_ids=None):
 
 
 @torch.inference_mode()
-def evaluate(env, checkpoints, output, *, levels=(0, 3, 6), seed=17, steps=500, motion_ids=None):
+def evaluate(env, checkpoints, output, *, levels=(0, 3, 6), seed=17, steps=500, motion_ids=None, terrain_gate=None):
     """Evaluate first episodes only; reset frames never count as successful tracking."""
     native = env.unwrapped
     c = native.command_manager.get_term("motion")
     terrain = native.scene.terrain
     if terrain.cfg.terrain_type != "generator" or c.cfg.enable_terrain_curriculum:
         raise ValueError("Benchmark requires generated terrain with curriculum disabled")
+    if terrain_gate not in (None, 0.0, 1.0):
+        raise ValueError("The perception ablation gate must be zero or one")
     cases = make_cases(c, levels, seed, steps, motion_ids)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
@@ -93,7 +97,7 @@ def evaluate(env, checkpoints, output, *, levels=(0, 3, 6), seed=17, steps=500, 
     reports = []
     try:
         for checkpoint in checkpoints:
-            policy = load_actor(checkpoint, native.device)
+            policy = load_actor(checkpoint, native.device, terrain_gate)
             results = []
             for offset in range(0, len(cases), native.num_envs):
                 batch = cases[offset : offset + native.num_envs]
@@ -150,6 +154,7 @@ def evaluate(env, checkpoints, output, *, levels=(0, 3, 6), seed=17, steps=500, 
                     horizon=steps,
                     cases=len(cases),
                     simulator="PGMT native Newton/MJWarp; terrain-only rays",
+                    terrain_gate_override=terrain_gate,
                 ),
                 aggregate={
                     key: float(np.mean([r[key] for r in results]))

@@ -26,6 +26,11 @@ class WorldModelRunner(TerrainRunner):
     def __init__(self, env, train_cfg, log_dir=None, device="cpu"):
         if dist.is_initialized():
             raise NotImplementedError("Scheme-one distributed gradient synchronization is not yet implemented")
+        if train_cfg.get("resume"):
+            # A complete scheme-one checkpoint must not depend on its old initialization file.
+            train_cfg = dict(train_cfg, warm_start=None, stage2_initialization=None)
+        elif train_cfg.get("warm_start") and train_cfg.get("stage2_initialization"):
+            raise ValueError("Choose stage-one warm-start or stage-two initialization, not both")
         super().__init__(env, train_cfg, log_dir, device)
         self.wm_cfg = dict(
             hidden=512,
@@ -64,7 +69,11 @@ class WorldModelRunner(TerrainRunner):
             start = time.monotonic()
             metrics = self.fit_world_model(iteration)
             losses, stats = ppo_update(iteration)
-            if iteration >= self.wm_cfg["warmup"] and metrics["wm_validation"] < self.wm_cfg["validation_threshold"]:
+            if (
+                iteration >= self.wm_cfg["warmup"]
+                and metrics["wm_validation"] < self.wm_cfg["validation_threshold"]
+                and metrics["validation_valid_fraction"] >= 0.5
+            ):
                 for _ in range(self.wm_cfg["actor_updates"]):
                     metrics.update(self.imagine())
             metrics["model_update_seconds"] = time.monotonic() - start
@@ -202,8 +211,36 @@ class WorldModelRunner(TerrainRunner):
             self.wm_optimizer.step()
             self.wm_updates += 1
         with torch.no_grad():
-            validation = self.wm_loss(self.sample(self.wm_cfg["horizon"], validation=True))
-        return dict(wm_loss=float(loss.detach()), wm_validation=float(validation), wm_updates=self.wm_updates)
+            sequence = self.sample(self.wm_cfg["horizon"], validation=True)
+            validation = self.wm_loss(sequence)
+            diagnostics = self.validation_errors(sequence)
+        return dict(
+            wm_loss=float(loss.detach()), wm_validation=float(validation), wm_updates=self.wm_updates, **diagnostics
+        )
+
+    @torch.no_grad()
+    def validation_errors(self, sequence):
+        """Physical end-of-horizon errors, using the same held-out open-loop actions."""
+        state, contact = sequence[0]["state"], sequence[0]["contact"]
+        alive = state.new_ones(state.shape[0])
+        for data in sequence[:-1]:
+            heights, valid = self.heightfield.local(state[:, :3], yaw_angle(state[:, 3:7]))
+            alive = alive * valid
+            state, contact = self.wm.step(state, data["action"], data["previous_action"], contact, heights)
+            error = self.wm.target(state, data["next_state"])
+            weight = alive
+            alive = alive * (~data["done"])
+        denominator = weight.sum().clamp_min(1)
+        return {
+            "validation_root_rmse_m": float(((error[:, :3].square().mean(-1) * weight).sum() / denominator).sqrt()),
+            "validation_rotation_rmse_rad": float(
+                ((error[:, 3:6].square().sum(-1) * weight).sum() / denominator).sqrt()
+            ),
+            "validation_joint_rmse_rad": float(
+                ((error[:, 12:41].square().mean(-1) * weight).sum() / denominator).sqrt()
+            ),
+            "validation_valid_fraction": float(weight.mean()),
+        }
 
     def imagine(self):
         self.wm.eval().requires_grad_(False)

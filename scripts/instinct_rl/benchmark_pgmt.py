@@ -19,6 +19,9 @@ def main():
     parser.add_argument("--motions", nargs="+", type=int)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--terrain-gate", type=float, choices=[0.0, 1.0], help="Override terrain attention for ablation"
+    )
     args = parser.parse_args()
     task = "Instinct-PGMT-Terrain-G1-Newton-v0"
     cfg, _ = resolve_train_cfg(task, [])
@@ -40,6 +43,7 @@ def main():
                 seed=args.seed,
                 steps=args.steps,
                 motion_ids=args.motions,
+                terrain_gate=args.terrain_gate,
             )
         finally:
             env.close()

@@ -160,3 +160,71 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 bash scripts/pgmt/train_terrain_gpu8.sh \
 Use `--resume --load_run /absolute/path/to/stage_two/run --checkpoint model_N.pt` for stage-two resume,
 without `agent.warm_start`. `scripts/pgmt/validate_terrain.py` checks channel migration, critic gradients,
 grouped returns, terminal bootstrap, exact checkpoint reload and multi-rank parameter/normalizer sync.
+
+## Scheme one: differentiable terrain imagination
+
+`Instinct-PGMT-WorldModel-G1-Newton-v0` keeps the terrain actor, four-value critic and all 27 real
+reward terms. It adds SuperMimic-style frame-local delta dynamics and short imagined actor updates
+after each native PPO update. This is a hybrid implementation, not a reproduction of SuperMimic's
+complete optimizer or a compatible loader for its flat-ground world-model weights.
+
+The complete path is action → predicted root pose/joints → bilinearly sampled local height map →
+next policy observation → next action. `heightfield.py` bakes the known static mesh once and shares
+one world raster across the batch. Gradients flow through sampling coordinates (XY, Z and yaw),
+not through the mesh or Newton. Keep `global_world_only=True` on the Newton height scanner: otherwise
+the current backend also hits robot geometry. The raster uses 5 cm cells; the policy retains its
+existing 21 x 21 scan at 10 cm spacing and exact native flattening order. Bilinear smoothing around
+sharp edges is an approximation, and finite-map validity masks stop invalid imagined objectives.
+
+The 71-D state uses pelvis XYZ, XYZW orientation, world linear/angular velocity, and 29 PGMT-ordered
+joint positions/velocities. The WM predicts a normalized 70-D local delta and 14 contact probabilities.
+Previous action, contact belief, proprioceptive history and the support-height filter are carried
+through imagination. Reference windows remain exogenous; orientation and tracking-error corrections
+are rebuilt from the predicted state. Contact probabilities help model dynamics; contact rewards
+still use real PPO. The imagined reward is a differentiable tracking/limits/action-rate surrogate,
+not the exact sum of real contact rewards.
+
+Default training uses three-step supervised rollouts, four-step actor rollouts, 50 warm-up iterations,
+16 WM minibatches per PPO iteration and a frozen initial actor anchor. Every eighth environment is
+held out of WM fitting and normalizer estimation. A held-out four-step normalized loss below 1 gates
+imagined policy updates. This gate is a practical error screen, not a guarantee against model bias.
+`world-model.jsonl` records losses, gradient norms and the actual count of imagination updates.
+
+Start from a native stage-one checkpoint:
+
+```bash
+export PGMT_LAFAN_DATA=/absolute/path/to/lafan1_umr_heft_pgmt40
+python scripts/instinct_rl/train.py --task Instinct-PGMT-WorldModel-G1-Newton-v0 \
+  --device cuda:0 --viz none --num_envs 512 --max_iterations 400 --run_name heightmap-from-stage1 \
+  --logroot /absolute/path/to/InstinctLab-local/scheme1 \
+  agent.warm_start=/absolute/path/to/model_2700.pt
+```
+
+Alternatively, continue a terrain policy with `agent.stage2_initialization=/absolute/path/to/model_9600.pt`
+instead of `agent.warm_start`. This preserves actor/critic/normalizers, source learning rate and terrain
+gate, while starting new optimizers and WM. It is different from proving equivalent convergence from
+stage one. The actor used for inference is unchanged and does not need the WM, global raster or
+privileged contact state; it still needs the same local height map and reference/proprioceptive inputs.
+
+Scheme-one checkpoints additionally contain WM, its normalization statistics/optimizer, teacher actor,
+imagination optimizer, update counts and configuration. Resume uses the usual `--resume --load_run ...
+--checkpoint model_N.pt`, matching environment count, WM settings and gate ramp; omit initialization
+overrides on resume. Physical episodes and replay restart together. Distributed WM synchronization is
+not implemented: use one GPU, rather than silently running independent models on multiple ranks.
+
+The benchmark fixes motion, start frame, yaw, terrain family and level for every case, records only
+the first episode and captures failure metrics before auto-reset. Failure and tile exit are reported
+separately. Run multiple checkpoints in one invocation to use identical environment randomization:
+
+```bash
+python scripts/instinct_rl/benchmark_pgmt.py --checkpoint /absolute/path/to/model_9600.pt \
+  /absolute/path/to/scheme1/model_400.pt --output /absolute/path/to/InstinctLab-local/comparison \
+  --num-envs 120 --steps 500 --levels 0 3 6 --seed 17
+```
+
+Repeat with another seed for new start frames/yaws and terrain realization. These remain the same
+40 motion clips, not unseen-motion generalization. `--terrain-gate 0` disables the terrain attention
+tokens for a perception ablation; use a separate output directory. Inspect tracking error, failure,
+tile exit and slip together, rather than selecting by reward alone. Result JSON includes checkpoint
+SHA-256 and per-case measurements. Run geometry, finite-difference, history and dynamics contracts with
+`python -m unittest discover -s source/instinctlab/test -p test_pgmt_world_model.py`.

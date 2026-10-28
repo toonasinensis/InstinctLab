@@ -4,11 +4,11 @@ import torch
 import unittest
 
 from isaaclab.sensors.ray_caster.patterns import GridPatternCfg, grid_pattern
-from isaaclab.utils.math import quat_apply, quat_mul, yaw_quat
 
 from instinctlab.tasks.shadowing.pgmt.heightfield import HeightField
 from instinctlab.tasks.shadowing.pgmt.imagination import pack_history, raw_history
 from instinctlab.tasks.shadowing.pgmt.world_model import TerrainWorldModel, rotation_increment
+from instinctlab.tasks.shadowing.pgmt.world_model_runner import WorldModelRunner
 
 
 class GeometryTest(unittest.TestCase):
@@ -54,8 +54,43 @@ class GeometryTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(gradient).all())
         self.assertTrue((gradient.abs() > 1e-5).all())
 
+    def test_frozen_world_model_preserves_multistep_input_gradients(self):
+        torch.manual_seed(9)
+        model = TerrainWorldModel(hidden=16).double()
+        # A fitted model has a nonzero dynamics Jacobian; the constructor deliberately
+        # initializes its output head to zero before any supervised updates.
+        torch.nn.init.normal_(model.dynamics.weight, std=0.002)
+        model.requires_grad_(False)
+        initial = torch.zeros(1, 71, dtype=torch.float64)
+        initial[:, 2], initial[:, 6] = 0.8, 1.0
+
+        def future_perception(action):
+            state = initial
+            previous = torch.zeros_like(action)
+            contact = torch.zeros(1, 14, dtype=torch.float64)
+            for _ in range(3):
+                heights, _ = self.field.local(state[:, :3], state[:, 3] * 0)
+                state, contact = model.step(state, action, previous, contact, heights)
+                previous = action
+            heights, _ = self.field.local(state[:, :3], state[:, 3] * 0)
+            return heights.square().mean()
+
+        action = torch.randn(1, 29, dtype=torch.float64, requires_grad=True) * 0.1
+        derivative = torch.autograd.grad(future_perception(action), action)[0]
+        component = derivative.abs().argmax().item()
+        perturbation = torch.zeros_like(action)
+        perturbation[0, component] = 1e-5
+        numerical = (future_perception(action + perturbation) - future_perception(action - perturbation)) / 2e-5
+        self.assertGreater(derivative.abs().max().item(), 1e-6)
+        torch.testing.assert_close(derivative[0, component], numerical, atol=1e-9, rtol=1e-5)
+        self.assertTrue(all(p.grad is None for p in model.parameters()))
+
 
 class DynamicsTest(unittest.TestCase):
+    def test_ambiguous_initialization_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "not both"):
+            WorldModelRunner(None, dict(warm_start="stage1.pt", stage2_initialization="stage2.pt"))
+
     def test_history_term_order(self):
         history = torch.randn(4, 10, 93)
         torch.testing.assert_close(raw_history(pack_history(history)), history)
