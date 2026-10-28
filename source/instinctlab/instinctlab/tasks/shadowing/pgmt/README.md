@@ -236,3 +236,35 @@ tokens for a perception ablation; use a separate output directory. Inspect track
 tile exit and slip together, rather than selecting by reward alone. Result JSON includes checkpoint
 SHA-256 and per-case measurements. Run geometry, finite-difference, history and dynamics contracts with
 `python -m unittest discover -s source/instinctlab/test -p test_pgmt_world_model.py`.
+
+### Validated local candidate, 2026-10-29
+
+The selected local checkpoint uses surrogate v2 and `agent.world_model.anchor=10.0`. It was initialized
+from the existing PGMT terrain PPO `model_9600`, then selected after 4,032 WM optimizer steps and 202
+imagination updates. This establishes a working second-stage refinement of that terrain policy;
+the separate short warm-start run from flat `model_2700` did not reach the terrain baseline.
+
+Native Newton evaluation used the local UMR HEFT retargeted 40 clips, five terrain families, L0/L3/L6,
+ten-second episodes and seeds 17/23: 1,200 matched cases per policy. Seeds were used during development,
+not reserved as a final untouched test set. Aggregate results:
+
+| Metric | Existing terrain PPO | Selected scheme one |
+| --- | ---: | ---: |
+| Horizon completed | 77.17% | 77.75% |
+| Failure | 5.92% | 5.17% |
+| Tile exit | 17.00% | 17.08% |
+| Joint RMSE / rad | 0.15261 | 0.15323 |
+| Aligned body error / m | 0.06183 | 0.06367 |
+| Contact-weighted slip indicator | 0.04624 | 0.04780 |
+
+Both seeds individually passed the declared engineering limits: at most 3 percentage points less
+completion, 2 points more failure, 5% more joint/body error, and 10% more slip. This supports comparable
+performance on this protocol, not uniform improvement, a statistical equivalence proof, improved sample
+efficiency, or robot deployment. The selected actor also completed one ten-second standalone MuJoCo
+stairs-down replay without reset; that demonstration has different physics and is not pooled into
+the native benchmark.
+
+Artifacts live outside Git under `../InstinctLab-local/checkpoints/scheme1_heightmap/`: full
+`model_best.pt`, saved run parameters, SHA/provenance, replay video, and `resume.sh` / `benchmark.sh`.
+The complete per-case results and failed experiments remain under `../InstinctLab-local/scheme1/`.
+To resume this selected checkpoint, retain 512 environments and `agent.world_model.anchor=10.0`.
