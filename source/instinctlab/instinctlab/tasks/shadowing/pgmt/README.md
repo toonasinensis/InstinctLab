@@ -266,8 +266,14 @@ python scripts/instinct_rl/benchmark_pgmt.py --checkpoint /absolute/path/to/mode
   --num-envs 120 --steps 500 --levels 0 3 6 --seed 17
 ```
 
-Repeat with another seed for new start frames/yaws and terrain realization. These remain the same
-40 motion clips, not unseen-motion generalization. `--terrain-gate 0` disables the terrain attention
+The benchmark disables visualization while keeping the terrain height scanner active. The default
+Newton/MJWarp configuration does not guarantee deterministic physics: identical seeds and case
+descriptors do not imply bitwise-identical rollouts, even within one process. Repeat evaluations
+when differences are small, and retain every repeat rather than selecting the best result.
+
+Repeat with another seed for new start frames, yaws, terrain columns and startup randomization.
+The generated terrain mesh uses its separate, fixed default seed of 42. These remain the same
+40 motion clips, not unseen-motion or unseen-terrain generalization. `--terrain-gate 0` disables the terrain attention
 tokens for a perception ablation; use a separate output directory. Inspect tracking error, failure,
 tile exit and slip together, rather than selecting by reward alone. Result JSON includes checkpoint
 SHA-256 and per-case measurements. Run geometry, finite-difference, history and dynamics contracts with

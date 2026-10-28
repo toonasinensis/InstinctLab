@@ -29,7 +29,7 @@ def main():
     cfg.seed = args.seed
     cfg.commands.motion.enable_terrain_curriculum = False
     cfg.observations.policy.enable_corruption = False
-    with launch_simulation(cfg, dict(device=args.device, viz="none")):
+    with launch_simulation(cfg, dict(device=args.device, visualizer="none")):
         from instinctlab.tasks.shadowing.pgmt.benchmark import evaluate
         from instinctlab.utils.wrappers.instinct_rl.vecenv_wrapper import InstinctRlVecEnvWrapper
 
