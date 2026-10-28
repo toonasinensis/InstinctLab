@@ -276,7 +276,14 @@ The generated terrain mesh uses its separate, fixed default seed of 42. These re
 40 motion clips, not unseen-motion or unseen-terrain generalization. `--terrain-gate 0` disables the terrain attention
 tokens for a perception ablation; use a separate output directory. Inspect tracking error, failure,
 tile exit and slip together, rather than selecting by reward alone. Result JSON includes checkpoint
-SHA-256 and per-case measurements. Run geometry, finite-difference, history and dynamics contracts with
+SHA-256 and per-case measurements. Global root XY error and both raw-reference and position-corrected
+planar velocity errors are also recorded before reset. These are the time RMS of the vector norm
+within each first episode, in metres or metres per second. Actual/reference planar speeds are time
+means; aggregate values average the per-case measurements. Unlike the aligned body-position metric,
+root XY error measures following the placed global trajectory. Compare these diagnostics alongside
+failure and episode length: early termination changes the observed time interval, and speed magnitude
+alone does not measure velocity tracking. These additional fields do not alter the original metrics.
+Run geometry, finite-difference, history and dynamics contracts with
 `python -m unittest discover -s source/instinctlab/test -p test_pgmt_world_model.py`.
 
 `scripts/pgmt/validate_world_model.py` provides a bounded real-simulator test: four updates, exact

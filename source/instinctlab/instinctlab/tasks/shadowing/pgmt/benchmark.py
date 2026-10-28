@@ -83,12 +83,31 @@ def evaluate(env, checkpoints, output, *, levels=(0, 3, 6), seed=17, steps=500, 
     (output / "cases.json").write_text(json.dumps(cases, indent=2) + "\n")
     original_reward = native.reward_manager.compute
     measurement = {}
+    measurement_names = (
+        "joint_mse",
+        "body_error",
+        "slip",
+        "root_xy_mse",
+        "corrected_planar_velocity_mse",
+        "raw_planar_velocity_mse",
+        "actual_planar_speed",
+        "reference_planar_speed",
+    )
 
     def compute_reward(dt):
         result = original_reward(dt)
         measurement["joint_mse"] = (c.joint_pos - c.robot_joint_pos).square().mean(-1).clone()
         measurement["body_error"] = (c.body_pos_relative_w - c.robot_body_pos_w).norm(dim=-1).mean(-1).clone()
         measurement["slip"] = c.contacts.terrain_term("slip").clone()
+        measurement["root_xy_mse"] = (c.anchor_pos_w[:, :2] - c.robot_anchor_pos_w[:, :2]).square().sum(-1)
+        actual_velocity = c.robot_anchor_lin_vel_w[:, :2]
+        reference_velocity = c.body_lin_vel_w[:, c.motion_anchor_body_index, :2]
+        measurement["corrected_planar_velocity_mse"] = (
+            (c.corrected_velocity_w[:, :2] - actual_velocity).square().sum(-1)
+        )
+        measurement["raw_planar_velocity_mse"] = (reference_velocity - actual_velocity).square().sum(-1)
+        measurement["actual_planar_speed"] = actual_velocity.norm(dim=-1)
+        measurement["reference_planar_speed"] = reference_velocity.norm(dim=-1)
         measurement["failed"] = native.reset_terminated.clone()
         measurement["exited"] = native.termination_manager.get_term("tile_exit").clone()
         return result
@@ -114,7 +133,7 @@ def evaluate(env, checkpoints, output, *, levels=(0, 3, 6), seed=17, steps=500, 
                 obs, _ = env.reset()
                 alive = torch.arange(native.num_envs, device=native.device) < len(batch)
                 count = torch.zeros(native.num_envs, device=native.device)
-                totals = {key: torch.zeros_like(count) for key in ("return", "joint_mse", "body_error", "slip")}
+                totals = {key: torch.zeros_like(count) for key in ("return", *measurement_names)}
                 failed, exited = torch.zeros_like(alive), torch.zeros_like(alive)
                 for _ in range(steps):
                     obs, reward, done, _ = env.step(policy(obs))
@@ -122,7 +141,7 @@ def evaluate(env, checkpoints, output, *, levels=(0, 3, 6), seed=17, steps=500, 
                         raise FloatingPointError("Nonfinite native evaluation")
                     count += alive
                     totals["return"] += reward.sum(-1) * alive
-                    for key in ("joint_mse", "body_error", "slip"):
+                    for key in measurement_names:
                         totals[key] += measurement[key] * alive
                     failed |= measurement["failed"] & alive
                     exited |= measurement["exited"] & alive
@@ -142,6 +161,13 @@ def evaluate(env, checkpoints, output, *, levels=(0, 3, 6), seed=17, steps=500, 
                             joint_rmse=float((totals["joint_mse"][i] / n).sqrt()),
                             body_error=float(totals["body_error"][i] / n),
                             slip=float(totals["slip"][i] / n),
+                            root_xy_rmse=float((totals["root_xy_mse"][i] / n).sqrt()),
+                            corrected_planar_velocity_rmse=float(
+                                (totals["corrected_planar_velocity_mse"][i] / n).sqrt()
+                            ),
+                            raw_planar_velocity_rmse=float((totals["raw_planar_velocity_mse"][i] / n).sqrt()),
+                            actual_planar_speed=float(totals["actual_planar_speed"][i] / n),
+                            reference_planar_speed=float(totals["reference_planar_speed"][i] / n),
                         )
                     )
                 print(f"[Benchmark] {Path(checkpoint).name}: {len(results)}/{len(cases)} cases", flush=True)
@@ -167,6 +193,11 @@ def evaluate(env, checkpoints, output, *, levels=(0, 3, 6), seed=17, steps=500, 
                         "joint_rmse",
                         "body_error",
                         "slip",
+                        "root_xy_rmse",
+                        "corrected_planar_velocity_rmse",
+                        "raw_planar_velocity_rmse",
+                        "actual_planar_speed",
+                        "reference_planar_speed",
                     )
                 },
                 cases=results,
