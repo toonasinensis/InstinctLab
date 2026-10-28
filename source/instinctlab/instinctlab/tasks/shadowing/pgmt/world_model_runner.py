@@ -23,6 +23,25 @@ def ordinary(tensor):
         return tensor.detach().clone()
 
 
+def frozen_terminal_value(actor_critic, policy_obs, critic_obs):
+    """Keep state derivatives through V, without optimizing its shared feature map.
+
+    The PGMT critic consumes actor intent. Freezing both networks for this forward
+    prevents a direct actor-feature shortcut that changes V without changing an
+    imagined action. Earlier action graphs still train the actor through state.
+    """
+    parameters = list(actor_critic.parameters())
+    flags = [parameter.requires_grad for parameter in parameters]
+    try:
+        for parameter in parameters:
+            parameter.requires_grad_(False)
+        actor_critic.actor(policy_obs)
+        return actor_critic.evaluate(critic_obs).sum(-1)
+    finally:
+        for parameter, flag in zip(parameters, flags, strict=True):
+            parameter.requires_grad_(flag)
+
+
 @torch.no_grad()
 def bounded_actor_step(actor, optimizer, observations, std, maximum_kl):
     """Backtrack an auxiliary Adam step against fixed replay observations.
@@ -62,7 +81,7 @@ def bounded_actor_step(actor, optimizer, observations, std, maximum_kl):
 
 
 class WorldModelRunner(TerrainRunner):
-    surrogate_version = 2
+    surrogate_version = 3
 
     def __init__(self, env, train_cfg, log_dir=None, device="cpu"):
         if train_cfg.get("resume"):
@@ -82,6 +101,7 @@ class WorldModelRunner(TerrainRunner):
             anchor=1.0,
             teacher_ema=0.0,
             max_imagination_kl=0.0,
+            bootstrap_value=0.0,
             replay_chunks=8,
             actor_updates=1,
             validation_threshold=1.0,
@@ -89,6 +109,8 @@ class WorldModelRunner(TerrainRunner):
         self.wm_cfg.update(train_cfg.get("world_model", {}))
         if not 0 <= self.wm_cfg["teacher_ema"] <= 1 or self.wm_cfg["max_imagination_kl"] < 0:
             raise ValueError("teacher_ema must be in [0,1] and max_imagination_kl must be nonnegative")
+        if not 0 <= self.wm_cfg["bootstrap_value"] <= 1:
+            raise ValueError("bootstrap_value must be in [0,1]")
         self.heightfield = HeightField.from_context(
             env.unwrapped.command_manager.get_term("motion").terrain, self.wm_cfg["resolution"]
         )
@@ -355,8 +377,26 @@ class WorldModelRunner(TerrainRunner):
                 discount = discount * valid * support_valid * (~data["done"])
                 objective = objective + discount * reward
                 discount = discount * 0.99 * survival
-                history = torch.cat((history[:, 1:], self.mdp.proprioception(state, action)[:, None]), 1)
+                history = torch.cat(
+                    (history[:, 1:], self.mdp.proprioception(state, action, sequence[index + 1])[:, None]), 1
+                )
                 previous_action = action
+            reward_return = objective.mean().detach()
+            bootstrap = state.new_zeros(state.shape[0])
+            if self.wm_cfg["bootstrap_value"]:
+                terminal_obs, valid = self.mdp.observations(state, history, sequence[-1])
+                critic_obs = self.mdp.critic_observations(state, previous_action, support, sequence[-1])
+                critic_normalizer = self.normalizers["critic"]
+                critic_was_training = critic_normalizer.training
+                try:
+                    critic_normalizer.eval()
+                    value = frozen_terminal_value(
+                        self.alg.actor_critic, normalizer(terminal_obs), critic_normalizer(critic_obs)
+                    )
+                finally:
+                    critic_normalizer.train(critic_was_training)
+                bootstrap = self.wm_cfg["bootstrap_value"] * discount * valid * value
+                objective = objective + bootstrap
             loss = -objective.mean() + self.wm_cfg["anchor"] * anchor_loss / self.wm_cfg["horizon"]
             self.actor_optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -377,6 +417,8 @@ class WorldModelRunner(TerrainRunner):
             self.wm.requires_grad_(True)
         return dict(
             imagined_return=float(objective.mean().detach()),
+            imagined_reward_return=float(reward_return),
+            imagined_bootstrap=float(bootstrap.mean().detach()),
             imagination_grad=float(grad),
             anchor_loss=float(anchor_loss.detach()),
             imagination_kl=kl,
@@ -415,7 +457,7 @@ class WorldModelRunner(TerrainRunner):
         # keep non-capturable Adam's scalar step counters on CPU, as on a fresh run.
         saved = torch.load(path, map_location="cpu", weights_only=True)
         model = saved["scheme1"]
-        saved_config = {"teacher_ema": 0.0, "max_imagination_kl": 0.0, **model["config"]}
+        saved_config = {"teacher_ema": 0.0, "max_imagination_kl": 0.0, "bootstrap_value": 0.0, **model["config"]}
         if model.get("surrogate_version", 1) != self.surrogate_version and not self.cfg.get(
             "allow_surrogate_change", False
         ):
@@ -424,7 +466,8 @@ class WorldModelRunner(TerrainRunner):
             key for key in saved_config.keys() | self.wm_cfg.keys() if saved_config.get(key) != self.wm_cfg.get(key)
         }
         if changed and not (
-            changed <= {"anchor", "teacher_ema", "max_imagination_kl"} and self.cfg.get("allow_surrogate_change", False)
+            changed <= {"anchor", "teacher_ema", "max_imagination_kl", "bootstrap_value"}
+            and self.cfg.get("allow_surrogate_change", False)
         ):
             raise ValueError(f"World model configuration changed on resume: {sorted(changed)}")
         result = super().load(path)

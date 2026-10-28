@@ -12,14 +12,18 @@ from unittest.mock import patch
 from isaaclab.sensors.ray_caster.patterns import GridPatternCfg, grid_pattern
 
 from instinctlab.tasks.shadowing.pgmt.heightfield import HeightField
-from instinctlab.tasks.shadowing.pgmt.imagination import pack_history, raw_history, stance_slip
+from instinctlab.tasks.shadowing.pgmt.imagination import ImaginationMDP, pack_history, raw_history, stance_slip
 from instinctlab.tasks.shadowing.pgmt.world_model import (
     Moments,
     TerrainWorldModel,
     average_gradients,
     rotation_increment,
 )
-from instinctlab.tasks.shadowing.pgmt.world_model_runner import WorldModelRunner, bounded_actor_step
+from instinctlab.tasks.shadowing.pgmt.world_model_runner import (
+    WorldModelRunner,
+    bounded_actor_step,
+    frozen_terminal_value,
+)
 
 
 def distributed_contract(rank, rendezvous):
@@ -131,6 +135,50 @@ class GeometryTest(unittest.TestCase):
 
 
 class DynamicsTest(unittest.TestCase):
+    def test_replayed_environments_keep_their_own_joint_offsets(self):
+        mdp = ImaginationMDP.__new__(ImaginationMDP)
+        state = torch.zeros(2, 71)
+        state[:, 6] = 1
+        state[:, 13:42] = 0.3
+        state[:, 42:71] = -0.2
+        context = dict(default_q=torch.randn(2, 29) * 0.01, default_qd=torch.randn(2, 29) * 0.01)
+        obs = mdp.proprioception(state, torch.zeros(2, 29), context)
+        torch.testing.assert_close(obs[:, 6:35], 0.3 - context["default_q"])
+        torch.testing.assert_close(obs[:, 35:64], -0.2 - context["default_qd"])
+        self.assertFalse(torch.equal(obs[0, 6:35], obs[1, 6:35]))
+
+    def test_terminal_value_trains_actions_without_shared_feature_shortcut(self):
+        class Intent(torch.nn.Linear):
+            def forward(self, obs):
+                self.intent = super().forward(obs)
+                return self.intent
+
+        class ActorCritic(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.actor = Intent(1, 1, bias=False)
+                self.critic = torch.nn.Linear(2, 4, bias=False)
+                with torch.no_grad():
+                    self.actor.weight.fill_(1)
+                    self.critic.weight.fill_(1)
+
+            def evaluate(self, obs):
+                return self.critic(torch.cat((obs, self.actor.intent), -1))
+
+        model = ActorCritic()
+        state = model.actor(torch.ones(1, 1))
+        value = frozen_terminal_value(model, 2 * state, 3 * state)
+        value.sum().backward()
+        # Four value heads, each with derivative 3 + 2 through predicted state.
+        # A direct derivative through terminal intent weights would incorrectly add 8.
+        torch.testing.assert_close(model.actor.weight.grad, torch.tensor([[20.0]]))
+        self.assertIsNone(model.critic.weight.grad)
+        self.assertTrue(all(p.requires_grad for p in model.parameters()))
+        with patch.object(model, "evaluate", side_effect=RuntimeError("terminal failure")):
+            with self.assertRaisesRegex(RuntimeError, "terminal failure"):
+                frozen_terminal_value(model, state, state)
+        self.assertTrue(all(p.requires_grad for p in model.parameters()))
+
     def test_oversized_imagination_step_is_bounded(self):
         actor = torch.nn.Linear(2, 1)
         observations = torch.tensor([[1.0, 2.0], [-2.0, 1.0]])

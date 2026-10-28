@@ -42,6 +42,19 @@ def main():
             runner = WorldModelRunner(env, agent.to_dict(), str(root), agent.device)
             if agent.resume:
                 runner.load(cli.checkpoint_path(str(root), agent.load_run, agent.load_checkpoint))
+            with torch.no_grad():
+                from instinctlab.tasks.shadowing.pgmt.mdp.terrain_observations import critic_state
+
+                native = env.unwrapped
+                rebuilt = runner.mdp.critic_observations(
+                    runner.mdp.state(),
+                    native.action_manager.action,
+                    runner.mdp.command.terrain.support_z,
+                    runner.mdp.context(),
+                )
+                expected = critic_state(native)
+                critic_parity = float((rebuilt - expected).abs().max())
+                torch.testing.assert_close(rebuilt, expected, atol=5e-5, rtol=1e-5)
             runner.learn(4)
             assert runner.imagination_updates > 0, "Smoke must exercise actual imagined updates"
             modules = (runner.alg.actor_critic, runner.wm, runner.teacher, *runner.normalizers.values())
@@ -82,6 +95,8 @@ def main():
                 validation_threshold=runner.wm_cfg["validation_threshold"],
                 teacher_ema=runner.wm_cfg["teacher_ema"],
                 maximum_imagination_kl=runner.wm_cfg["max_imagination_kl"],
+                bootstrap_value=runner.wm_cfg["bootstrap_value"],
+                critic_observation_max_error=critic_parity,
                 scope="Short correctness smoke, not a performance result",
             )
             (root / f"rank-{rank}.json").write_text(json.dumps(report, indent=2) + "\n")

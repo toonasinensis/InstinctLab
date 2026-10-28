@@ -186,6 +186,9 @@ weights are detached in this penalty so the actor cannot reduce it by merely pre
 This is a differentiable stance-motion proxy, not an exact contact-force or terrain-tangent reward.
 All original contact rewards still use real PPO. The imagined reward combines tracking, limits,
 action rate and stance motion; it is not the exact sum of real contact rewards.
+Surrogate version 3 also retains each replayed environment's randomized joint-position/velocity
+defaults when reconstructing future proprioception and critic inputs. Using environment zero's
+defaults for all samples would give the policy incorrect joint-relative observations.
 
 Default training uses three-step supervised rollouts, four-step actor rollouts, 50 warm-up iterations,
 16 WM minibatches per PPO iteration and a frozen initial actor anchor. Every eighth environment is
@@ -206,7 +209,17 @@ ranks; rejected steps restore both actor and optimizer. A nonfinite proposal rai
 This is a local step-size constraint, not a guarantee of real-environment improvement. Zero disables
 the constraint for legacy experiments. Logs include the accepted KL and parameter-step scale.
 
-The current stage-one experiment uses 200 warm-up iterations, EMA coefficient 0.05, anchor weight 10
+`agent.world_model.bootstrap_value=1` optionally appends the real PPO critic's discounted terminal
+value to the short imagined return. Zero preserves the previous finite-horizon objective. The 296
+critic inputs are rebuilt from the imagined root/joints, kinematics, action and support height;
+only reference commands come from replay. The critic and its shared actor-intent feature map are
+frozen for this forward, retaining state derivatives while preventing an actor-feature shortcut
+that raises value without changing earlier actions. Neither network is updated as a critic on
+imagined targets. This is a model-based value estimate, not a guarantee against exploitation.
+Logs separate the short reward return and the discounted bootstrap contribution. Actor inference
+still uses only its existing observation contract; privileged critic inputs remain training-only.
+
+The initial stage-one experiment uses 200 warm-up iterations, EMA coefficient 0.05, anchor weight 10
 and maximum imagination KL 0.002. These are experimental settings, not a claim of stage-one
 convergence to the existing terrain checkpoint. Warm-up only fits the WM and runs real PPO.
 
@@ -237,11 +250,11 @@ complete checkpoint, after adding WM/optimizer state, through an atomic rename.
 Checkpoint surrogate versions are checked on resume. Use `agent.allow_surrogate_change=true` only
 when deliberately starting a new experiment with a different surrogate reward; this opt-in is
 recorded in the saved run configuration.
-The same opt-in permits changing the teacher-anchor weight, EMA coefficient and imagination KL
+The same opt-in permits changing the teacher-anchor weight, EMA coefficient, terminal-value weight and imagination KL
 limit for an explicit experiment; it does not permit changing model shape, raster resolution or
 rollout settings. Activating EMA on a previously frozen-teacher checkpoint initializes the teacher
 from that checkpoint's actor. An ordinary EMA-to-EMA resume restores the saved teacher exactly.
-Old checkpoints without the EMA/KL settings retain their zero defaults.
+Old checkpoints without the EMA/KL/terminal-value settings retain their zero defaults.
 
 The benchmark fixes motion, start frame, yaw, terrain family and level for every case, records only
 the first episode and captures failure metrics before auto-reset. Failure and tile exit are reported

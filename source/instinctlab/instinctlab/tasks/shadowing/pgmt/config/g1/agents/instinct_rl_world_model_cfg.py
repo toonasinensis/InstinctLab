@@ -21,6 +21,7 @@ class G1PGMTWorldModelRunnerCfg(G1PGMTTerrainPPORunnerCfg):
         anchor=1.0,
         teacher_ema=0.0,
         max_imagination_kl=0.0,
+        bootstrap_value=0.0,
         replay_chunks=8,
         actor_updates=1,
         validation_threshold=1.0,

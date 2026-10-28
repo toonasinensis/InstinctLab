@@ -11,6 +11,7 @@ import torch
 from isaaclab.utils.math import matrix_from_quat, quat_apply, quat_apply_inverse, quat_inv, quat_mul, yaw_quat
 
 from .mdp.terrain_math import corrected_planar_velocity, tolerance_error
+from .mdp.terrain_observations import critic_state
 from .models.cross_attention import unpack_terms
 from .world_model import yaw_angle
 
@@ -32,8 +33,6 @@ class ImaginationMDP:
         self.command = env.command_manager.get_term("motion")
         self.reference = self.command.reference
         self.heightfield = heightfield
-        self.default_q = env.scene["robot"].data.default_joint_pos.torch[0].clone()
-        self.default_qd = env.scene["robot"].data.default_joint_vel.torch[0].clone()
         self.limits = env.scene["robot"].data.soft_joint_pos_limits.torch[0].clone()
         self.dt = env.step_dt
 
@@ -74,6 +73,11 @@ class ImaginationMDP:
             "ref_valid": c.reference_contact_valid.float().clone(),
             "level": c.terrain.level.clone(),
             "family": c.terrain.family.clone(),
+            "default_q": self.env.scene["robot"].data.default_joint_pos.torch.clone(),
+            "default_qd": self.env.scene["robot"].data.default_joint_vel.torch.clone(),
+            # Only the exogenous reference command is retained. Imagined robot
+            # features below are reconstructed from the predicted state.
+            "critic_command": critic_state(self.env)[:, :68].clone(),
         }
 
     def bodies(self, state):
@@ -99,14 +103,14 @@ class ImaginationMDP:
         blend = 1 - math.exp(-self.dt / self.command.cfg.support_filter_seconds)
         return support + blend * (target - support), valid.all(-1) & root_valid
 
-    def proprioception(self, state, previous_action):
+    def proprioception(self, state, previous_action, context):
         gravity = state.new_tensor([0, 0, -1]).expand(state.shape[0], -1)
         return torch.cat(
             (
                 quat_apply_inverse(state[:, 3:7], gravity),
                 quat_apply_inverse(state[:, 3:7], state[:, 10:13]),
-                state[:, 13:42] - self.default_q,
-                state[:, 42:71] - self.default_qd,
+                state[:, 13:42] - context["default_q"],
+                state[:, 42:71] - context["default_qd"],
                 previous_action,
             ),
             -1,
@@ -134,6 +138,32 @@ class ImaginationMDP:
                 -1,
             ),
             valid,
+        )
+
+    def critic_observations(self, state, action, support, context):
+        """Native 296-value critic layout, with counterfactual robot/support state."""
+        position, rotation = self.bodies(state)
+        root_R = matrix_from_quat(state[:, 3:7])
+        inverse_R = root_R.transpose(-1, -2)
+        target = torch.cat((context["ref_position"][:, :2], context["ref_clearance"][:, :1] + support[:, None]), -1)
+        anchor_pos = quat_apply_inverse(state[:, 3:7], target - state[:, :3])
+        anchor_ori = matrix_from_quat(quat_mul(quat_inv(state[:, 3:7]), context["ref_rotation"][:, 0]))
+        body_pos = (inverse_R[:, None] @ (position - state[:, None, :3])[..., None]).squeeze(-1)
+        body_ori = inverse_R[:, None] @ rotation
+        return torch.cat(
+            (
+                context["critic_command"],
+                anchor_pos,
+                anchor_ori[..., :2].flatten(1),
+                body_pos.flatten(1),
+                body_ori[..., :2].flatten(1),
+                quat_apply_inverse(state[:, 3:7], state[:, 7:10]),
+                quat_apply_inverse(state[:, 3:7], state[:, 10:13]),
+                state[:, 13:42] - context["default_q"],
+                state[:, 42:71] - context["default_qd"],
+                action,
+            ),
+            -1,
         )
 
     def reward(self, state, action, previous_action, support, context, previous_state, contact):
