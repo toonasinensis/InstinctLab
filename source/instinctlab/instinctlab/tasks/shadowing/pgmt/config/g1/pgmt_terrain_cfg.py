@@ -57,6 +57,10 @@ class G1PGMTTerrainEnvCfg(G1PGMTShadowingEnvCfg):
             ray_alignment="yaw",
             pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[2.0, 2.0], ordering="yx"),
             mesh_prim_paths=["/World/ground"],
+            # Newton's BVH backend otherwise hits the carrier robot as well as
+            # terrain, unlike PhysX's mesh-only ray caster. Preserve the PGMT
+            # terrain-only observation contract on both backends.
+            global_world_only=True,
             update_period=0.02,
             debug_vis=False,
         )
