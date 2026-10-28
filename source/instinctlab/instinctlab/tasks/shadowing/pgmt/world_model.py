@@ -6,10 +6,25 @@ silently reinterpreted in this different robot/state contract.
 """
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 
 from isaaclab.utils.math import axis_angle_from_quat, quat_apply, quat_apply_inverse, quat_inv, quat_mul, yaw_quat
+
+
+def average_gradients(module):
+    """Average auxiliary gradients before clipping, including locally unused parameters."""
+    if not dist.is_initialized():
+        return
+    parameters = [p for p in module.parameters() if p.requires_grad]
+    gradients = torch.cat([(torch.zeros_like(p) if p.grad is None else p.grad).flatten() for p in parameters])
+    dist.all_reduce(gradients)
+    gradients.div_(dist.get_world_size())
+    offset = 0
+    for parameter in parameters:
+        parameter.grad = gradients[offset : offset + parameter.numel()].view_as(parameter)
+        offset += parameter.numel()
 
 
 def yaw_angle(quaternion):
@@ -51,9 +66,16 @@ class Moments(nn.Module):
     def update(self, x):
         x = x.reshape(-1, x.shape[-1])
         n = x.shape[0]
+        mean, variance = x.mean(0), x.var(0, unbiased=False)
+        if dist.is_initialized():
+            sums = torch.cat((mean * n, mean.new_tensor([n])))
+            dist.all_reduce(sums)
+            global_mean, count = sums[:-1] / sums[-1], sums[-1]
+            variance = (variance + (mean - global_mean).square()) * n
+            dist.all_reduce(variance)
+            mean, variance, n = global_mean, variance / count, count
         total = self.count + n
-        delta = x.mean(0) - self.mean
-        variance = x.var(0, unbiased=False)
+        delta = mean - self.mean
         self.variance.copy_(
             (self.variance * self.count + variance * n + delta.square() * self.count * n / total) / total
         )

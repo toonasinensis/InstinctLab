@@ -1,14 +1,47 @@
 """CPU contracts for scheme-one geometry, dynamics, and checkpoint actor layout."""
 
+import tempfile
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from isaaclab.sensors.ray_caster.patterns import GridPatternCfg, grid_pattern
 
 from instinctlab.tasks.shadowing.pgmt.heightfield import HeightField
 from instinctlab.tasks.shadowing.pgmt.imagination import pack_history, raw_history, stance_slip
-from instinctlab.tasks.shadowing.pgmt.world_model import TerrainWorldModel, rotation_increment
+from instinctlab.tasks.shadowing.pgmt.world_model import (
+    Moments,
+    TerrainWorldModel,
+    average_gradients,
+    rotation_increment,
+)
 from instinctlab.tasks.shadowing.pgmt.world_model_runner import WorldModelRunner
+
+
+def distributed_contract(rank, rendezvous):
+    dist.init_process_group("gloo", init_method="file://" + rendezvous, rank=rank, world_size=2)
+    try:
+        # Unequal per-rank sample counts and means must match concatenated-data moments.
+        data = [torch.tensor([[1.0, 2.0], [3.0, 6.0]]), torch.tensor([[8.0, -2.0]])]
+        moments = Moments(2)
+        expected = torch.cat(data)
+        for shift in (0.0, 10.0):
+            moments.update(data[rank] + shift)
+        all_data = torch.cat((expected, expected + 10))
+        torch.testing.assert_close(moments.mean, all_data.mean(0))
+        torch.testing.assert_close(moments.variance, all_data.var(0, unbiased=False))
+        assert moments.count == len(all_data)
+        model = torch.nn.Linear(2, 1)
+        model.weight.grad = torch.full_like(model.weight, float(1 + rank * 2))
+        model.bias.grad = None if rank == 0 else torch.full_like(model.bias, 4.0)
+        average_gradients(model)
+        torch.testing.assert_close(model.weight.grad, torch.full_like(model.weight, 2.0))
+        torch.testing.assert_close(model.bias.grad, torch.full_like(model.bias, 2.0))
+    finally:
+        dist.destroy_process_group()
 
 
 class GeometryTest(unittest.TestCase):
@@ -87,6 +120,22 @@ class GeometryTest(unittest.TestCase):
 
 
 class DynamicsTest(unittest.TestCase):
+    def test_distributed_moments_and_auxiliary_gradients(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mp.spawn(distributed_contract, args=(str(Path(directory) / "rendezvous"),), nprocs=2, join=True)
+
+    def test_raw_observation_is_captured_before_normalization(self):
+        runner = WorldModelRunner.__new__(WorldModelRunner)
+        original = torch.randn(2, 2119)
+        extras = {"policy": original.clone()}
+        with patch("instinctlab.tasks.shadowing.pgmt.terrain_runner.TerrainRunner._prepare_extra_obs") as prepare:
+            prepare.side_effect = lambda obs: obs["policy"].zero_()
+            with torch.inference_mode():
+                normalized = runner._prepare_extra_obs(extras)
+        torch.testing.assert_close(runner.raw_policy_obs, original)
+        self.assertFalse(torch.is_inference(runner.raw_policy_obs))
+        self.assertEqual(float(normalized.abs().sum()), 0.0)
+
     def test_stance_slip_gradient_cannot_reduce_contact_probability(self):
         previous = torch.zeros(1, 2, 3, requires_grad=True)
         feet = torch.tensor([[[0.03, 0.04, 0.1], [1.0, 1.0, 0.0]]], requires_grad=True)

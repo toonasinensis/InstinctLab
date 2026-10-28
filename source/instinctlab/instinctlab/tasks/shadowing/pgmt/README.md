@@ -212,8 +212,11 @@ privileged contact state; it still needs the same local height map and reference
 Scheme-one checkpoints additionally contain WM, its normalization statistics/optimizer, teacher actor,
 imagination optimizer, update counts and configuration. Resume uses the usual `--resume --load_run ...
 --checkpoint model_N.pt`, matching environment count, WM settings and gate ramp; omit initialization
-overrides on resume. Physical episodes and replay restart together. Distributed WM synchronization is
-not implemented: use one GPU, rather than silently running independent models on multiple ranks.
+overrides on resume. Physical episodes and replay restart together. Multi-GPU runs share WM parameters,
+normalization moments, supervised gradients and imagined actor gradients. The model-error gate is
+pooled across ranks so all ranks take the same update branch. Each rank retains its own terrain and
+replay; checkpoints preserve the native per-rank curriculum/RNG state. Only rank zero publishes the
+complete checkpoint, after adding WM/optimizer state, through an atomic rename.
 Checkpoint surrogate versions are checked on resume. Use `agent.allow_surrogate_change=true` only
 when deliberately starting a new experiment with a different surrogate reward; this opt-in is
 recorded in the saved run configuration.
@@ -236,6 +239,14 @@ tokens for a perception ablation; use a separate output directory. Inspect track
 tile exit and slip together, rather than selecting by reward alone. Result JSON includes checkpoint
 SHA-256 and per-case measurements. Run geometry, finite-difference, history and dynamics contracts with
 `python -m unittest discover -s source/instinctlab/test -p test_pgmt_world_model.py`.
+
+`scripts/pgmt/validate_world_model.py` provides a bounded real-simulator test: four updates, exact
+module/optimizer reload, two further updates, then exact cross-rank equality. Use the training task,
+an explicit stage-one `agent.warm_start`, `--report-dir`, and (for a short smoke only)
+`agent.world_model.warmup=1 agent.world_model.updates=2 agent.world_model.validation_threshold=100.0`.
+The permissive smoke gate exercises gradients; it must not be used as evidence of model accuracy or
+copied into a performance training recipe. Launch multi-GPU training/validation through
+`python -m torch.distributed.run --standalone --nproc_per_node=2 ...`; `--num_envs` is per rank.
 
 ### Validated local candidate, 2026-10-29
 

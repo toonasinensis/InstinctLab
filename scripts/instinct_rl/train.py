@@ -89,6 +89,10 @@ def main():
             log_root_path,
             cli.train_log_dir_name(getattr(env_cfg, "run_name", None), agent_cfg.run_name, resume_path),
         )
+        if args_cli.distributed:
+            paths = [log_dir]
+            dist.broadcast_object_list(paths, src=0, device=torch.device(env_cfg.sim.device))
+            log_dir = paths[0]
 
         env_cfg.log_dir = log_dir
         cli.apply_video_recording(env_cfg, args_cli, os.path.join(log_dir, "videos", "train"))

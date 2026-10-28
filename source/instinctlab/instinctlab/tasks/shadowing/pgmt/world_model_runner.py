@@ -12,7 +12,7 @@ from torch.nn import functional as F
 from .heightfield import HeightField
 from .imagination import ImaginationMDP, raw_history
 from .terrain_runner import TerrainRunner
-from .world_model import TerrainWorldModel, yaw_angle
+from .world_model import TerrainWorldModel, average_gradients, yaw_angle
 
 
 def ordinary(tensor):
@@ -26,8 +26,6 @@ class WorldModelRunner(TerrainRunner):
     surrogate_version = 2
 
     def __init__(self, env, train_cfg, log_dir=None, device="cpu"):
-        if dist.is_initialized():
-            raise NotImplementedError("Scheme-one distributed gradient synchronization is not yet implemented")
         if train_cfg.get("resume"):
             # A complete scheme-one checkpoint must not depend on its old initialization file.
             train_cfg = dict(train_cfg, warm_start=None, stage2_initialization=None)
@@ -81,12 +79,26 @@ class WorldModelRunner(TerrainRunner):
             metrics["model_update_seconds"] = time.monotonic() - start
             metrics["imagination_updates"] = self.imagination_updates
             stats.update({"Scheme1/" + k: torch.tensor(v, device=self.device) for k, v in metrics.items()})
-            if self.log_dir:
+            if self.log_dir and not self.is_mp_rank_other_process():
                 with (Path(self.log_dir) / "world-model.jsonl").open("a") as file:
                     file.write(json.dumps(dict(iteration=iteration, **metrics)) + "\n")
             return losses, stats
 
         self.alg.update = update
+
+    def learn(self, num_learning_iterations, init_at_random_ep_len=False):
+        if dist.is_initialized():
+            # Each rank has different terrain/data, but one shared dynamics model and teacher.
+            for module in (self.wm, self.teacher):
+                for value in module.state_dict().values():
+                    dist.broadcast(value, src=0)
+        return super().learn(num_learning_iterations, init_at_random_ep_len)
+
+    def _prepare_extra_obs(self, extra_obs):
+        # Keep the actual observation: after a distributed normalizer sync, inverting
+        # an observation with the new moments does not recover its original values.
+        self.raw_policy_obs = ordinary(extra_obs["policy"])
+        return super()._prepare_extra_obs(extra_obs)
 
     def initialize_stage2(self, path):
         saved = torch.load(path, map_location=self.device, weights_only=True)
@@ -120,9 +132,7 @@ class WorldModelRunner(TerrainRunner):
         )
         self.alg.actor_critic.actor.terrain_gate.fill_(gate)
         self.mdp.command.metrics["terrain_gate"][:] = gate
-        norm = self.normalizers["policy"]
-        # EmpiricalNormalization's exact inverse; heights bypass it.
-        raw = torch.cat((obs[:, :1678] * (norm._std[:, :1678] + norm.eps) + norm._mean[:, :1678], obs[:, 1678:]), -1)
+        raw = self.raw_policy_obs
         record = {key: ordinary(value) for key, value in self.mdp.context().items()}
         record.update(
             state=ordinary(self.mdp.state()),
@@ -209,6 +219,7 @@ class WorldModelRunner(TerrainRunner):
             loss = self.wm_loss(self.sample(min(3, self.wm_cfg["horizon"])))
             self.wm_optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            average_gradients(self.wm)
             torch.nn.utils.clip_grad_norm_(self.wm.parameters(), 1.0, error_if_nonfinite=True)
             self.wm_optimizer.step()
             self.wm_updates += 1
@@ -216,9 +227,15 @@ class WorldModelRunner(TerrainRunner):
             sequence = self.sample(self.wm_cfg["horizon"], validation=True)
             validation = self.wm_loss(sequence)
             diagnostics = self.validation_errors(sequence)
-        return dict(
+        metrics = dict(
             wm_loss=float(loss.detach()), wm_validation=float(validation), wm_updates=self.wm_updates, **diagnostics
         )
+        if dist.is_initialized():
+            # All ranks must make the same imagination-gate decision before collectives.
+            values = torch.tensor(list(metrics.values()), device=self.device)
+            dist.all_reduce(values)
+            metrics = dict(zip(metrics, (values / dist.get_world_size()).tolist()))
+        return metrics
 
     @torch.no_grad()
     def validation_errors(self, sequence):
@@ -281,6 +298,7 @@ class WorldModelRunner(TerrainRunner):
             loss = -objective.mean() + self.wm_cfg["anchor"] * anchor_loss / self.wm_cfg["horizon"]
             self.actor_optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            average_gradients(actor)
             grad = torch.nn.utils.clip_grad_norm_(actor.parameters(), 0.5, error_if_nonfinite=True)
             self.actor_optimizer.step()
             self.imagination_updates += 1
@@ -296,8 +314,14 @@ class WorldModelRunner(TerrainRunner):
         )
 
     def save(self, path, infos=None):
-        super().save(path, infos)
-        saved = torch.load(path, map_location="cpu", weights_only=True)
+        # Publish only the complete checkpoint; evaluators/resumers can read `path`
+        # concurrently while the base runner gathers per-rank simulator state.
+        base_path = str(path) + ".scheme1-base"
+        super().save(base_path, infos)
+        if self.is_mp_rank_other_process():
+            dist.barrier()
+            return
+        saved = torch.load(base_path, map_location="cpu", weights_only=True)
         saved["scheme1"] = dict(
             world_model=self.wm.state_dict(),
             wm_optimizer=self.wm_optimizer.state_dict(),
@@ -312,9 +336,14 @@ class WorldModelRunner(TerrainRunner):
         temporary = str(path) + ".scheme1.tmp"
         torch.save(saved, temporary)
         Path(temporary).replace(path)
+        Path(base_path).unlink()
+        if dist.is_initialized():
+            dist.barrier()
 
     def load(self, path):
-        saved = torch.load(path, map_location=self.device, weights_only=True)
+        # Optimizer.load_state_dict places parameter moments on the parameter device;
+        # keep non-capturable Adam's scalar step counters on CPU, as on a fresh run.
+        saved = torch.load(path, map_location="cpu", weights_only=True)
         model = saved["scheme1"]
         if model.get("surrogate_version", 1) != self.surrogate_version and not self.cfg.get(
             "allow_surrogate_change", False
