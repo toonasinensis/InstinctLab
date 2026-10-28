@@ -40,3 +40,13 @@ _build
 
 # Agent specific files
 agents/computation
+
+# External references and temporary dependency checkouts belong outside this repository.
+/.reference/
+
+# Local runtimes and generated experiment artifacts
+/.venv*/
+/artifacts
+/imgui.ini
+/agents/pgmt_*validation*
+/agents/pgmt_*curve_comparison*

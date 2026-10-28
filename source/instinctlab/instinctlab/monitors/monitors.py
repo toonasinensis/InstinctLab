@@ -475,7 +475,7 @@ class ShadowingPositionMonitorTerm(MonitorTerm):
         self._base_pos_error_currently = torch.norm(root_diff, dim=-1) * in_frame_mask
         self._base_pos_error_xy += torch.norm(root_diff[:, :2], dim=-1) * in_frame_mask
         self._base_pos_error_z += torch.abs(root_diff[:, 2]) * in_frame_mask
-        self._base_pos_error_z_max = torch.maximum(
+        self._base_pos_error_z_max[:] = torch.maximum(
             self._base_pos_error_z_max, torch.abs(root_diff[:, 2]) * in_frame_mask
         )
 
@@ -549,7 +549,7 @@ class ShadowingRotationMonitorTerm(MonitorTerm):
         self._base_rot_error += _base_rot_error * in_frame_mask
         self._base_rot_error_currently = _base_rot_error * in_frame_mask
 
-        self._base_rot_error_max = torch.maximum(self._base_rot_error_max, _base_rot_error * in_frame_mask)
+        self._base_rot_error_max[:] = torch.maximum(self._base_rot_error_max, _base_rot_error * in_frame_mask)
 
         self._num_frames_should_reach += in_frame_mask.to(torch.int)
 
@@ -614,7 +614,7 @@ class ShadowingVelocityMonitorTerm(MonitorTerm):
         self._base_vel_error += _base_vel_error * in_frame_mask
         self._base_vel_error_currently = _base_vel_error * in_frame_mask
 
-        self._base_vel_error_max = torch.maximum(self._base_vel_error_max, _base_vel_error * in_frame_mask)
+        self._base_vel_error_max[:] = torch.maximum(self._base_vel_error_max, _base_vel_error * in_frame_mask)
 
         self._num_frames_should_reach += in_frame_mask.to(torch.int)
 
@@ -682,7 +682,7 @@ class ShadowingJointPosMonitorTerm(MonitorTerm):
             joint_diff = joint_diff[:, self.cfg.params["robot_cfg"].joint_ids]
         self._joint_pos_error += torch.abs(joint_diff).mean(dim=-1) * in_frame_mask
         self._joint_pos_error_currently = torch.abs(joint_diff).mean(dim=-1) * in_frame_mask
-        self._joint_pos_error_max = torch.maximum(
+        self._joint_pos_error_max[:] = torch.maximum(
             self._joint_pos_error_max, torch.abs(joint_diff).max(dim=-1).values * in_frame_mask
         )
 
@@ -752,7 +752,7 @@ class ShadowingJointVelMonitorTerm(MonitorTerm):
             joint_diff = joint_diff[:, self.cfg.params["robot_cfg"].joint_ids]
         self._joint_vel_error += torch.abs(joint_diff).mean(dim=-1) * in_frame_mask
         self._joint_vel_error_currently = torch.abs(joint_diff).mean(dim=-1) * in_frame_mask
-        self._joint_vel_error_max = torch.maximum(
+        self._joint_vel_error_max[:] = torch.maximum(
             self._joint_vel_error_max, torch.abs(joint_diff).max(dim=-1).values * in_frame_mask
         )
         self._num_frames_should_reach += in_frame_mask.to(torch.int)
@@ -823,7 +823,7 @@ class ShadowingLinkPosMonitorTerm(MonitorTerm):
 
         self._link_pos_error += link_distance.mean(dim=-1) * in_frame_mask
         self._link_pos_error_currently = link_distance.mean(dim=-1) * in_frame_mask
-        self._link_pos_error_max = torch.maximum(
+        self._link_pos_error_max[:] = torch.maximum(
             self._link_pos_error_max, link_distance.max(dim=-1).values * in_frame_mask
         )
         self._num_frames_should_reach += in_frame_mask.to(torch.int)
@@ -1055,7 +1055,7 @@ class ShadowingGravityMonitorTerm(MonitorTerm):
 
         self._pg_diff += diff * in_frame_mask
         self._pg_diff_currently = diff * in_frame_mask
-        self._pg_diff_max = torch.maximum(self._pg_diff_max, diff * in_frame_mask)
+        self._pg_diff_max[:] = torch.maximum(self._pg_diff_max, diff * in_frame_mask)
         self._num_frames_should_reach += in_frame_mask.to(torch.int)
 
     def reset_idx(self, env_ids: torch.Tensor | slice):

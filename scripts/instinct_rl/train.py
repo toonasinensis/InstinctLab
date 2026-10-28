@@ -18,6 +18,7 @@ import isaaclab
 from isaaclab.app import launch_simulation
 from isaaclab.envs import DirectMARLEnvCfg
 from isaaclab.utils.io import dump_yaml
+from isaaclab.utils.string import string_to_callable
 
 import instinctlab.tasks  # noqa: F401
 from instinctlab.utils import instinct_rl_cli as cli
@@ -99,7 +100,12 @@ def main():
             env = multi_agent_to_single_agent(env)
 
         env = InstinctRlVecEnvWrapper(env)
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+        runner_type = (
+            string_to_callable(agent_cfg.runner_class_name)
+            if getattr(agent_cfg, "runner_class_name", None)
+            else OnPolicyRunner
+        )
+        runner = runner_type(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
         runner.add_git_repo_to_log(__file__)
         runner.add_git_repo_to_log(isaaclab.__file__)
         if resume_path is not None:
