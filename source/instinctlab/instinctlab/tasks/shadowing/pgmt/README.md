@@ -217,6 +217,8 @@ not implemented: use one GPU, rather than silently running independent models on
 Checkpoint surrogate versions are checked on resume. Use `agent.allow_surrogate_change=true` only
 when deliberately starting a new experiment with a different surrogate reward; this opt-in is
 recorded in the saved run configuration.
+The same opt-in permits changing the teacher-anchor loss weight for an explicit fine-tuning
+experiment; it does not permit changing the model shape, raster resolution or rollout settings.
 
 The benchmark fixes motion, start frame, yaw, terrain family and level for every case, records only
 the first episode and captures failure metrics before auto-reset. Failure and tile exit are reported

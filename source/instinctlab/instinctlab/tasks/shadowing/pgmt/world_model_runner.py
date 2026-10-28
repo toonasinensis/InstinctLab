@@ -320,8 +320,13 @@ class WorldModelRunner(TerrainRunner):
             "allow_surrogate_change", False
         ):
             raise ValueError("Surrogate reward changed; explicitly set allow_surrogate_change for a new experiment")
-        if model["config"] != self.wm_cfg:
-            raise ValueError("World model configuration changed on resume")
+        changed = {
+            key
+            for key in model["config"].keys() | self.wm_cfg.keys()
+            if model["config"].get(key) != self.wm_cfg.get(key)
+        }
+        if changed and not (changed <= {"anchor"} and self.cfg.get("allow_surrogate_change", False)):
+            raise ValueError(f"World model configuration changed on resume: {sorted(changed)}")
         result = super().load(path)
         self.wm.load_state_dict(model["world_model"])
         self.teacher.load_state_dict(model["teacher"])
