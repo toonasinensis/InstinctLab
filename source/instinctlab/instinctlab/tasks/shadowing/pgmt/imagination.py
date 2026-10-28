@@ -19,6 +19,13 @@ def pack_history(history):
     return torch.cat([term.flatten(1) for term in history.split((3, 3, 29, 29, 29), -1)], -1)
 
 
+def stance_slip(previous_feet, feet, contact, dt):
+    # Stop the contact-weight gradient: the actor must reduce stance motion,
+    # rather than make the model predict that a sliding foot lost contact.
+    velocity_xy = (feet[..., :2] - previous_feet[..., :2]) / dt
+    return (velocity_xy.square().sum(-1) * contact.detach()).sum(-1)
+
+
 class ImaginationMDP:
     def __init__(self, env, heightfield):
         self.env = env
@@ -129,7 +136,7 @@ class ImaginationMDP:
             valid,
         )
 
-    def reward(self, state, action, previous_action, support, context):
+    def reward(self, state, action, previous_action, support, context, previous_state, contact):
         """Analytic tracking surrogate; real PPO retains all 27 original reward terms."""
         c = self.command
         position, rotation = self.bodies(state)
@@ -171,6 +178,8 @@ class ImaginationMDP:
         ref_R = matrix_from_quat(context["ref_rotation"][:, 0])
         reward = reward + 0.5 * torch.exp(-(root_R - ref_R).square().sum((-1, -2)) / (2 * 0.4**2))
         reward = reward - 0.05 * (action - previous_action).square().sum(-1)
+        previous_feet = self.bodies(previous_state)[0][:, c.foot_ids]
+        reward = reward - stance_slip(previous_feet, position[:, c.foot_ids], contact[:, c.foot_ids], self.dt)
         q = state[:, 13:42]
         reward = reward - 15 * ((self.limits[:, 0] - q).clamp_min(0) + (q - self.limits[:, 1]).clamp_min(0)).sum(-1)
         # Smooth survival penalizes model trajectories leaving the true task's viable region.

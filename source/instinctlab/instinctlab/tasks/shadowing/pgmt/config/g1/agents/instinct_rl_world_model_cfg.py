@@ -9,6 +9,7 @@ from .instinct_rl_terrain_cfg import G1PGMTTerrainPPORunnerCfg
 class G1PGMTWorldModelRunnerCfg(G1PGMTTerrainPPORunnerCfg):
     runner_class_name: str = "instinctlab.tasks.shadowing.pgmt.world_model_runner:WorldModelRunner"
     stage2_initialization: str | None = None
+    allow_surrogate_change: bool = False
     world_model: dict = dict(
         hidden=512,
         resolution=0.05,

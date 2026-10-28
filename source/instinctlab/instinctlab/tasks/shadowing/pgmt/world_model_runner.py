@@ -23,6 +23,8 @@ def ordinary(tensor):
 
 
 class WorldModelRunner(TerrainRunner):
+    surrogate_version = 2
+
     def __init__(self, env, train_cfg, log_dir=None, device="cpu"):
         if dist.is_initialized():
             raise NotImplementedError("Scheme-one distributed gradient synchronization is not yet implemented")
@@ -265,9 +267,12 @@ class WorldModelRunner(TerrainRunner):
                     target_action = self.teacher(obs.detach())
                 anchor_loss = anchor_loss + (action - target_action).square().mean()
                 heights, _ = self.heightfield.local(state[:, :3], yaw_angle(state[:, 3:7]))
+                previous_state = state
                 state, contact = self.wm.step(state, action, previous_action, contact, heights)
                 support, support_valid = self.mdp.update_support(state, support, sequence[index + 1])
-                reward, survival = self.mdp.reward(state, action, previous_action, support, sequence[index + 1])
+                reward, survival = self.mdp.reward(
+                    state, action, previous_action, support, sequence[index + 1], previous_state, contact
+                )
                 discount = discount * valid * support_valid * (~data["done"])
                 objective = objective + discount * reward
                 discount = discount * 0.99 * survival
@@ -302,6 +307,7 @@ class WorldModelRunner(TerrainRunner):
             wm_updates=self.wm_updates,
             imagination_updates=self.imagination_updates,
             start_gate=self.start_gate,
+            surrogate_version=self.surrogate_version,
         )
         temporary = str(path) + ".scheme1.tmp"
         torch.save(saved, temporary)
@@ -310,6 +316,10 @@ class WorldModelRunner(TerrainRunner):
     def load(self, path):
         saved = torch.load(path, map_location=self.device, weights_only=True)
         model = saved["scheme1"]
+        if model.get("surrogate_version", 1) != self.surrogate_version and not self.cfg.get(
+            "allow_surrogate_change", False
+        ):
+            raise ValueError("Surrogate reward changed; explicitly set allow_surrogate_change for a new experiment")
         if model["config"] != self.wm_cfg:
             raise ValueError("World model configuration changed on resume")
         result = super().load(path)

@@ -180,9 +180,12 @@ The 71-D state uses pelvis XYZ, XYZW orientation, world linear/angular velocity,
 joint positions/velocities. The WM predicts a normalized 70-D local delta and 14 contact probabilities.
 Previous action, contact belief, proprioceptive history and the support-height filter are carried
 through imagination. Reference windows remain exogenous; orientation and tracking-error corrections
-are rebuilt from the predicted state. Contact probabilities help model dynamics; contact rewards
-still use real PPO. The imagined reward is a differentiable tracking/limits/action-rate surrogate,
-not the exact sum of real contact rewards.
+are rebuilt from the predicted state. Contact probabilities help model dynamics. Surrogate version 2
+also penalizes the squared horizontal finite-difference velocity of predicted stance feet. Contact
+weights are detached in this penalty so the actor cannot reduce it by merely predicting lost contact.
+This is a differentiable stance-motion proxy, not an exact contact-force or terrain-tangent reward.
+All original contact rewards still use real PPO. The imagined reward combines tracking, limits,
+action rate and stance motion; it is not the exact sum of real contact rewards.
 
 Default training uses three-step supervised rollouts, four-step actor rollouts, 50 warm-up iterations,
 16 WM minibatches per PPO iteration and a frozen initial actor anchor. Every eighth environment is
@@ -211,6 +214,9 @@ imagination optimizer, update counts and configuration. Resume uses the usual `-
 --checkpoint model_N.pt`, matching environment count, WM settings and gate ramp; omit initialization
 overrides on resume. Physical episodes and replay restart together. Distributed WM synchronization is
 not implemented: use one GPU, rather than silently running independent models on multiple ranks.
+Checkpoint surrogate versions are checked on resume. Use `agent.allow_surrogate_change=true` only
+when deliberately starting a new experiment with a different surrogate reward; this opt-in is
+recorded in the saved run configuration.
 
 The benchmark fixes motion, start frame, yaw, terrain family and level for every case, records only
 the first episode and captures failure metrics before auto-reset. Failure and tile exit are reported

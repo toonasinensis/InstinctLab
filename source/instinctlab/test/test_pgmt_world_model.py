@@ -6,7 +6,7 @@ import unittest
 from isaaclab.sensors.ray_caster.patterns import GridPatternCfg, grid_pattern
 
 from instinctlab.tasks.shadowing.pgmt.heightfield import HeightField
-from instinctlab.tasks.shadowing.pgmt.imagination import pack_history, raw_history
+from instinctlab.tasks.shadowing.pgmt.imagination import pack_history, raw_history, stance_slip
 from instinctlab.tasks.shadowing.pgmt.world_model import TerrainWorldModel, rotation_increment
 from instinctlab.tasks.shadowing.pgmt.world_model_runner import WorldModelRunner
 
@@ -87,6 +87,17 @@ class GeometryTest(unittest.TestCase):
 
 
 class DynamicsTest(unittest.TestCase):
+    def test_stance_slip_gradient_cannot_reduce_contact_probability(self):
+        previous = torch.zeros(1, 2, 3, requires_grad=True)
+        feet = torch.tensor([[[0.03, 0.04, 0.1], [1.0, 1.0, 0.0]]], requires_grad=True)
+        contact = torch.tensor([[0.9, 0.0]], requires_grad=True)
+        cost = stance_slip(previous, feet, contact, 0.02).sum()
+        torch.testing.assert_close(cost, torch.tensor(5.625))
+        cost.backward()
+        torch.testing.assert_close(feet.grad, torch.tensor([[[135.0, 180.0, 0.0], [0.0, 0.0, 0.0]]]))
+        torch.testing.assert_close(previous.grad, -feet.grad)
+        self.assertIsNone(contact.grad)
+
     def test_ambiguous_initialization_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "not both"):
             WorldModelRunner(None, dict(warm_start="stage1.pt", stage2_initialization="stage2.pt"))
