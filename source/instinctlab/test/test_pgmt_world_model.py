@@ -120,6 +120,14 @@ class GeometryTest(unittest.TestCase):
 
 
 class DynamicsTest(unittest.TestCase):
+    def test_zero_rotation_residual_has_finite_training_gradient(self):
+        state = torch.zeros(1, 71)
+        state[:, 6] = 1.0
+        state.requires_grad_()
+        target = TerrainWorldModel.target(state, state.detach().clone())
+        target.square().sum().backward()
+        torch.testing.assert_close(state.grad, torch.zeros_like(state))
+
     def test_distributed_moments_and_auxiliary_gradients(self):
         with tempfile.TemporaryDirectory() as directory:
             mp.spawn(distributed_contract, args=(str(Path(directory) / "rendezvous"),), nprocs=2, join=True)

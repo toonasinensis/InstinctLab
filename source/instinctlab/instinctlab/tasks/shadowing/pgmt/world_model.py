@@ -10,7 +10,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 
-from isaaclab.utils.math import axis_angle_from_quat, quat_apply, quat_apply_inverse, quat_inv, quat_mul, yaw_quat
+from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_inv, quat_mul, yaw_quat
 
 
 def average_gradients(module):
@@ -35,6 +35,14 @@ def yaw_angle(quaternion):
 def rotation_increment(vector):
     angle = vector.norm(dim=-1, keepdim=True)
     return torch.cat((0.5 * torch.sinc(angle / (2 * torch.pi)) * vector, (angle / 2).cos()), -1)
+
+
+def rotation_vector(quaternion):
+    # Avoid an unselected 0/0 branch in the upstream axis-angle conversion: its
+    # forward result at identity is finite, but its backward result contains NaNs.
+    quaternion = quaternion * torch.where(quaternion[..., 3:4] < 0, -1.0, 1.0)
+    angle = 2 * torch.atan2(quaternion[..., :3].norm(dim=-1, keepdim=True), quaternion[..., 3:4])
+    return 2 * quaternion[..., :3] / torch.sinc(angle / (2 * torch.pi))
 
 
 def state_features(state, heights):
@@ -126,7 +134,7 @@ class TerrainWorldModel(nn.Module):
         return torch.cat(
             (
                 quat_apply_inverse(yaw_quat(rot), p1 - p),
-                axis_angle_from_quat(quat_mul(quat_inv(rot), rot1)),
+                rotation_vector(quat_mul(quat_inv(rot), rot1)),
                 quat_apply_inverse(rot, v1 - v),
                 quat_apply_inverse(rot, w1 - w),
                 q1 - q,
