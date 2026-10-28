@@ -40,6 +40,8 @@ def main():
         env = InstinctRlVecEnvWrapper(gym.make(args.task, cfg=cfg))
         try:
             runner = WorldModelRunner(env, agent.to_dict(), str(root), agent.device)
+            if agent.resume:
+                runner.load(cli.checkpoint_path(str(root), agent.load_run, agent.load_checkpoint))
             runner.learn(4)
             assert runner.imagination_updates > 0, "Smoke must exercise actual imagined updates"
             modules = (runner.alg.actor_critic, runner.wm, runner.teacher, *runner.normalizers.values())
@@ -56,6 +58,10 @@ def main():
             assert not runner.replay and not runner.pending
             runner.learn(2)
             assert runner.wm_updates > counters[0] and runner.imagination_updates > counters[1]
+            if runner.wm_cfg["teacher_ema"] > 0:
+                torch.testing.assert_close(
+                    runner.teacher.terrain_gate, runner.alg.actor_critic.actor.terrain_gate, rtol=0, atol=0
+                )
             for module in modules:
                 for value in module.state_dict().values():
                     assert torch.isfinite(value).all()
@@ -73,7 +79,10 @@ def main():
                 exact_module_optimizer_reload=True,
                 cross_rank_equality=True,
                 observation_parity=runner.observation_parity,
-                scope="Short correctness smoke; permissive model-loss gate is not a performance result",
+                validation_threshold=runner.wm_cfg["validation_threshold"],
+                teacher_ema=runner.wm_cfg["teacher_ema"],
+                maximum_imagination_kl=runner.wm_cfg["max_imagination_kl"],
+                scope="Short correctness smoke, not a performance result",
             )
             (root / f"rank-{rank}.json").write_text(json.dumps(report, indent=2) + "\n")
             print(json.dumps(report), flush=True)

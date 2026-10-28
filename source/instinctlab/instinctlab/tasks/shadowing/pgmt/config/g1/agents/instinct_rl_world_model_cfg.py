@@ -19,6 +19,8 @@ class G1PGMTWorldModelRunnerCfg(G1PGMTTerrainPPORunnerCfg):
         horizon=4,
         actor_lr=1e-5,
         anchor=1.0,
+        teacher_ema=0.0,
+        max_imagination_kl=0.0,
         replay_chunks=8,
         actor_updates=1,
         validation_threshold=1.0,

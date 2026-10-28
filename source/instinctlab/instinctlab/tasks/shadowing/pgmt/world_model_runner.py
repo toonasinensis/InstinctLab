@@ -1,6 +1,7 @@
 """Real PGMT PPO plus terrain-conditioned differentiable imagination updates."""
 
 import json
+import math
 import time
 import torch
 import torch.distributed as dist
@@ -22,6 +23,44 @@ def ordinary(tensor):
         return tensor.detach().clone()
 
 
+@torch.no_grad()
+def bounded_actor_step(actor, optimizer, observations, std, maximum_kl):
+    """Backtrack an auxiliary Adam step against fixed replay observations.
+
+    Imagination does not change action noise, so this is the exact diagonal-Gaussian
+    KL on this batch. It bounds a policy change, not the true closed-loop return.
+    """
+    if maximum_kl == 0:
+        optimizer.step()
+        return 0.0, 1.0
+    parameters = list(actor.parameters())
+    original = [p.clone() for p in parameters]
+    old_action = actor(observations).clone()
+    optimizer_state = deepcopy(optimizer.state_dict())
+    optimizer.step()
+    delta = [p - old for p, old in zip(parameters, original, strict=True)]
+    scale = 1.0
+    for _ in range(8):
+        kl = 0.5 * ((actor(observations) - old_action) / std).square().sum(-1).mean()
+        if dist.is_initialized():
+            dist.all_reduce(kl)
+            kl.div_(dist.get_world_size())
+        value = float(kl)
+        if math.isfinite(value) and value <= maximum_kl:
+            return value, scale
+        if not math.isfinite(value):
+            break
+        scale *= min(0.5, 0.9 * math.sqrt(maximum_kl / value))
+        for parameter, old, change in zip(parameters, original, delta, strict=True):
+            parameter.copy_(old + scale * change)
+    for parameter, old in zip(parameters, original, strict=True):
+        parameter.copy_(old)
+    optimizer.load_state_dict(optimizer_state)
+    if not math.isfinite(value):
+        raise FloatingPointError("Nonfinite imagined policy proposal; actor and optimizer were restored")
+    return 0.0, 0.0
+
+
 class WorldModelRunner(TerrainRunner):
     surrogate_version = 2
 
@@ -41,11 +80,15 @@ class WorldModelRunner(TerrainRunner):
             horizon=4,
             actor_lr=1e-5,
             anchor=1.0,
+            teacher_ema=0.0,
+            max_imagination_kl=0.0,
             replay_chunks=8,
             actor_updates=1,
             validation_threshold=1.0,
         )
         self.wm_cfg.update(train_cfg.get("world_model", {}))
+        if not 0 <= self.wm_cfg["teacher_ema"] <= 1 or self.wm_cfg["max_imagination_kl"] < 0:
+            raise ValueError("teacher_ema must be in [0,1] and max_imagination_kl must be nonnegative")
         self.heightfield = HeightField.from_context(
             env.unwrapped.command_manager.get_term("motion").terrain, self.wm_cfg["resolution"]
         )
@@ -69,6 +112,8 @@ class WorldModelRunner(TerrainRunner):
             start = time.monotonic()
             metrics = self.fit_world_model(iteration)
             losses, stats = ppo_update(iteration)
+            if self.wm_cfg["teacher_ema"]:
+                self.update_teacher()
             if (
                 iteration >= self.wm_cfg["warmup"]
                 and metrics["wm_validation"] < self.wm_cfg["validation_threshold"]
@@ -85,6 +130,16 @@ class WorldModelRunner(TerrainRunner):
             return losses, stats
 
         self.alg.update = update
+
+    @torch.no_grad()
+    def update_teacher(self):
+        actor = self.alg.actor_critic.actor
+        for target, source in zip(self.teacher.parameters(), actor.parameters(), strict=True):
+            target.lerp_(source, self.wm_cfg["teacher_ema"])
+        # In particular, terrain attention must use the current gate, not the flat gate.
+        source_buffers = dict(actor.named_buffers())
+        for name, target in self.teacher.named_buffers():
+            target.copy_(source_buffers[name])
 
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
         if dist.is_initialized():
@@ -279,10 +334,17 @@ class WorldModelRunner(TerrainRunner):
             for index, data in enumerate(sequence[:-1]):
                 obs, valid = self.mdp.observations(state, history, data)
                 obs = normalizer(obs)
+                if index == 0:
+                    initial_obs = obs.detach()
                 action = actor(obs)
                 with torch.no_grad():
                     target_action = self.teacher(obs.detach())
-                anchor_loss = anchor_loss + (action - target_action).square().mean()
+                # No teacher loss on predicted states paired with a post-reset reference.
+                # Detach the weight so predicting death cannot reduce the anchor penalty.
+                weight = (discount * valid).detach()
+                anchor_loss = anchor_loss + (
+                    (action - target_action).square().mean(-1) * weight
+                ).sum() / weight.sum().clamp_min(1)
                 heights, _ = self.heightfield.local(state[:, :3], yaw_angle(state[:, 3:7]))
                 previous_state = state
                 state, contact = self.wm.step(state, action, previous_action, contact, heights)
@@ -300,8 +362,14 @@ class WorldModelRunner(TerrainRunner):
             loss.backward()
             average_gradients(actor)
             grad = torch.nn.utils.clip_grad_norm_(actor.parameters(), 0.5, error_if_nonfinite=True)
-            self.actor_optimizer.step()
-            self.imagination_updates += 1
+            kl, step_scale = bounded_actor_step(
+                actor,
+                self.actor_optimizer,
+                initial_obs,
+                self.alg.actor_critic.std.detach(),
+                self.wm_cfg["max_imagination_kl"],
+            )
+            self.imagination_updates += int(step_scale > 0)
             # Release the mutable shared-intent graph before the next PPO call.
             actor.intent = actor.intent.detach()
         finally:
@@ -311,6 +379,8 @@ class WorldModelRunner(TerrainRunner):
             imagined_return=float(objective.mean().detach()),
             imagination_grad=float(grad),
             anchor_loss=float(anchor_loss.detach()),
+            imagination_kl=kl,
+            imagination_step_scale=step_scale,
         )
 
     def save(self, path, infos=None):
@@ -345,20 +415,26 @@ class WorldModelRunner(TerrainRunner):
         # keep non-capturable Adam's scalar step counters on CPU, as on a fresh run.
         saved = torch.load(path, map_location="cpu", weights_only=True)
         model = saved["scheme1"]
+        saved_config = {"teacher_ema": 0.0, "max_imagination_kl": 0.0, **model["config"]}
         if model.get("surrogate_version", 1) != self.surrogate_version and not self.cfg.get(
             "allow_surrogate_change", False
         ):
             raise ValueError("Surrogate reward changed; explicitly set allow_surrogate_change for a new experiment")
         changed = {
-            key
-            for key in model["config"].keys() | self.wm_cfg.keys()
-            if model["config"].get(key) != self.wm_cfg.get(key)
+            key for key in saved_config.keys() | self.wm_cfg.keys() if saved_config.get(key) != self.wm_cfg.get(key)
         }
-        if changed and not (changed <= {"anchor"} and self.cfg.get("allow_surrogate_change", False)):
+        if changed and not (
+            changed <= {"anchor", "teacher_ema", "max_imagination_kl"} and self.cfg.get("allow_surrogate_change", False)
+        ):
             raise ValueError(f"World model configuration changed on resume: {sorted(changed)}")
         result = super().load(path)
         self.wm.load_state_dict(model["world_model"])
         self.teacher.load_state_dict(model["teacher"])
+        if saved_config["teacher_ema"] == 0 and self.wm_cfg["teacher_ema"] > 0:
+            # Explicit activation after a PPO/WM warm-up starts from that learned policy,
+            # not from an untrained terrain branch in the original flat teacher.
+            self.teacher.load_state_dict(self.alg.actor_critic.actor.state_dict())
+            print("[Scheme1] Activated EMA teacher from the resumed actor", flush=True)
         self.wm_optimizer.load_state_dict(model["wm_optimizer"])
         self.actor_optimizer.load_state_dict(model["actor_optimizer"])
         self.wm_updates = model["wm_updates"]

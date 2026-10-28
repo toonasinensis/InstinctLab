@@ -5,6 +5,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,7 +19,7 @@ from instinctlab.tasks.shadowing.pgmt.world_model import (
     average_gradients,
     rotation_increment,
 )
-from instinctlab.tasks.shadowing.pgmt.world_model_runner import WorldModelRunner
+from instinctlab.tasks.shadowing.pgmt.world_model_runner import WorldModelRunner, bounded_actor_step
 
 
 def distributed_contract(rank, rendezvous):
@@ -40,6 +41,16 @@ def distributed_contract(rank, rendezvous):
         average_gradients(model)
         torch.testing.assert_close(model.weight.grad, torch.full_like(model.weight, 2.0))
         torch.testing.assert_close(model.bias.grad, torch.full_like(model.bias, 2.0))
+        with torch.no_grad():
+            model.weight.zero_()
+            model.bias.zero_()
+        optimizer = torch.optim.SGD(model.parameters(), lr=1.0)
+        kl, scale = bounded_actor_step(model, optimizer, torch.full((2, 2), float(rank)), torch.ones(1), 0.002)
+        assert 0 < scale < 1 and 0 < kl <= 0.002
+        for value in model.parameters():
+            expected = value.detach().clone()
+            dist.broadcast(expected, src=0)
+            torch.testing.assert_close(value, expected, rtol=0, atol=0)
     finally:
         dist.destroy_process_group()
 
@@ -120,6 +131,38 @@ class GeometryTest(unittest.TestCase):
 
 
 class DynamicsTest(unittest.TestCase):
+    def test_oversized_imagination_step_is_bounded(self):
+        actor = torch.nn.Linear(2, 1)
+        observations = torch.tensor([[1.0, 2.0], [-2.0, 1.0]])
+        before = actor(observations).detach()
+        optimizer = torch.optim.Adam(actor.parameters(), lr=1.0)
+        actor(observations).sum().backward()
+        kl, scale = bounded_actor_step(actor, optimizer, observations, torch.ones(1), 0.002)
+        actual = 0.5 * (actor(observations) - before).square().sum(-1).mean()
+        self.assertGreater(scale, 0)
+        self.assertLess(scale, 1)
+        self.assertLessEqual(kl, 0.002)
+        torch.testing.assert_close(actual, torch.tensor(kl))
+
+    def test_nonfinite_proposal_restores_actor_and_adam_before_raising(self):
+        class Exponential(torch.nn.Module):
+            def forward(self, x):
+                return x.exp()
+
+        actor = torch.nn.Sequential(torch.nn.Linear(1, 1, bias=False), Exponential())
+        parameter = actor[0].weight
+        with torch.no_grad():
+            parameter.zero_()
+        optimizer = torch.optim.Adam(actor.parameters(), lr=1.0)
+        parameter.grad = torch.zeros_like(parameter)
+        optimizer.step()
+        saved = deepcopy(optimizer.state_dict())
+        parameter.grad = -torch.ones_like(parameter)
+        with self.assertRaisesRegex(FloatingPointError, "restored"):
+            bounded_actor_step(actor, optimizer, torch.tensor([[1000.0]]), torch.ones(1), 0.002)
+        torch.testing.assert_close(parameter, torch.zeros_like(parameter), rtol=0, atol=0)
+        torch.testing.assert_close(optimizer.state_dict(), saved, rtol=0, atol=0)
+
     def test_zero_rotation_residual_has_finite_training_gradient(self):
         state = torch.zeros(1, 71)
         state[:, 6] = 1.0

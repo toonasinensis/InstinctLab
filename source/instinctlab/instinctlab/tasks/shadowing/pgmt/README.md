@@ -193,6 +193,23 @@ held out of WM fitting and normalizer estimation. A held-out four-step normalize
 imagined policy updates. This gate is a practical error screen, not a guarantee against model bias.
 `world-model.jsonl` records losses, gradient norms and the actual count of imagination updates.
 
+For adaptation from a weaker flat checkpoint, `agent.world_model.teacher_ema` can replace the
+permanently frozen anchor with a teacher that slowly follows the actor after each real PPO update.
+Its terrain gate and other buffers follow the current actor exactly. Zero retains the frozen-teacher
+behavior. The teacher loss excludes post-terminal reference windows. This teacher is derived from
+the same training run; it does not load the stage-two evaluation policy.
+
+`agent.world_model.max_imagination_kl` optionally bounds each auxiliary step's mean Gaussian KL on
+fixed, reconstructed observations at real replay states. Since imagination does not update action
+noise, the KL formula is exact on that batch. Oversized steps are backtracked identically across
+ranks; rejected steps restore both actor and optimizer. A nonfinite proposal raises after restoration.
+This is a local step-size constraint, not a guarantee of real-environment improvement. Zero disables
+the constraint for legacy experiments. Logs include the accepted KL and parameter-step scale.
+
+The current stage-one experiment uses 200 warm-up iterations, EMA coefficient 0.05, anchor weight 10
+and maximum imagination KL 0.002. These are experimental settings, not a claim of stage-one
+convergence to the existing terrain checkpoint. Warm-up only fits the WM and runs real PPO.
+
 Start from a native stage-one checkpoint:
 
 ```bash
@@ -220,8 +237,11 @@ complete checkpoint, after adding WM/optimizer state, through an atomic rename.
 Checkpoint surrogate versions are checked on resume. Use `agent.allow_surrogate_change=true` only
 when deliberately starting a new experiment with a different surrogate reward; this opt-in is
 recorded in the saved run configuration.
-The same opt-in permits changing the teacher-anchor loss weight for an explicit fine-tuning
-experiment; it does not permit changing the model shape, raster resolution or rollout settings.
+The same opt-in permits changing the teacher-anchor weight, EMA coefficient and imagination KL
+limit for an explicit experiment; it does not permit changing model shape, raster resolution or
+rollout settings. Activating EMA on a previously frozen-teacher checkpoint initializes the teacher
+from that checkpoint's actor. An ordinary EMA-to-EMA resume restores the saved teacher exactly.
+Old checkpoints without the EMA/KL settings retain their zero defaults.
 
 The benchmark fixes motion, start frame, yaw, terrain family and level for every case, records only
 the first episode and captures failure metrics before auto-reset. Failure and tile exit are reported
