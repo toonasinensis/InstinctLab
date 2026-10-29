@@ -15,17 +15,23 @@ class TerrainPolicy:
     def __init__(self, checkpoint):
         self.path = Path(checkpoint).resolve()
         saved = torch.load(self.path, map_location="cpu", weights_only=True)
-        if saved["infos"]["schema"] != "pgmt-lafan-terrain-v1":
-            raise ValueError("Select a native PGMT stage-two terrain checkpoint")
+        schema = saved.get("schema", saved.get("infos", {}).get("schema"))
+        self.pure_wm = schema == "pgmt-purewm-v1"
+        if self.pure_wm:
+            state, normalizer = saved["actor"], saved["policy_normalizer"]
+            self.update = saved["iteration"]
+        elif schema == "pgmt-lafan-terrain-v1":
+            state = {
+                k.removeprefix("actor."): v for k, v in saved["model_state_dict"].items() if k.startswith("actor.")
+            }
+            normalizer = saved["policy_normalizer_state_dict"]
+            self.update = saved["iter"]
+        else:
+            raise ValueError("Select a native PGMT terrain or pure-WM checkpoint")
         self.actor = TerrainActor().eval()
-        self.actor.load_state_dict(
-            {k.removeprefix("actor."): v for k, v in saved["model_state_dict"].items() if k.startswith("actor.")},
-            strict=True,
-        )
-        normalizer = saved["policy_normalizer_state_dict"]
+        self.actor.load_state_dict(state, strict=True)
         self.mean, self.std = normalizer["_mean"], normalizer["_std"]
         self.gate = float(self.actor.terrain_gate)
-        self.update = saved["iter"]
         self.env_cfg = load_saved_yaml(str(self.path.parent / "params/env.yaml"))
         command = self.env_cfg["commands"]["motion"]
         command.update(
@@ -37,6 +43,7 @@ class TerrainPolicy:
         )
         self.provenance = dict(
             checkpoint=str(self.path),
+            schema=schema,
             update=self.update,
             actor="native TerrainActor",
             normalization="frozen; raw height map bypass",
@@ -72,6 +79,8 @@ class TerrainPolicy:
             state, source, actor.query_positions, positions, attention_bias=bias, return_weights=True
         )
         actions = actor.action_head(torch.cat((history[:, -1], intent[:, 0]), -1))
+        if self.pure_wm:
+            actions = actions.clamp(-20, 20)
         return dict(
             actions=actions,
             history_weights=history_weights,

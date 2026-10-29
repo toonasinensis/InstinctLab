@@ -87,5 +87,8 @@ run with small networks and permissive gates verifies execution only. It must
 never be reported as a trained terrain result. First-result evaluation must show
 reference-versus-actual trajectories and videos, global position/orientation and
 motion progress, and applicable terrain passage. Survival alone is insufficient.
+The MuJoCo replay `TerrainPolicy` also accepts pure checkpoints and retains their
+action clamp; these videos are a separate deployment replay from the native
+Newton benchmark and must be identified as such.
 Matched PPO controls, systematic seeds and detailed derivative studies follow
 the first useful result; final stage2-equivalence remains an empirical objective.
