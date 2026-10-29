@@ -37,6 +37,20 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def startup_context_modes(event_manager):
+    """Reject episode-varying parameters before taking an environment-indexed snapshot."""
+    modes = {
+        name: event_manager.get_term_cfg(name).mode
+        for name in ("physics_material", "add_joint_default_pos", "base_com")
+    }
+    if any(mode != "startup" for mode in modes.values()):
+        raise ValueError(
+            "Pure-WM environment-indexed context requires startup-only material, joint-default and COM events; "
+            f"episode-varying context needs transition-local replay snapshots: {modes}"
+        )
+    return modes
+
+
 class PureWorldModelRunner:
     schema = "pgmt-purewm-v1"
 
@@ -63,6 +77,9 @@ class PureWorldModelRunner:
             self.native.command_manager.get_term("motion").terrain, self.options["resolution"]
         )
         self.mdp = PureImaginationMDP(self.native, heightfield)
+        # gym.make applies startup events and the vector wrapper resets before
+        # runner construction. These bindings stay fixed across episode resets.
+        context_modes = startup_context_modes(self.native.event_manager)
         material = self.native.event_manager.get_term_cfg("physics_material").func._impl
         robot = self.native.scene["robot"].data
         com_event = self.native.event_manager.get_term_cfg("base_com").func
@@ -75,6 +92,8 @@ class PureWorldModelRunner:
             joint_bias=bias.shape[-1],
             torso_com=com.shape[-1],
             restitution="not applied by pinned MuJoCo Warp solver",
+            event_modes=context_modes,
+            binding="post-startup environment snapshot; invariant across episode resets",
         )
         self.wm = TerrainDynamics(self.xi.shape[-1], self.options["hidden"], self.options["amp"]).to(device)
         self.critic = ImaginedValue(296 + 14 + self.xi.shape[-1] + 441).to(device)
@@ -382,7 +401,7 @@ class PureWorldModelRunner:
 
     def imagine_batch(self, count):
         horizon, gamma = self.options["horizon"], self.options["gamma"]
-        start, history = self.replay.starts(count, horizon, self.mdp.windows.lengths)
+        start, history = self.replay.collective_starts(count, horizon, self.mdp.windows.lengths)
         state, previous_action, contact, support = (
             start[key] for key in ("state", "previous_action", "contact", "support")
         )
@@ -577,7 +596,7 @@ class PureWorldModelRunner:
             or saved["reward_hash"] != self.reward_hash
             or saved["xi_schema"] != self.xi_schema
         ):
-            raise ValueError("Pure-WM resume changed algorithm/reward/context contract")
+            raise ValueError("Pure-WM resume changed algorithm/reward/context contract (including horizon)")
         if len(saved["ranks"]) != self.world_size or saved["local_envs"] != self.env.num_envs:
             raise ValueError("Pure-WM resume changed rank or environment count")
         for name in (

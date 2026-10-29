@@ -22,6 +22,14 @@ serialization is term-major, while attention tokens are frame-major.
   29 joint offsets and 3 torso COM offsets. The deployment actor does not receive
   these values. Randomized restitution did not affect the pinned MuJoCo Warp
   solver's material arrays, so it is excluded.
+  The supported material, joint-default and COM events run only at startup,
+  before runner construction. Their per-environment snapshots therefore remain
+  valid across resets. Construction rejects reset/interval modes, and
+  `xi_schema` records the event modes and binding lifetime. Episode-varying
+  randomization requires transition-local context snapshots before it can be
+  supported. Older checkpoints without this metadata fail strict resume; any
+  metadata migration must first verify their recorded event configurations and
+  preserve the original checkpoint and all tensor contents.
 - Chronological replay holds 1000 real steps per environment. Initial/refill
   collection is 64 steps; the learner collects 2/3 alternating steps per update
   (`utd=0.4`). WM fitting uses recursive 8-step windows and online normalization
@@ -69,6 +77,9 @@ Replay transitions include the terminal state captured before reset, and all
 successor rows after a reset are masked. Actor starts require a complete motion
 window; a real replay termination never truncates a different imagined action
 trajectory.
+If reference coverage is exhausted on any rank, every rank receives the same
+collective failure before starting that microbatch's imagined rollout or entering
+gradient averaging. No rank continues the actor optimizer after that failure.
 
 ## Running and interpreting results
 
@@ -81,6 +92,7 @@ Pure checkpoints use `pgmt-purewm-v1`, preserve all three optimizers and counter
 and reject hybrid/stage2 resumes. Resume starts new episodes and refills replay;
 it is optimizer continuation, not exact simulator continuation. Algorithm or
 reward configuration changes require a new explicitly designed experiment.
+This includes a horizon-only change: strict resume deliberately rejects it.
 
 `benchmark.load_actor` accepts pure checkpoints alongside stage1/stage2. A smoke
 run with small networks and permissive gates verifies execution only. It must

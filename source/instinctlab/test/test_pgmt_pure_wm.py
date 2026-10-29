@@ -1,7 +1,13 @@
 """Essential CPU contracts for standalone world-model training components."""
 
+import tempfile
+import time
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import unittest
+from datetime import timedelta
+from types import SimpleNamespace
 
 from instinctlab.tasks.shadowing.pgmt.pure_wm_model import (
     ImaginedValue,
@@ -9,7 +15,62 @@ from instinctlab.tasks.shadowing.pgmt.pure_wm_model import (
     TerrainDynamics,
     lambda_returns,
 )
-from instinctlab.tasks.shadowing.pgmt.pure_wm_replay import TransitionReplay
+from instinctlab.tasks.shadowing.pgmt.pure_wm_replay import ReferenceCoverageError, TransitionReplay
+from instinctlab.tasks.shadowing.pgmt.pure_wm_runner import PureWorldModelRunner, startup_context_modes
+
+
+def one_rank_bad_coverage(rank, rendezvous):
+    dist.init_process_group(
+        "gloo", init_method="file://" + rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=20)
+    )
+    try:
+        runner = PureWorldModelRunner.__new__(PureWorldModelRunner)
+        runner.world_size = 2
+        runner.options = dict(actor_batch=4, actor_microbatch=2, horizon=2, gamma=0.99)
+        runner.wm, runner.actor, runner.critic = (torch.nn.Linear(1, 1) for _ in range(3))
+        for name in ("wm", "actor", "critic"):
+            setattr(runner, name + "_optimizer", torch.optim.Adam(getattr(runner, name).parameters()))
+        runner.actor_updates = runner.critic_updates = 0
+        runner.replay = TransitionReplay(12, 8, "cpu")
+        for step in range(12):
+            runner.replay.add(ReplayContractTest.record(step))
+        runner.mdp = SimpleNamespace(windows=SimpleNamespace(lengths=torch.tensor([1000 if rank == 0 else 2])))
+        before = [p.detach().clone() for p in runner.actor.parameters()]
+        started = time.monotonic()
+        try:
+            runner.update_actor()
+        except ReferenceCoverageError as error:
+            assert "aborted on all ranks" in str(error)
+        else:
+            raise AssertionError("One rank's bad coverage must abort both actor updates")
+        assert time.monotonic() - started < 5
+        assert runner.actor_updates == runner.critic_updates == 0
+        assert all(torch.equal(old, new) for old, new in zip(before, runner.actor.parameters()))
+        assert all(p.requires_grad for p in runner.wm.parameters())
+        assert all(p.requires_grad for p in runner.critic.parameters())
+        # Every peer can enter another collective; nobody was stranded averaging gradients.
+        starts, history = runner.replay.collective_starts(2, 2, torch.tensor([1000]))
+        assert len(starts["state"]) == len(history) == 2
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+class ContextContractTest(unittest.TestCase):
+    def test_context_requires_startup_only_events(self):
+        modes = {name: "startup" for name in ("physics_material", "add_joint_default_pos", "base_com")}
+        manager = SimpleNamespace(get_term_cfg=lambda name: SimpleNamespace(mode=modes[name]))
+        self.assertEqual(startup_context_modes(manager), modes)
+        for name in modes:
+            for mode in ("reset", "interval"):
+                modes[name] = mode
+                with self.assertRaisesRegex(ValueError, "transition-local replay snapshots"):
+                    startup_context_modes(manager)
+            modes[name] = "startup"
+
+    def test_one_rank_coverage_failure_aborts_update_actor_together(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mp.spawn(one_rank_bad_coverage, args=(directory + "/rendezvous",), nprocs=2, join=True)
 
 
 class ModelContractTest(unittest.TestCase):

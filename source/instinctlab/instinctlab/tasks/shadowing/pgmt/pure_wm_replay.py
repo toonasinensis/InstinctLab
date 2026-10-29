@@ -1,6 +1,11 @@
 """Chronological replay independent of PPO rollout chunks and episode resets."""
 
 import torch
+import torch.distributed as dist
+
+
+class ReferenceCoverageError(RuntimeError):
+    """The bounded sampler could not find enough complete reference windows."""
 
 
 class TransitionReplay:
@@ -78,7 +83,26 @@ class TransitionReplay:
             count += len(chosen)
             if count == batch:
                 return {name: torch.cat([x[name] for x in records]) for name in records[0]}, torch.cat(histories)
-        raise RuntimeError("Insufficient motion-reference coverage for the requested imagination horizon")
+        raise ReferenceCoverageError("Insufficient motion-reference coverage for the requested imagination horizon")
+
+    def collective_starts(self, batch, horizon, motion_lengths, history_length=10):
+        """Decide reference-coverage failure together before any rank enters BPTT."""
+        sample, error = None, None
+        try:
+            sample = self.starts(batch, horizon, motion_lengths, history_length)
+        except ReferenceCoverageError as exc:
+            error = exc
+        if not dist.is_initialized():
+            if error is not None:
+                raise error
+            return sample
+        failed = torch.tensor(int(error is not None), device=self.device)
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+        if failed.item():
+            raise ReferenceCoverageError(
+                "Insufficient motion-reference coverage on at least one rank; actor update aborted on all ranks"
+            ) from error
+        return sample
 
     def clear(self):
         self.pointer = self.size = 0
