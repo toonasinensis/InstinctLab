@@ -92,8 +92,9 @@ class ImaginationMDP:
         rotation = root_R[:, None] @ matrices[..., :3, :3]
         return position, rotation
 
-    def update_support(self, state, support, context):
-        feet = self.bodies(state)[0][:, self.command.foot_ids]
+    def update_support(self, state, support, context, bodies=None):
+        position = self.bodies(state)[0] if bodies is None else bodies[0]
+        feet = position[:, self.command.foot_ids]
         foot_height, valid = self.heightfield.query(feet[..., :2])
         root_height, root_valid = self.heightfield.query(state[:, :2])
         labels = (context["ref_contact"] * context["ref_valid"])[:, self.command.foot_ids]
@@ -140,9 +141,9 @@ class ImaginationMDP:
             valid,
         )
 
-    def critic_observations(self, state, action, support, context):
+    def critic_observations(self, state, action, support, context, bodies=None):
         """Native 296-value critic layout, with counterfactual robot/support state."""
-        position, rotation = self.bodies(state)
+        position, rotation = self.bodies(state) if bodies is None else bodies
         root_R = matrix_from_quat(state[:, 3:7])
         inverse_R = root_R.transpose(-1, -2)
         target = torch.cat((context["ref_position"][:, :2], context["ref_clearance"][:, :1] + support[:, None]), -1)

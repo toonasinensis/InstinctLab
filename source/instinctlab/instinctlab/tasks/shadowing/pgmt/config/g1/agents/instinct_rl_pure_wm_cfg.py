@@ -37,5 +37,8 @@ class G1PGMTPureWorldModelRunnerCfg(G1PGMTTerrainPPORunnerCfg):
         critic_epochs=5,
         critic_minibatches=4,
     )
+    # Execution choices do not change the checkpoint's algorithm contract.
+    # Zero means one full local batch. The actor keeps a bounded BPTT batch.
+    pure_wm_execution: dict = dict(compile=True, wm_microbatch=0, actor_microbatch=512, profile=False)
     experiment_name = "g1_pgmt_pure_wm"
     run_name = "Stage1PureWM"

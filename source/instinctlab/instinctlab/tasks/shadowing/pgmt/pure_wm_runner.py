@@ -61,6 +61,11 @@ class PureWorldModelRunner:
         self.rank = dist.get_rank() if dist.is_initialized() else 0
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
         self.options = dict(train_cfg["pure_wm"])
+        self.execution = dict(train_cfg.get("pure_wm_execution", {}))
+        for name in ("wm_microbatch", "actor_microbatch"):
+            if self.execution.get(name, self.options[name]) < 0:
+                raise ValueError(f"{name} must be nonnegative (zero means the full local batch)")
+        self.timings = {}
         if train_cfg.get("stage2_initialization"):
             raise ValueError("Pure WM only accepts original stage1 initialization")
         if self.native.cfg.observations.policy.enable_corruption:
@@ -112,6 +117,14 @@ class PureWorldModelRunner:
                 for value in module.state_dict().values():
                     dist.broadcast(value, src=0)
         self.reward_hash = hashlib.sha256(json.dumps(self.mdp.contract, sort_keys=True).encode()).hexdigest()
+        # Compile tensor-only kernels. Replay sampling, reference-bank reads,
+        # collectives and online moments remain outside these graphs.
+        compile_kernel = torch.compile if self.execution.get("compile", False) else lambda function, **_: function
+        self._wm_sequence = compile_kernel(self.wm_sequence, fullgraph=True, dynamic=False)
+        self._imagined_step = compile_kernel(self.imagined_step, fullgraph=True, dynamic=False)
+        self._imagined_objective = compile_kernel(self.imagined_objective, fullgraph=True, dynamic=False)
+        self._kinematics = compile_kernel(self.mdp.kinematics.forward, fullgraph=True, dynamic=False)
+        self._critic = compile_kernel(self.critic, fullgraph=True, dynamic=False)
         if self.log_dir and self.rank == 0:
             self.log_dir.mkdir(parents=True, exist_ok=True)
             (self.log_dir / "pure-wm-contract.json").write_text(
@@ -119,6 +132,7 @@ class PureWorldModelRunner:
                     dict(
                         schema=self.schema,
                         options=self.options,
+                        execution=self.execution,
                         xi=self.xi_schema,
                         rewards=self.mdp.contract,
                         reward_hash=self.reward_hash,
@@ -269,8 +283,8 @@ class PureWorldModelRunner:
             self.real_metrics["clipped_action_fraction"] = float((action.abs() >= 20).float().mean())
             self.actor.intent = self.actor.intent.detach()
 
-    def critic_features(self, state, action, support, contact, context, xi):
-        native = self.mdp.critic_observations(state, action, support, context)
+    def critic_features(self, state, action, support, contact, context, xi, bodies=None):
+        native = self.mdp.critic_observations(state, action, support, context, bodies=bodies)
         heights, _ = self.mdp.heightfield.local(state[:, :3], yaw_angle(state[:, 3:7]))
         return torch.cat((native, contact, xi, heights), -1)
 
@@ -315,18 +329,28 @@ class PureWorldModelRunner:
     def fit_world_model(self):
         batch = self.options["wm_batch"] // self.world_size
         length = self.options["wm_window"]
-        total = 0.0
+        total = torch.zeros((), device=self.device)
+        microbatch = self.microbatch("wm", batch)
         for _ in range(self.options["wm_updates"]):
             self.wm_optimizer.zero_grad(set_to_none=True)
-            for begin in range(0, batch, self.options["wm_microbatch"]):
-                count = min(batch - begin, self.options["wm_microbatch"])
+            for begin in range(0, batch, microbatch):
+                count = min(batch - begin, microbatch)
                 data = self.replay.sequences(count, length)
-                loss, _, _ = self.wm_sequence(data, length)
+                loss, _, _ = self._wm_sequence(data, length)
                 (loss * count / batch).backward()
-                total += float(loss.detach()) * count / batch / length
+                total += loss.detach() * count / batch / length
             self.optimizer_step(self.wm, self.wm_optimizer)
             self.wm_updates += 1
-        return total / self.options["wm_updates"]
+        return float(total / self.options["wm_updates"])
+
+    def microbatch(self, name, batch):
+        value = getattr(self, "execution", {}).get(name + "_microbatch", self.options[name + "_microbatch"])
+        return min(value or batch, batch)
+
+    def clock(self):
+        if getattr(self, "execution", {}).get("profile", False) and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        return time.perf_counter()
 
     @torch.no_grad()
     def validation(self):
@@ -399,86 +423,132 @@ class PureWorldModelRunner:
         passed = passed and min(metrics[f"h{h}/valid_fraction"], metrics["current/valid_fraction"]) >= 0.5
         return passed, metrics
 
-    def imagine_batch(self, count):
-        horizon, gamma = self.options["horizon"], self.options["gamma"]
-        start, history = self.replay.collective_starts(count, horizon, self.mdp.windows.lengths)
-        state, previous_action, contact, support = (
-            start[key] for key in ("state", "previous_action", "contact", "support")
+    def imagined_step(self, state, previous_action, contact, support, history, context, next_context, xi, noise):
+        """The causal perception -> action -> dynamics -> support recurrence."""
+        observation, valid = self.mdp.observations(state, history, context)
+        action = (self.actor(self.policy_normalizer(observation)) + self.options["action_noise"] * noise).clamp(-20, 20)
+        # The observation already contains this state's differentiable local map.
+        state, logits, _ = self.wm(state, action, previous_action, contact, observation[:, 1678:], xi)
+        contact = logits.sigmoid()
+        kinematics = self.mdp.kinematics.forward(state, next_context["root_com"], next_context["body_com"])
+        support, support_valid = self.mdp.update_support(state, support, next_context, bodies=kinematics[:2])
+        history = torch.cat((history[:, 1:], self.mdp.proprioception(state, action, next_context)[:, None]), 1)
+        return state, action, contact, support, history, valid * support_valid, kinematics
+
+    def imagined_objective(self, states, actions, contacts, supports, contexts, kinematics, validity, episode_step, xi):
+        """Batch the non-causal reward and critic work over time and samples."""
+        horizon, count = validity.shape
+        gamma = self.options["gamma"]
+        context = {key: value[1:].flatten(0, 1) for key, value in contexts.items()}
+        previous_context = {key: value[:-1].flatten(0, 1) for key, value in contexts.items()}
+        reward, survival, _ = self.mdp.objective(
+            states[1:].flatten(0, 1),
+            actions[1:].flatten(0, 1),
+            actions[:-1].flatten(0, 1),
+            supports[1:].flatten(),
+            context,
+            states[:-1].flatten(0, 1),
+            contacts[1:].flatten(0, 1),
+            contacts[:-1].flatten(0, 1),
+            previous_context,
+            (episode_step[None] + torch.arange(horizon, device=states.device)[:, None] > 0).float().flatten(),
+            kinematics=tuple(value[1:].flatten(0, 1) for value in kinematics),
+            previous_kinematics=tuple(value[:-1].flatten(0, 1) for value in kinematics),
         )
-        xi = self.xi[start["env_id"]]
-        context = self.mdp.reference_context(start, 0)
-        discount, objective = state.new_ones(count), state.new_zeros(count)
-        features = [self.critic_features(state, previous_action, support, contact, context, xi).detach()]
-        rewards, survival_steps = [], []
-        for step in range(horizon):
-            observation, valid = self.mdp.observations(state, history, context)
-            action = self.action(observation)
-            heights, _ = self.mdp.heightfield.local(state[:, :3], yaw_angle(state[:, 3:7]))
-            previous_state, previous_contact, previous_context = state, contact, context
-            state, logits, _ = self.wm(state, action, previous_action, contact, heights, xi)
-            contact = logits.sigmoid()
-            context = self.mdp.reference_context(start, step + 1)
-            support, support_valid = self.mdp.update_support(state, support, context)
-            reward, survival, _ = self.mdp.objective(
-                state,
-                action,
-                previous_action,
-                support,
-                context,
-                previous_state,
-                contact,
-                previous_contact,
-                previous_context,
-                (start["episode_step"] + step > 0).float(),
-            )
-            # Pay the terminating step's reward, then absorb. Real replay done
-            # describes another action trajectory and is never used here.
-            objective = objective + discount * reward
-            survival = survival * valid * support_valid
-            discount = discount * gamma * survival
-            rewards.append(reward.detach())
-            survival_steps.append(survival.detach())
-            history = torch.cat((history[:, 1:], self.mdp.proprioception(state, action, context)[:, None]), 1)
-            previous_action = action
-            feature = self.critic_features(state, action, support, contact, context, xi)
-            features.append(feature.detach())
-        objective = objective + discount * self.critic(feature)
-        features = torch.stack(features)
+        rewards = reward.reshape(horizon, count)
+        survival = survival.reshape(horizon, count) * validity
+        discount = (gamma * survival).cumprod(0)
+        # Pay the terminating step's reward before absorbing the trajectory.
+        before = torch.cat((discount.new_ones(1, count), discount[:-1]), 0)
+        flat_context = {key: value.flatten(0, 1) for key, value in contexts.items()}
+        features = self.critic_features(
+            states.flatten(0, 1),
+            actions.flatten(0, 1),
+            supports.flatten(),
+            contacts.flatten(0, 1),
+            flat_context,
+            xi[None].expand(horizon + 1, -1, -1).flatten(0, 1),
+            bodies=tuple(value.flatten(0, 1) for value in kinematics[:2]),
+        ).reshape(horizon + 1, count, -1)
+        objective = (before * rewards).sum(0) + discount[-1] * self.critic(features[-1])
+        features = features.detach()
         with torch.no_grad():
             values = self.critic(features.flatten(0, 1)).reshape(horizon + 1, count)
-            targets = lambda_returns(
-                torch.stack(rewards), torch.stack(survival_steps), values, gamma, self.options["lambda"]
-            )
+            targets = lambda_returns(rewards.detach(), survival.detach(), values, gamma, self.options["lambda"])
         return (
             -objective.mean(),
             features[:-1].flatten(0, 1),
             targets.flatten(),
-            float((discount / gamma**horizon).detach().mean()),
+            (discount[-1] / gamma**horizon).detach().mean(),
+        )
+
+    def imagine_batch(self, count):
+        horizon = self.options["horizon"]
+        start, history = self.replay.collective_starts(count, horizon, self.mdp.windows.lengths)
+        noise = torch.randn(horizon, count, 29, device=self.device)
+        return self.rollout_batch(start, history, noise)
+
+    def rollout_batch(self, start, history, noise):
+        """Execute fixed starts/noise, also permitting paired derivative checks."""
+        horizon = self.options["horizon"]
+        contexts = self.mdp.reference_sequence(start, horizon)
+        context = {key: value[0] for key, value in contexts.items()}
+        state, action, contact, support = (start[key] for key in ("state", "previous_action", "contact", "support"))
+        xi = self.xi[start["env_id"]]
+        kin = self._kinematics(state, context["root_com"], context["body_com"])
+        states, actions, contacts, supports, kinematics = [state], [action], [contact], [support], [kin]
+        validity = []
+        for step in range(horizon):
+            next_context = {key: value[step + 1] for key, value in contexts.items()}
+            state, action, contact, support, history, valid, kin = self._imagined_step(
+                state, action, contact, support, history, context, next_context, xi, noise[step]
+            )
+            states.append(state)
+            actions.append(action)
+            contacts.append(contact)
+            supports.append(support)
+            kinematics.append(kin)
+            validity.append(valid)
+            context = next_context
+        return self._imagined_objective(
+            torch.stack(states),
+            torch.stack(actions),
+            torch.stack(contacts),
+            torch.stack(supports),
+            contexts,
+            tuple(torch.stack(values) for values in zip(*kinematics)),
+            torch.stack(validity),
+            start["episode_step"],
+            xi,
         )
 
     def update_actor(self):
+        started = self.clock()
         self.wm.requires_grad_(False)
         self.critic.requires_grad_(False)
         self.wm_optimizer.zero_grad(set_to_none=True)
         self.critic_optimizer.zero_grad(set_to_none=True)
         self.actor_optimizer.zero_grad(set_to_none=True)
         batch = self.options["actor_batch"] // self.world_size
-        all_features, all_targets, total, alive = [], [], 0.0, 0.0
+        all_features, all_targets = [], []
+        total, alive = torch.zeros(2, device=getattr(self, "device", "cpu"))
+        microbatch = self.microbatch("actor", batch)
         try:
-            for begin in range(0, batch, self.options["actor_microbatch"]):
-                count = min(batch - begin, self.options["actor_microbatch"])
+            for begin in range(0, batch, microbatch):
+                count = min(batch - begin, microbatch)
                 loss, features, targets, survival = self.imagine_batch(count)
                 (loss * count / batch).backward()
                 self.actor.intent = self.actor.intent.detach()
                 all_features.append(features)
                 all_targets.append(targets)
-                total += float(loss.detach()) * count / batch
+                total += loss.detach() * count / batch
                 alive += survival * count / batch
             norm = self.optimizer_step(self.actor, self.actor_optimizer, value_clip=True)
             self.actor_updates += 1
         finally:
             self.wm.requires_grad_(True)
             self.critic.requires_grad_(True)
+        actor_finished = self.clock()
         features, targets = torch.cat(all_features), torch.cat(all_targets)
         # Online critic moments use detached data; never change them mid-BPTT.
         self.critic.normalizer.update(features)
@@ -487,15 +557,16 @@ class PureWorldModelRunner:
             permutation = torch.randperm(len(features), device=self.device)
             for ids in permutation.chunk(self.options["critic_minibatches"]):
                 self.critic_optimizer.zero_grad(set_to_none=True)
-                loss = (self.critic(features[ids]) - targets[ids]).square().mean()
+                loss = (self._critic(features[ids]) - targets[ids]).square().mean()
                 loss.backward()
                 self.optimizer_step(self.critic, self.critic_optimizer)
                 self.critic_updates += 1
                 value_loss += float(loss.detach())
+        self.timings.update(actor_seconds=actor_finished - started, critic_seconds=self.clock() - actor_finished)
         return dict(
-            actor_loss=total,
+            actor_loss=float(total),
             actor_gradient_norm=norm,
-            imagination_survival=alive,
+            imagination_survival=float(alive),
             critic_loss=value_loss / (self.options["critic_epochs"] * self.options["critic_minibatches"]),
         )
 
@@ -513,10 +584,16 @@ class PureWorldModelRunner:
             self.iteration = iteration
             # UTD .4: one learner iteration for 2.5 new steps per environment.
             steps = math.floor((iteration + 1) / self.options["utd"]) - math.floor(iteration / self.options["utd"])
+            phase_started = self.clock()
             self.collect(steps)
+            collected = self.clock()
             loss = self.fit_world_model()
+            fitted = self.clock()
+            self.timings.update(collect_seconds=collected - phase_started, wm_seconds=fitted - collected)
+            self.timings.update(validation_seconds=0.0, actor_seconds=0.0, critic_seconds=0.0)
             if iteration % self.options["validation_interval"] == 0:
                 gate, metrics = self.validation()
+                self.timings["validation_seconds"] = self.clock() - fitted
             actor_metrics = {}
             if iteration >= self.options["warmup_iterations"] and gate:
                 self.actor.terrain_gate.fill_(min(1.0, (self.actor_updates + 1) / self.options["terrain_gate_ramp"]))
@@ -534,6 +611,7 @@ class PureWorldModelRunner:
                 **metrics,
                 **self.real_metrics,
                 **actor_metrics,
+                **{"timing/" + key: value for key, value in self.timings.items()},
             )
             if self.rank == 0 and iteration % self.cfg["log_interval"] == 0:
                 print("[PureWM] " + json.dumps(row), flush=True)
@@ -581,6 +659,7 @@ class PureWorldModelRunner:
                 actor_updates=self.actor_updates,
                 critic_updates=self.critic_updates,
                 resume_semantics="fresh episodes and replay refill; optimizer continuation, not simulator-exact replay",
+                execution=self.execution,
             )
             torch.save(checkpoint, str(path) + ".tmp")
             os.replace(str(path) + ".tmp", path)
@@ -629,7 +708,12 @@ class PureWorldModelRunner:
         if self.rank == 0 and self.log_dir:
             contract_path = self.log_dir / "pure-wm-contract.json"
             contract = json.loads(contract_path.read_text())
-            contract.update(lineage=self.lineage, resume_from=str(path), resume_semantics=saved["resume_semantics"])
+            contract.update(
+                lineage=self.lineage,
+                resume_from=str(path),
+                resume_semantics=saved["resume_semantics"],
+                resumed_execution=saved.get("execution", {"implementation": "original eager microbatch runner"}),
+            )
             contract_path.write_text(json.dumps(contract, indent=2) + "\n")
         print(f"[PureWM] resumed {path}; fresh episodes, refill {self.options['fill_steps']} steps", flush=True)
 

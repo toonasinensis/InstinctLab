@@ -243,6 +243,16 @@ class PureImaginationMDP(ImaginationMDP):
         context["root_com"], context["body_com"] = self.root_com[ids], self.body_com[ids]
         return context
 
+    def reference_sequence(self, start, horizon):
+        """Read exogenous H+1 reference windows together, outside compiled BPTT."""
+        steps = horizon + 1
+        expanded = {name: value[None].expand(steps, *value.shape).flatten(0, 1) for name, value in start.items()}
+        expanded["frame"] = expanded["frame"] + torch.arange(steps, device=start["frame"].device).repeat_interleave(
+            len(start["frame"])
+        )
+        context = self.reference_context(expanded, 0)
+        return {name: value.reshape(steps, len(start["frame"]), *value.shape[1:]) for name, value in context.items()}
+
     def surface_normal(self, xy):
         eps = self.heightfield.resolution
         offsets = xy.new_tensor([[eps, 0], [-eps, 0], [0, eps], [0, -eps]])
@@ -264,10 +274,16 @@ class PureImaginationMDP(ImaginationMDP):
         previous_contact,
         previous_context,
         derivative_valid,
+        kinematics=None,
+        previous_kinematics=None,
     ):
         c = self.command
-        position, rotation, velocity, spin = self.kinematics.forward(state, context["root_com"], context["body_com"])
-        previous_velocity = self.kinematics.forward(previous_state, context["root_com"], context["body_com"])[2]
+        if kinematics is None:
+            kinematics = self.kinematics.forward(state, context["root_com"], context["body_com"])
+        if previous_kinematics is None:
+            previous_kinematics = self.kinematics.forward(previous_state, context["root_com"], context["body_com"])
+        position, rotation, velocity, spin = kinematics
+        previous_velocity = previous_kinematics[2]
         delta = yaw_quat(quat_mul(state[:, 3:7], quat_inv(context["ref_rotation"][:, 0])))
         target_root = torch.cat((state[:, :2], context["ref_clearance"][:, :1] + support[:, None]), -1)
         aligned = delta[:, None].expand(-1, position.shape[1], -1)
