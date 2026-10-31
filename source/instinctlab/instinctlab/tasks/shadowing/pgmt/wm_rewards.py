@@ -107,6 +107,20 @@ def rotation_error(left, right):
 
 
 class AnalyticRewards:
+    contact_terms = {
+        "auxiliary/undesired_contact",
+        "terrain/slip",
+        "terrain/match",
+        "terrain/switch",
+        "terrain/touchdown",
+        "terrain/stumble",
+    }
+    force_terms = {"auxiliary/impact", "terrain/stumble", "terrain/force"}
+
+    def supported_keys(self, contact=True, force=True):
+        omitted = (self.contact_terms if not contact else set()) | (self.force_terms if not force else set())
+        return [key for key in self.terms if key not in omitted]
+
     def __init__(self, env, heightfield):
         self.env, self.heightfield = env, heightfield
         self.command = c = env.command_manager.get_term("motion")
@@ -300,37 +314,43 @@ class AnalyticRewards:
             (limits[..., 0] - joints).clamp_min(0) + (joints - limits[..., 1]).clamp_min(0)
         ).sum(-1)
         reference, valid = context["ref_contact"], context["ref_valid"]
-        unexpected = (1 - reference) * valid
-        unexpected = unexpected.clone()
-        unexpected[:, c.foot_ids] = 0
-        terms["auxiliary/undesired_contact"] = (contact * unexpected).sum(-1)
-        impact_unexpected = (1 - reference[:, c.impact_ids]) * valid[:, c.impact_ids]
-        terms["auxiliary/impact"] = (
-            force[:, c.impact_ids].norm(dim=-1).sub(100).clamp_min(0).square() * impact_unexpected
-        ).sum(-1)
         feet = c.foot_ids
-        normal, quality, surface_valid = self.surface(position[:, feet, :2], exact_surface)
-        foot_contact = contact[:, feet]
-        terms["terrain/slip"] = (tangent_velocity(velocity[:, feet], normal).square().sum(-1) * foot_contact).sum(-1)
-        terms["terrain/match"] = ((reference * contact + (1 - reference) * (1 - contact)) * valid).sum(-1) / valid.sum(
-            -1
-        ).clamp_min(1)
-        changed = (contact - previous_contact).abs() * derivative_valid[:, None]
-        mismatch = (contact - reference).abs()
-        terms["terrain/switch"] = (changed[:, feet] * mismatch[:, feet] * valid[:, feet]).mean(-1)
-        touchdown = contact[:, feet] * (1 - previous_contact[:, feet]) * derivative_valid[:, None]
-        terms["terrain/touchdown"] = (quality * touchdown * surface_valid).mean(-1)
-        foot_force = force[:, feet]
-        normal_force = (foot_force * normal).sum(-1).abs()
-        terms["terrain/stumble"] = (
-            (tangent_velocity(foot_force, normal).norm(dim=-1) > 5 * normal_force.clamp_min(1)).float() * foot_contact
-        ).sum(-1)
-        terms["terrain/force"] = foot_force.square().sum((-1, -2))
+        if contact is not None:
+            unexpected = ((1 - reference) * valid).clone()
+            unexpected[:, feet] = 0
+            terms["auxiliary/undesired_contact"] = (contact * unexpected).sum(-1)
+            normal, quality, surface_valid = self.surface(position[:, feet, :2], exact_surface)
+            foot_contact = contact[:, feet]
+            terms["terrain/slip"] = (tangent_velocity(velocity[:, feet], normal).square().sum(-1) * foot_contact).sum(
+                -1
+            )
+            terms["terrain/match"] = ((reference * contact + (1 - reference) * (1 - contact)) * valid).sum(
+                -1
+            ) / valid.sum(-1).clamp_min(1)
+            changed = (contact - previous_contact).abs() * derivative_valid[:, None]
+            mismatch = (contact - reference).abs()
+            terms["terrain/switch"] = (changed[:, feet] * mismatch[:, feet] * valid[:, feet]).mean(-1)
+            touchdown = contact[:, feet] * (1 - previous_contact[:, feet]) * derivative_valid[:, None]
+            terms["terrain/touchdown"] = (quality * touchdown * surface_valid).mean(-1)
+        if force is not None:
+            impact_unexpected = (1 - reference[:, c.impact_ids]) * valid[:, c.impact_ids]
+            terms["auxiliary/impact"] = (
+                force[:, c.impact_ids].norm(dim=-1).sub(100).clamp_min(0).square() * impact_unexpected
+            ).sum(-1)
+            foot_force = force[:, feet]
+            terms["terrain/force"] = foot_force.square().sum((-1, -2))
+            if contact is not None:
+                normal_force = (foot_force * normal).sum(-1).abs()
+                terms["terrain/stumble"] = (
+                    (tangent_velocity(foot_force, normal).norm(dim=-1) > 5 * normal_force.clamp_min(1)).float()
+                    * foot_contact
+                ).sum(-1)
         if not c.cfg.enable_contact_objectives:
             for key in terms:
                 if key.startswith("terrain/"):
                     terms[key] = torch.zeros_like(terms[key])
-        if set(terms) != set(self.terms):
+        keys = self.supported_keys(contact is not None, force is not None)
+        if set(terms) != set(keys):
             raise ValueError("Analytic reward implementation does not cover the active native reward contract")
-        weighted = torch.stack([terms[key] * self.terms[key].weight * self.dt for key in self.terms], -1)
+        weighted = torch.stack([terms[key] * self.terms[key].weight * self.dt for key in keys], -1)
         return weighted, terms

@@ -41,7 +41,7 @@ python scripts/instinct_rl/train.py \
 - `agent.warm_start=...`：沿用现有 stage1 actor/normalizer 扩展和新 critic 逻辑。
 - `agent.ppo_checkpoint=...`：从当前 terrain PPO 载入 actor、critic、normalizer、源学习率和已有 terrain gate。PPO optimizer、WM、课程统计、仿真 episode 重新开始；不会把 4096×4 的训练伪装成不同规模的精确 resume。
 
-真正的监督式 WM checkpoint resume 使用已有标准 resume 入口，恢复 PPO、WM 及 optimizer、rank 采样 RNG。仿真 episode/replay 重新填充；不是逐物理步复现。地形栅格摘要、奖励契约和 WM 参数改变会拒绝 resume。摘要按 rank 保存，因为不同 rank 可以生成不同随机地形；任一 rank 的契约不匹配时，所有 rank 一起退出，避免一部分进入恢复 collective 后挂起。当前 schema 为 `pgmt-supervised-wm-v2`。
+真正的监督式 WM checkpoint resume 使用已有标准 resume 入口，恢复 PPO、WM 及 optimizer、rank 采样 RNG。仿真 episode/replay 重新填充；不是逐物理步复现。地形栅格摘要、奖励契约和 WM 参数改变会拒绝 resume。摘要按 rank 保存，因为不同 rank 可以生成不同随机地形；任一 rank 的契约不匹配时，所有 rank 一起退出，避免一部分进入恢复 collective 后挂起。当前 schema 为 `pgmt-supervised-wm-v3`。
 
 ## WM 状态、输入和输出
 
@@ -71,15 +71,15 @@ python scripts/instinct_rl/train.py \
 
 ## 监督训练和隔离
 
-默认每次 PPO 的 24 步 rollout 后执行 8 次 WM AdamW 更新，学习率 `3e-4`，每 rank batch 512，训练开环长度 4（80ms）；保留最近 2 个 rollout chunk。增大卡数时总 WM batch 随 rank 数增加，梯度取平均；这些默认值是诊断起点，不是原论文超参复现。
+默认每次 PPO 的 24 步 rollout 后执行 8 次 WM AdamW 更新，学习率 `3e-4`，每 rank batch 512，训练开环长度 8（160ms）；按时间保留最近 48 步（2 个 PPO rollout）。增大卡数时总 WM batch 随 rank 数增加，梯度取平均；这些默认值是诊断起点，不是原论文超参复现。
 
-每步在 reward 计算后、自动 reset 前截取真实 successor。终止 transition 本身可训练；其后的新 episode 不属于同一条开环序列。采样不会把 PPO rollout chunk 拼成连续轨迹。WM 所有训练数据 detach 并从 inference tensor 复制成可用于 autograd 的普通 tensor。
+每步在 reward 计算后、自动 reset 前截取真实 successor。终止 transition 本身可训练；其后的新 episode 不属于同一条开环序列。采样可跨越相邻 PPO rollout，连续 ring buffer 保留真实时间顺序；只有 episode 边界后被屏蔽。WM 所有训练数据 detach 并从 inference tensor 复制成可用于 autograd 的普通 tensor。
 
 局部 `env_id % 8 == 0` 的完整环境留出，不参与 WM 梯度和 WM 归一化统计；其余 7/8 环境用于训练。PPO 仍使用所有环境。这是同 motion、不同环境/随机化/出生样本的 holdout，**不是新 motion 泛化验证**。
 
 目标为开环状态误差的归一化 MSE，加 `0.1×contact BCE` 和 `0.1×归一化 force MSE`。状态误差使用 ground-truth 朝向定义坐标。尺度取在线标准差与物理误差下限之大者，避免近静止维度除以极小数。在线 moments 仅统计新收集的训练环境，不重复统计 replay 更新；多卡聚合统计和梯度。
 
-训练 4 步时，第 2 步起使用 WM 的状态、接触概率与预测 pose 裁图，动作使用记录的真实动作。这是 WM 自身的序列监督反传，不是对 policy 做 BPTT。
+训练 8 步时，第 2 步起使用 WM 的状态、接触概率与预测 pose 裁图，动作使用记录的真实动作。这是 WM 自身的序列监督反传，不是对 policy 做 BPTT。
 
 WM 拥有独立参数、optimizer 和采样 Generator；初始化保护全局 RNG。PPO 更新先执行，WM 更新随后执行。WM 不消费 actor 输出的计算图，不向 actor/critic/观测 normalizer 写入参数或梯度。WM checkpoint 不改动部署 actor 接口。
 
@@ -99,7 +99,7 @@ WM 拥有独立参数、optimizer 和采样 Generator；初始化保护全局 RN
 
 ## 三层误差与验证
 
-每 25 轮默认记录固定 holdout 与当前 holdout，开环 H=1/4/8（20/80/160ms）：
+每 25 轮默认记录固定 holdout 与当前 holdout，开环 H=1/4/8/16/32（20/80/160/320/640ms）：
 
 1. 状态预测：位置、旋转、线/角速度、q/qd 的物理单位 RMSE；与静止及恒速/恒关节速度外推基线比较。接触除 accuracy 外还报告 feet F1/Brier，避免大量不接触部位造成虚高；报告力 RMSE。
 2. `oracle`：真实 successor、真实接触/力、真实 support + 原生 mesh 查询，经过运动学和解析公式，对照原生逐项奖励。检验状态/速度坐标、时序、权重、dt、公式。
@@ -117,7 +117,7 @@ WM 拥有独立参数、optimizer 和采样 Generator；初始化保护全局 RN
 
 1. 新增独立 task/runner，避免改变现有纯 PPO 的训练或 checkpoint。
 2. 使用修正后的 Scheme A 状态/force/COM 运动学，而非复制旧 BPTT runner 和遗漏奖励。
-3. 保持 512 宽、4 步监督、有限 replay 的低成本诊断默认值；全部通过 agent 字典调整。
+3. 保持 512 宽、8 步监督、有限 replay 的低成本诊断默认值；全部通过 agent 字典调整。
 4. 支持学习中的 PPO checkpoint 初始化，保留已训练 terrain gate；与 stage1 warm-start 明确区分。
 5. 严格分离公式、栅格和预测误差；保留原生硬事件，暂不引入软奖励设计影响 PPO。
 6. 固定留出完整环境，并用独立 RNG；验证分数不能通过重复采样相邻训练窗口或归一化泄漏虚高。
@@ -128,3 +128,26 @@ WM 拥有独立参数、optimizer 和采样 Generator；初始化保护全局 RN
 奖励目标是仿真的原生即时奖励，不包含 PPO 在 timeout 时添加的 value bootstrap。接触分类与力回归是两个独立监督 head，目前没有强制二者物理一致；逐项奖励误差用于暴露这一限制。归一化 moments 沿用方案 A 的 `2e8` 样本上限，达到上限后固定统计量。
 
 对照中的“baseline”指真实 PPO 收集结束、离线固定 replay 训练开始前的 WM，不是完全未训练的网络。固定 holdout 用于比较离线训练前后；当前 holdout 每次重新采样，二者都需结合 `valid_fraction` 解释。8 步未跨 episode 的窗口得分，不代表所有失败 episode 都能预测 8 步。
+
+
+## 三组正式对照（2026-11-01）
+
+PPO 仍为 24 步/轮；WM 训练统一 H8，验证统一 H1/4/8/16/32。H32 超出一次 PPO rollout，因此使用容量 48 步的连续环形 replay。第一次 24 步不足 H32 时不记录虚假的验证分数；第二轮后首次验证，随后每 25 轮验证。一次 H32 前向复用其所有前缀，并复用预测 support 序列，避免为每个视距重复 rollout。
+
+| 组别 | predict_contact | predict_force | dynamics contact 输入 | 可预测奖励项 |
+|---|---|---|---|---|
+| full | true | true | 真实起点 + 后续预测接触 | 27 |
+| no_contact_force | false | false | 删除输入通道 | 19 |
+| no_force | true | false | 真实起点 + 后续预测接触 | 24 |
+
+命令覆盖键为 `agent.world_model.predict_contact=false` / `agent.world_model.predict_force=false`。关闭的 head、归一化统计和监督 loss 都不存在；不会用零 loss 留着完整 head，也不会在后续 WM 步中偷偷使用真实 contact/force。力预测目前要求同时启用接触预测。
+
+**三组 PPO 全部保留相同的 27 项原生奖励**，包括 impact/stumble/force。此处验证的是辅助 WM 头消融，不是改变 PPO 目标。真实 contact/force 仍保存在 replay 中用于独立 oracle 验证，关闭的目标不进入 WM 的输入、loss 或归一化统计。
+
+无 force 时，预测奖励不支持 `auxiliary/impact`、`terrain/stumble`、`terrain/force`。无 contact/force 时，还不支持 `auxiliary/undesired_contact`、`terrain/slip`、`terrain/match`、`terrain/switch`、`terrain/touchdown`。缺失的项不会填零并冒充完整奖励。
+
+所有组记录 `reward_common_mae`（相同 19 项）用于公平比较；另记录 `reward_supported_mae`（各组各自支持的 27/19/24 项），以及完整 27 项真实状态 oracle/raster 误差。仅 full 保留完整 `reward_predicted_mae`。不支持的 contact/force 指标不输出，具体可预测项写入 `wm-contract.json`。
+
+三组正式配置固定：原 stage1 `model_2700.pt` 初始化、WM 从零开始、同 seed42、每组 4 GPU×4096 环境、2000 PPO 轮。head 消融不会引入 WM/BPTT policy 更新，因此重点比较 WM 状态/奖励预测、速度与显存；policy 效果仍由相同 PPO 目标决定。
+
+运行时记录非验证轮和验证轮耗时，分别报告均值/中位数/P95；同时记录四个 rank 及每秒 NVML 利用率、显存。资源不足时保留每组四卡，等待现有训练释放，再串行运行；profile 独立初始化且不向正式训练传递权重、optimizer 或更新计数。运行清单和证据位于仓库外 `InstinctLab-local/ppo-wm-ablation-20261101/`。

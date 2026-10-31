@@ -64,7 +64,9 @@ def main():
                 p.grad.clone() if p.grad is not None else None for p in runner.alg.actor_critic.parameters()
             ]
             moment_counts = [
-                m.count.clone() for m in (runner.wm.input_norm, runner.wm.delta_norm, runner.wm.force_norm)
+                m.count.clone()
+                for m in (runner.wm.input_norm, runner.wm.delta_norm, runner.wm.force_norm)
+                if m is not None
             ]
             for iteration in range(args.offline_iterations):
                 runner.fit_world_model(update_moments=False)
@@ -76,7 +78,7 @@ def main():
                 [p.grad for p in runner.alg.actor_critic.parameters()], policy_gradients, rtol=0, atol=0
             )
             torch.testing.assert_close(
-                [m.count for m in (runner.wm.input_norm, runner.wm.delta_norm, runner.wm.force_norm)],
+                [m.count for m in (runner.wm.input_norm, runner.wm.delta_norm, runner.wm.force_norm) if m is not None],
                 moment_counts,
                 rtol=0,
                 atol=0,
@@ -89,13 +91,38 @@ def main():
             assert torch.equal(cuda_rng, torch.cuda.get_rng_state(runner.device))
             # All fitted tensors are detached; no policy parameter is owned by the WM optimizer.
             assert not {id(p) for p in runner.wm.parameters()} & {id(p) for p in runner.alg.actor_critic.parameters()}
-            data = runner.sample(8, validation=True)
+            horizon = max(runner.options["validation_horizons"])
+            data = runner.sample(horizon, validation=True)
             assert (data["env_id"] % 8 == 0).all()
-            train = runner.sample(4)
+            train = runner.sample(runner.options["train_horizon"])
             assert (train["env_id"] % 8 != 0).all()
             assert not data["state"].requires_grad and not data["state"].is_inference()
             after_end = data["done"].cumsum(1)[:, :-1] > 0
             assert (data["mask"][:, 1:][after_end] == 0).all()
+            adjacent = data["mask"][:, 1:].bool()
+            assert adjacent.any()
+            torch.testing.assert_close(
+                data["next_state"][:, :-1][adjacent], data["state"][:, 1:][adjacent], atol=1e-5, rtol=0
+            )
+            assert horizon > runner.num_steps_per_env and len(runner.replay) >= horizon
+            assert (runner.wm.contact_head is not None) == runner.options["predict_contact"]
+            assert (runner.wm.force_head is not None) == runner.options["predict_force"]
+            if not runner.wm.predict_force:
+                modified = dict(data, next_force=data["next_force"] + 123.0)
+                if not runner.wm.predict_contact:
+                    modified.update(contact=1 - data["contact"], next_contact=1 - data["next_contact"])
+                with torch.no_grad():
+                    original_output = runner.predict(data, runner.options["train_horizon"])
+                    changed_output = runner.predict(modified, runner.options["train_horizon"])
+                torch.testing.assert_close(original_output, changed_output, atol=0, rtol=0)
+            common = runner.rewards.supported_keys(False, False)
+            supported = runner.rewards.supported_keys(runner.wm.predict_contact, runner.wm.predict_force)
+            assert len(common) == 19
+            assert len(supported) == (27 if runner.wm.predict_force else 24 if runner.wm.predict_contact else 19)
+            for h in runner.options["validation_horizons"]:
+                assert f"fixed/h{h}/reward_common_mae" in final
+                if not runner.wm.predict_force:
+                    assert f"fixed/h{h}/reward_predicted_mae" not in final
             # Native mesh scan versus the baked map, at arbitrary current held-out states.
             state = data["state"][:, 0].clone().requires_grad_(True)
             heights, valid = runner.heightfield.local(state[:, :3], yaw_angle(state[:, 3:7]))
@@ -136,7 +163,7 @@ def main():
             runner.load(str(checkpoint))
             torch.testing.assert_close(runner.wm.state_dict(), wm_before, rtol=0, atol=0)
             torch.testing.assert_close(runner.wm_optimizer.state_dict(), optimizer_before, rtol=0, atol=0)
-            assert not runner.replay and not runner.pending
+            assert not runner.replay
             for value in runner.wm.state_dict().values():
                 assert torch.isfinite(value).all()
                 if dist.is_initialized():
@@ -155,6 +182,13 @@ def main():
                 offline_moment_counts_unchanged=True,
                 global_rng_unchanged=True,
                 reset_prefix_mask_checked=True,
+                cross_ppo_rollout_continuity_checked=True,
+                predict_contact=runner.wm.predict_contact,
+                predict_force=runner.wm.predict_force,
+                disabled_auxiliary_targets_do_not_leak=True,
+                validation_horizons=runner.options["validation_horizons"],
+                supported_reward_terms=supported,
+                common_reward_terms=common,
                 heldout_environments_excluded_from_training=True,
                 heightmap_coordinate_gradient_finite=True,
                 heightmap_mesh_mae_m=heightmap_mesh_mae,

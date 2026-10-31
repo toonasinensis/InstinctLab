@@ -119,13 +119,14 @@ class RunningMoments(nn.Module):
 class TerrainDynamics(nn.Module):
     """Frame-local delta dynamics with applied simulator context and contact heads."""
 
-    def __init__(self, context_width, hidden=2048, amp=True):
+    def __init__(self, context_width, hidden=512, amp=True, predict_contact=True, predict_force=True):
         super().__init__()
         self.amp = amp
         self.context_width = context_width
-        self.input_norm = RunningMoments(68 + 29 + 29 + 14 + context_width)
+        self.predict_contact, self.predict_force = predict_contact, predict_force
+        self.input_norm = RunningMoments(68 + 29 + 29 + (14 if predict_contact else 0) + context_width)
         self.delta_norm = RunningMoments(70, epsilon=1e-4)
-        self.force_norm = RunningMoments(42)
+        self.force_norm = RunningMoments(42) if predict_force else None
         self.terrain_encoder = nn.Sequential(nn.Linear(441, 128), nn.SiLU(), nn.Linear(128, 64), nn.SiLU())
         layers, width = [], self.input_norm.mean.numel() + 64
         for _ in range(3):
@@ -133,8 +134,8 @@ class TerrainDynamics(nn.Module):
             width = hidden
         self.trunk = nn.Sequential(*layers)
         self.delta_head = nn.Linear(hidden, 70)
-        self.contact_head = nn.Linear(hidden, 14)
-        self.force_head = nn.Linear(hidden, 42)
+        self.contact_head = nn.Linear(hidden, 14) if predict_contact else None
+        self.force_head = nn.Linear(hidden, 42) if predict_force else None
         nn.init.zeros_(self.delta_head.weight)
         nn.init.zeros_(self.delta_head.bias)
         self.register_buffer(
@@ -152,7 +153,10 @@ class TerrainDynamics(nn.Module):
         )
 
     def inputs(self, state, action, previous_action, contact, heights, context):
-        return torch.cat((state_features(state, heights), action, previous_action, contact, context), -1)
+        features = [state_features(state, heights), action, previous_action]
+        if self.predict_contact:
+            features.append(contact)
+        return torch.cat((*features, context), -1)
 
     @staticmethod
     def target(state, next_state):
@@ -168,8 +172,8 @@ class TerrainDynamics(nn.Module):
         with torch.autocast(device_type=state.device.type, dtype=torch.bfloat16, enabled=self.amp and state.is_cuda):
             hidden = self.trunk(torch.cat((normalized, self.terrain_encoder(heights)), -1))
             delta = self.delta_head(hidden).float()
-            logits = self.contact_head(hidden).float()
-            forces = self.force_head(hidden).float()
+            logits = self.contact_head(hidden).float() if self.contact_head is not None else None
+            forces = self.force_head(hidden).float() if self.force_head is not None else None
         delta = delta * self.delta_norm.std() + self.delta_norm.mean
         dp, dr, dv, dw, dq, dqd = delta.split((3, 3, 3, 3, 29, 29), -1)
         p, rot, v, w, q, qd = state.split((3, 4, 3, 3, 29, 29), -1)
