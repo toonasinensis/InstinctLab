@@ -150,6 +150,13 @@ gamma=0.99, lambda=0.95 and its original noise, randomization and terminations.
 
 ## Implementation decisions and verification boundary
 
+- Capacity tests exposed MuJoCo Warp `nefc overflow` with the original 384
+  constraint rows per environment. This drops constraints beyond the buffer,
+  even when PPO losses and checkpoints stay finite. The diagnostic preset now
+  uses 1024 constraint rows on Newton, keeping the original 192 contact-point
+  budget, physics solver, terrains and PPO settings. Capacity must be measured
+  again with this larger buffer. The native task still uses its original value.
+  `env.sim.physics.solver_cfg.njmax` overrides the resolved Newton setting.
 - The diagnostic behavior is a new task preset; the original task defaults
   remain available. No global environment variables select a hidden profile.
 - The initial formal run is bounded to 2000 iterations, rather than the native

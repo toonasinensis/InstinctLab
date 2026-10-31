@@ -143,6 +143,8 @@ class G1PGMTTerrainPPOValidationEnvCfg(G1PGMTTerrainEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
+        # Larger batches exposed truncated MuJoCo Warp constraints with the native 384-row buffer.
+        self.sim.physics.newton_mjwarp.solver_cfg.njmax = 1024
         proportions = dict(flat=0.2, slope_up=0.1, slope_down=0.1, stairs_up=0.2, stairs_down=0.2, boxes=0.0, rough=0.2)
         for name, proportion in proportions.items():
             self.scene.terrain.terrain_generator.sub_terrains[name].proportion = proportion
