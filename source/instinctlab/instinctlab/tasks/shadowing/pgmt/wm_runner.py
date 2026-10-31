@@ -127,7 +127,7 @@ class SupervisedWMRunner(TerrainRunner):
             stats.update(
                 {
                     "wm/" + key: torch.tensor(value, device=self.device)
-                    for key, value in self.latest_metrics.items()
+                    for key, value in (self.latest_metrics.items() if validating else ())
                     if key not in {"updates", "train_loss"}
                     and not any("/" + name + "/" in key for name in ("oracle", "raster", "predicted"))
                 }
