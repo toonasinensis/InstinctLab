@@ -79,7 +79,36 @@ At reset:
   greater than 1.1 m. Those steps are accumulated, not necessarily consecutive.
 - Timeouts without sufficient platform departure keep the level unchanged.
   Motion-end and tile-exit timeouts do not themselves promote the level.
-- Levels are clamped to [0,9]; no reset accounting occurs at first placement.
+- L8 success advances to L9. A successful episode at L9 attempts to advance
+  beyond the ten-row grid and uniformly resamples a level from L0--L9,
+  including L9. Merely entering L9 or resetting there without success does
+  not trigger randomization. Failure at L9 still moves to L8; failure at L0
+  stays at L0. No reset accounting occurs at first placement.
+
+The reset delegates level and origin updates to the installed Isaac Lab
+`TerrainImporter.update_env_origins`, matching the last-level behavior in
+[Isaac Lab](https://github.com/isaac-sim/IsaacLab/blob/main/source/isaaclab/isaaclab/terrains/terrain_importer.py)
+and [legged_gym](https://github.com/leggedrobotics/legged_gym/blob/master/legged_gym/envs/base/legged_robot.py).
+Its `max_terrain_level` is the exclusive row count (10), not the highest valid
+index (9). Each environment retains its column/type after randomization.
+Previous-episode failures/visits are recorded at the old level before the
+transition; the next motion is sampled using the newly assigned level.
+Consequently, mean training terrain level can decrease after mastering L9:
+the population revisits easier rows instead of accumulating permanently at
+the highest row. Mean level is not a monotonic measure of tracking ability.
+
+Checkpoints record `terrain_curriculum_version=max_level_resample_v1` in their
+sampling contract. The existing resume check rejects stage-two checkpoints
+with the old clamped curriculum contract; start this experiment from the
+original stage-one warm start. Existing jobs keep their immutable old source.
+The native updater draws random candidates for every settling environment,
+so seeded runs are reproducible within this version but do not preserve the
+old version's frame/yaw random sequence.
+
+The focused regression entry point is `scripts/pgmt/validate_curriculum.py`.
+It uses real environment resets to exercise the L8/L9 boundaries, failure,
+neutral/insufficient-platform/tile-exit resets, first placement, frozen
+curriculum, origin/type consistency, and old-level sampler accounting.
 
 Configuration controls:
 

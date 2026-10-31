@@ -59,6 +59,7 @@ class TerrainMotion(CommandTerm):
             motion_failure_decay=cfg.motion_failure_decay,
             curriculum_off_platform_steps=cfg.curriculum_off_platform_steps,
             enable_terrain_curriculum=cfg.enable_terrain_curriculum,
+            terrain_curriculum_version="max_level_resample_v1",
         )
         print(f"[PGMT] Sampling contract: {self.sampling_contract}")
         for name in ("error_body_pos", "error_joint_pos", "terrain_level", "terrain_gate"):
@@ -259,13 +260,12 @@ class TerrainMotion(CommandTerm):
             self.stratum_failure.mul_(decay).add_(counts.reshape_as(self.stratum_failure), alpha=1 - decay)
             if self.cfg.enable_terrain_curriculum and t.cfg.terrain_type == "generator":
                 # 无失败且未越界地跑满时长才算成功；非平地还需累计超过 50 步离开中心平台。
-                # 成功升一级、失败降一级，并同步更新地形出生原点。
+                # 成功升一级、失败降一级；通过最高等级后随机分配等级，并同步出生原点。
                 success = self.env.termination_manager.get_term("time_out")[old] & ~failed & ~self.terrain.outside[old]
                 success &= (self.terrain.off_platform_steps[old] > self.cfg.curriculum_off_platform_steps) | (
                     family == 0
                 )
-                t.terrain_levels[old] = (t.terrain_levels[old] + success.long() - failed.long()).clamp(0, 9)
-                t.env_origins[old] = t.terrain_origins[t.terrain_levels[old], t.terrain_types[old]]
+                t.update_env_origins(old, success, failed)
         if t.cfg.terrain_type == "generator":
             family, level = self.terrain.column_families[t.terrain_types[ids]], t.terrain_levels[ids]
         else:
