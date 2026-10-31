@@ -1,0 +1,517 @@
+"""PPO policy updates plus an independent, supervised Scheme A world model."""
+
+import hashlib
+import json
+import time
+import torch
+import torch.distributed as dist
+from collections import deque
+from pathlib import Path
+from torch.nn import functional as F
+
+import warp as wp
+from instinct_rl.runners import OnPolicyRunner
+
+from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_mul
+
+from .heightfield import HeightField
+from .terrain_runner import TerrainRunner
+from .wm_dynamics import TerrainDynamics, average_gradients, rotation_increment, yaw_angle
+from .wm_rewards import AnalyticRewards
+
+
+def ordinary(value):
+    # Rollouts are inference tensors. Supervised autograd needs ordinary copies.
+    with torch.inference_mode(False):
+        return value.detach().clone()
+
+
+class SupervisedWMRunner(TerrainRunner):
+    schema = "pgmt-supervised-wm-v2"
+
+    def __init__(self, env, train_cfg, log_dir=None, device="cpu"):
+        super().__init__(env, train_cfg, log_dir, device)
+        self.options = train_cfg["world_model"]
+        horizons = [self.options["train_horizon"], *self.options["validation_horizons"]]
+        if env.num_envs < 2 or min(horizons) < 1 or max(horizons) > self.num_steps_per_env:
+            raise ValueError("WM requires >=2 environments and horizons within the PPO rollout")
+        if (
+            min(
+                self.options[key]
+                for key in ("updates", "batch_size", "validation_batch", "validation_interval", "replay_chunks")
+            )
+            < 1
+        ):
+            raise ValueError("WM update, batch, interval and replay sizes must be positive")
+        if train_cfg.get("ppo_checkpoint") and train_cfg.get("warm_start"):
+            raise ValueError("Choose terrain PPO initialization or native stage1 warm-start, not both")
+        self.native = env.unwrapped
+        self.device = torch.device(device)
+        self.initial_gate = 0.0
+        if train_cfg.get("ppo_checkpoint"):
+            self.initialize_ppo(train_cfg["ppo_checkpoint"])
+        # WM initialization/sampling must not consume the policy/reset RNG stream.
+        with torch.random.fork_rng(devices=[self.device]):
+            torch.manual_seed(train_cfg["seed"] + 1741)
+            self.heightfield = HeightField.from_context(
+                self.native.command_manager.get_term("motion").terrain, self.options["resolution"]
+            ).to(self.device)
+            self.rewards = AnalyticRewards(self.native, self.heightfield)
+            c = self.rewards.command
+            self.context_modes = {
+                name: self.native.event_manager.get_term_cfg(name).mode
+                for name in ("physics_material", "add_joint_default_pos", "base_com")
+            }
+            if any(mode != "startup" for mode in self.context_modes.values()):
+                raise ValueError(
+                    "WM environment context requires startup-only randomization; snapshot per transition if changed"
+                )
+            material = self.native.event_manager.get_term_cfg("physics_material").func._impl
+            com_event = self.native.event_manager.get_term_cfg("base_com").func
+            robot = c.robot.data
+            # Actual solver friction binding, randomized actuator zero and torso COM.
+            self.xi = ordinary(
+                torch.cat(
+                    (
+                        wp.to_torch(material._friction_binding),
+                        robot.default_joint_pos.torch - robot.default_joint_pos_nominal,
+                        (robot.body_com_pos_b.torch - com_event.default_com[..., :3])[
+                            :, com_event.asset_cfg.body_ids
+                        ].flatten(1),
+                    ),
+                    -1,
+                )
+            )
+            self.wm = TerrainDynamics(self.xi.shape[-1], self.options["hidden"], self.options["amp"]).to(self.device)
+        self.terrain_digest = hashlib.sha256(self.heightfield.heights.cpu().numpy().tobytes()).hexdigest()
+        self.wm_optimizer = torch.optim.AdamW(self.wm.parameters(), lr=self.options["learning_rate"], weight_decay=1e-5)
+        self.generator = torch.Generator(device=self.device).manual_seed(train_cfg["seed"] + 2909)
+        self.replay = deque(maxlen=self.options["replay_chunks"])
+        self.pending = []
+        self.frozen_validation = None
+        self.wm_updates = 0
+        self.latest_metrics = {}
+        self.capture_terminal()
+        for value in self.wm.state_dict().values():
+            if dist.is_initialized():
+                dist.broadcast(value, src=0)
+        update_ppo = self.alg.update
+
+        def update(iteration):
+            losses, stats = update_ppo(iteration)
+            started = time.perf_counter()
+            self.fit_world_model()
+            if iteration % self.options["validation_interval"] == 0:
+                self.latest_metrics = self.validate()
+                self.write_metrics(iteration)
+            stats.update(
+                {
+                    "wm/" + key: torch.tensor(value, device=self.device)
+                    for key, value in self.latest_metrics.items()
+                    if not any("/" + name + "/" in key for name in ("oracle", "raster", "predicted"))
+                }
+            )
+            stats["wm/seconds"] = torch.tensor(time.perf_counter() - started, device=self.device)
+            return losses, stats
+
+        self.alg.update = update
+        if log_dir and not self.is_mp_rank_other_process():
+            Path(log_dir).mkdir(parents=True, exist_ok=True)
+            (Path(log_dir) / "wm-contract.json").write_text(
+                json.dumps(
+                    dict(
+                        schema=self.schema,
+                        options=self.options,
+                        rewards=self.rewards.contract,
+                        state="p3, quaternion_xyzw4, world_COM_v3, world_w3, q29, qd29",
+                        context_width=self.xi.shape[-1],
+                        context_modes=self.context_modes,
+                        terrain_sha256=self.terrain_digest,
+                        actor_update="PPO only; detached WM data",
+                        holdout="local env_id % 8 == 0; excluded from fitting AND WM moments",
+                        resume="optimizer continuation, fresh simulator episodes and replay",
+                    ),
+                    indent=2,
+                )
+                + "\n"
+            )
+
+    def initialize_ppo(self, path):
+        """New WM experiment from learned terrain weights; fresh PPO optimizer/simulator."""
+        saved = torch.load(path, map_location=self.device, weights_only=True)
+        if saved["infos"]["schema"] != self.native.cfg.mdp_schema:
+            raise ValueError("PPO initialization requires a terrain PPO checkpoint")
+        if saved["infos"].get("sampling_contract") != self.native.command_manager.get_term("motion").sampling_contract:
+            raise ValueError("PPO initialization changed motion/terrain sampling contract")
+        self.alg.actor_critic.load_state_dict(saved["model_state_dict"])
+        for group, normalizer in self.normalizers.items():
+            normalizer.load_state_dict(saved[group + "_normalizer_state_dict"])
+        self.initial_gate = float(self.alg.actor_critic.actor.terrain_gate)
+        self.alg.learning_rate = saved["infos"]["rank_states"][0]["learning_rate"]
+        for group in self.alg.optimizer.param_groups:
+            group["lr"] = self.alg.learning_rate
+        self.source_checkpoint = str(path)
+
+    def capture_terminal(self):
+        original = self.native.reward_manager.compute
+
+        def compute(dt):
+            result = original(dt)
+            c = self.rewards.command
+            self.terminal = {"ref_" + key: ordinary(value) for key, value in self.rewards.context().items()}
+            self.terminal.update(
+                next_state=ordinary(self.rewards.state()),
+                next_contact=ordinary(c.contacts.contact.float()),
+                next_force=ordinary(c.contacts.force),
+                next_support=ordinary(c.terrain.support_z),
+                derivative_valid=ordinary(c.contacts.valid_derivative.float()),
+                action=ordinary(self.native.action_manager.action),
+                native_reward=ordinary(
+                    torch.stack(
+                        [
+                            self.native.reward_manager._termwise_reward_buf[group][name] * dt
+                            for key in self.rewards.terms
+                            for group, name in [key.split("/")]
+                        ],
+                        -1,
+                    )
+                ),
+            )
+            return result
+
+        self.native.reward_manager.compute = compute
+
+    def rollout_step(self, obs, extra_obs):
+        c = self.rewards.command
+        record = dict(
+            state=ordinary(self.rewards.state()),
+            contact=ordinary(c.contacts.contact.float()),
+            previous_action=ordinary(self.native.action_manager.action),
+            support=ordinary(c.terrain.support_z),
+            previous_ref_velocity=ordinary(c.contacts.previous_ref_velocity),
+        )
+        gate = max(
+            self.initial_gate,
+            min(1.0, self.current_learning_iteration / max(1, self.cfg.get("terrain_gate_ramp", 200))),
+        )
+        self.alg.actor_critic.actor.terrain_gate.fill_(gate)
+        c.metrics["terrain_gate"][:] = gate
+        result = OnPolicyRunner.rollout_step(self, obs, extra_obs)
+        record.update(self.terminal, done=ordinary(result[3].bool()))
+        self.pending.append(record)
+        if len(self.pending) == self.num_steps_per_env:
+            with torch.inference_mode(False):
+                self.replay.append({key: torch.stack([r[key] for r in self.pending]) for key in record})
+            self.pending.clear()
+        return result
+
+    def sample(self, horizon, validation=False):
+        chunk = (
+            self.replay[-1]
+            if validation
+            else self.replay[int(torch.randint(len(self.replay), (), device=self.device, generator=self.generator))]
+        )
+        steps, envs = chunk["state"].shape[:2]
+        if horizon > steps:
+            raise ValueError("WM horizon exceeds the PPO rollout length")
+        eligible = torch.arange(envs, device=self.device)
+        eligible = eligible[eligible % 8 == 0] if validation else eligible[eligible % 8 != 0]
+        if not len(eligible):
+            raise ValueError("WM fitting/holdout requires at least two environments")
+        count = self.options["validation_batch"] if validation else self.options["batch_size"]
+        ids = eligible[torch.randint(len(eligible), (count,), device=self.device, generator=self.generator)]
+        times = torch.randint(steps - horizon + 1, (count,), device=self.device, generator=self.generator)
+        times = times[:, None] + torch.arange(horizon, device=self.device)
+        data = {key: value[times, ids[:, None]] for key, value in chunk.items()}
+        data["env_id"] = ids
+        alive = (~data["done"]).float().cumprod(1)
+        data["mask"] = torch.cat((torch.ones_like(alive[:, :1]), alive[:, :-1]), 1)
+        return data
+
+    @torch.no_grad()
+    def update_moments(self):
+        chunk = self.replay[-1]
+        ids = torch.arange(chunk["state"].shape[1], device=self.device)
+        ids = ids[ids % 8 != 0]
+        # Bound the heightmap temporary allocation at 4096 environments/GPU.
+        inputs, deltas, forces = [], [], []
+        for begin in range(len(chunk["state"])):
+            data = {
+                key: chunk[key][begin, ids]
+                for key in ("state", "action", "previous_action", "contact", "next_state", "next_force")
+            }
+            heights, valid = self.heightfield.local(data["state"][:, :3], yaw_angle(data["state"][:, 3:7]))
+            inputs.append(
+                self.wm.inputs(
+                    data["state"], data["action"], data["previous_action"], data["contact"], heights, self.xi[ids]
+                )[valid]
+            )
+            deltas.append(self.wm.target(data["state"], data["next_state"])[valid])
+            rotation = data["next_state"][:, None, 3:7].expand(-1, 14, -1)
+            forces.append(quat_apply_inverse(rotation, data["next_force"]).flatten(1)[valid])
+        self.wm.input_norm.update(torch.cat(inputs))
+        self.wm.delta_norm.update(torch.cat(deltas))
+        self.wm.force_norm.update(torch.cat(forces))
+
+    def predict(self, data, horizon):
+        state, contact = data["state"][:, 0], data["contact"][:, 0]
+        states, contacts, forces, errors, losses, masks = [], [], [], [], [], []
+        valid_prefix = torch.ones(len(state), device=self.device)
+        scale = torch.maximum(self.wm.delta_norm.std(), self.wm.error_floor)
+        for step in range(horizon):
+            heights, valid = self.heightfield.local(state[:, :3], yaw_angle(state[:, 3:7]))
+            state, logits, force = self.wm(
+                state,
+                data["action"][:, step],
+                data["previous_action"][:, step],
+                contact,
+                heights,
+                self.xi[data["env_id"]],
+            )
+            contact = logits.sigmoid()
+            target_rotation = data["next_state"][:, step, None, 3:7].expand(-1, 14, -1)
+            target_force = quat_apply_inverse(target_rotation, data["next_force"][:, step]).flatten(1)
+            error = self.wm.state_error(state, data["next_state"][:, step])
+            loss = (error / scale).square().mean(-1) + 0.1 * F.binary_cross_entropy_with_logits(
+                logits, data["next_contact"][:, step], reduction="none"
+            ).mean(-1)
+            loss = loss + 0.1 * (force - self.wm.force_norm(target_force)).square().mean(-1)
+            valid_prefix = valid_prefix * valid
+            masks.append(data["mask"][:, step] * valid_prefix)
+            states.append(state)
+            contacts.append(contact)
+            forces.append(force * self.wm.force_norm.std() + self.wm.force_norm.mean)
+            errors.append(error)
+            losses.append(loss)
+        masks = torch.stack(masks, 1)
+        loss = (torch.stack(losses, 1) * masks).sum() / masks.sum().clamp_min(1)
+        return (
+            loss,
+            torch.stack(errors, 1),
+            masks,
+            torch.stack(states, 1),
+            torch.stack(contacts, 1),
+            torch.stack(forces, 1),
+        )
+
+    def fit_world_model(self, update_moments=True):
+        if update_moments:
+            self.update_moments()
+        self.wm.train()
+        for _ in range(self.options["updates"]):
+            data = self.sample(self.options["train_horizon"])
+            loss = self.predict(data, self.options["train_horizon"])[0]
+            self.wm_optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            average_gradients(self.wm)
+            torch.nn.utils.clip_grad_norm_(self.wm.parameters(), 1.0, error_if_nonfinite=True)
+            self.wm_optimizer.step()
+            self.wm_updates += 1
+        self.training_loss = float(loss.detach())
+
+    def reduce_mean(self, value, weight):
+        sums = torch.stack(((value * weight).sum(), weight.sum()))
+        if dist.is_initialized():
+            dist.all_reduce(sums)
+        return float(sums[0] / sums[1].clamp_min(1))
+
+    @torch.no_grad()
+    def validate(self):
+        if self.frozen_validation is None:
+            self.frozen_validation = self.sample(max(self.options["validation_horizons"]), validation=True)
+        metrics = {"updates": self.wm_updates, "train_loss": getattr(self, "training_loss", 0.0)}
+        for dataset, data in (
+            ("fixed", self.frozen_validation),
+            ("current", self.sample(max(self.options["validation_horizons"]), validation=True)),
+        ):
+            for horizon in self.options["validation_horizons"]:
+                loss, errors, masks, states, contacts, forces = self.predict(data, horizon)
+                weight, error = masks[:, -1], errors[:, -1]
+                prefix = f"{dataset}/h{horizon}"
+                metrics[prefix + "/loss"] = float(loss)
+                metrics[prefix + "/valid_fraction"] = self.reduce_mean(weight, torch.ones_like(weight))
+                initial = data["state"][:, 0]
+                duration = horizon * self.native.step_dt
+                spin = initial[:, 10:13]
+                link_velocity = initial[:, 7:10] - torch.cross(
+                    spin, quat_apply(initial[:, 3:7], self.rewards.root_com[data["env_id"]]), dim=-1
+                )
+                constant_velocity = torch.cat(
+                    (
+                        initial[:, :3] + link_velocity * duration,
+                        quat_mul(
+                            initial[:, 3:7], rotation_increment(quat_apply_inverse(initial[:, 3:7], spin) * duration)
+                        ),
+                        initial[:, 7:13],
+                        initial[:, 13:42] + initial[:, 42:71] * duration,
+                        initial[:, 42:71],
+                    ),
+                    -1,
+                )
+                cv_error = self.wm.state_error(constant_velocity, data["next_state"][:, horizon - 1])
+                for name, section in (
+                    ("root_m", slice(0, 3)),
+                    ("rotation_rad", slice(3, 6)),
+                    ("velocity_mps", slice(6, 9)),
+                    ("angular_radps", slice(9, 12)),
+                    ("joint_rad", slice(12, 41)),
+                    ("joint_velocity_radps", slice(41, 70)),
+                ):
+                    metrics[prefix + "/" + name] = self.reduce_mean(error[:, section].square().mean(-1), weight) ** 0.5
+                    stationary = self.wm.state_error(data["state"][:, 0], data["next_state"][:, horizon - 1])
+                    metrics[prefix + "/stationary_" + name] = (
+                        self.reduce_mean(stationary[:, section].square().mean(-1), weight) ** 0.5
+                    )
+                    metrics[prefix + "/constant_velocity_" + name] = (
+                        self.reduce_mean(cv_error[:, section].square().mean(-1), weight) ** 0.5
+                    )
+                metrics.update(self.reward_metrics(data, states, contacts, forces, masks, prefix))
+        return metrics
+
+    @torch.no_grad()
+    def reward_metrics(self, data, states, contacts, forces, masks, prefix):
+        h = states.shape[1]
+        support = data["support"][:, 0]
+        previous, previous_contact = data["state"][:, 0], data["contact"][:, 0]
+        metrics = {}
+        for step in range(h):
+            context = {key[4:]: value[:, step] for key, value in data.items() if key.startswith("ref_")}
+            state, contact = states[:, step], (contacts[:, step] > 0.5).float()
+            bodies = self.rewards.bodies(state, data["env_id"])
+            support, _ = self.rewards.support(state, support, context, bodies)
+            force = quat_apply(state[:, None, 3:7].expand(-1, 14, -1), forces[:, step].reshape(-1, 14, 3))
+            predicted, _ = self.rewards.evaluate(
+                state,
+                previous,
+                data["action"][:, step],
+                data["previous_action"][:, step],
+                contact,
+                previous_contact,
+                force,
+                support,
+                context,
+                data["previous_ref_velocity"][:, step],
+                data["derivative_valid"][:, step],
+                data["env_id"],
+            )
+            previous, previous_contact = state, contact
+        # At H, first quantify formula/FK parity with true state + true mesh queries.
+        real = data["next_state"][:, h - 1]
+        kwargs = dict(
+            state=real,
+            previous_state=data["state"][:, h - 1],
+            action=data["action"][:, h - 1],
+            previous_action=data["previous_action"][:, h - 1],
+            contact=data["next_contact"][:, h - 1],
+            previous_contact=data["contact"][:, h - 1],
+            force=data["next_force"][:, h - 1],
+            support=data["next_support"][:, h - 1],
+            context=context,
+            previous_ref_velocity=data["previous_ref_velocity"][:, h - 1],
+            derivative_valid=data["derivative_valid"][:, h - 1],
+            ids=data["env_id"],
+        )
+        oracle, _ = self.rewards.evaluate(**kwargs, exact_surface=True)
+        raster, _ = self.rewards.evaluate(**kwargs)
+        weight = masks[:, -1]
+        target = data["native_reward"][:, h - 1]
+        metrics[prefix + "/reward_native_abs_mean"] = self.reduce_mean(target.sum(-1).abs(), weight)
+        metrics[prefix + "/contact_brier"] = self.reduce_mean(
+            (contacts[:, -1] - data["next_contact"][:, h - 1]).square().mean(-1), weight
+        )
+        feet = self.rewards.command.foot_ids
+        predicted_contact = (contacts[:, -1, feet] > 0.5).float()
+        reference_contact = data["next_contact"][:, h - 1, feet]
+        true_positive = self.reduce_mean((predicted_contact * reference_contact).sum(-1), weight)
+        predicted_positive = self.reduce_mean(predicted_contact.sum(-1), weight)
+        reference_positive = self.reduce_mean(reference_contact.sum(-1), weight)
+        metrics[prefix + "/foot_contact_f1"] = 2 * true_positive / max(predicted_positive + reference_positive, 1e-8)
+        force_world = quat_apply(states[:, -1, None, 3:7].expand(-1, 14, -1), forces[:, -1].reshape(-1, 14, 3))
+        metrics[prefix + "/force_rmse_N"] = (
+            self.reduce_mean((force_world - data["next_force"][:, h - 1]).square().mean((-1, -2)), weight) ** 0.5
+        )
+        for name, output in (("oracle", oracle), ("raster", raster), ("predicted", predicted)):
+            metrics[prefix + "/reward_" + name + "_mae"] = self.reduce_mean(
+                (output.sum(-1) - target.sum(-1)).abs(), weight
+            )
+            for index, key in enumerate(self.rewards.terms):
+                metrics[prefix + "/" + name + "/" + key] = self.reduce_mean(
+                    (output[:, index] - target[:, index]).abs(), weight
+                )
+        true_map, valid = self.heightfield.local(real[:, :3], yaw_angle(real[:, 3:7]))
+        predicted_map, pv = self.heightfield.local(states[:, -1, :3], yaw_angle(states[:, -1, 3:7]))
+        metrics[prefix + "/heightmap_mae_m"] = self.reduce_mean(
+            (true_map - predicted_map).abs().mean(-1), weight * valid * pv
+        )
+        metrics[prefix + "/contact_accuracy"] = self.reduce_mean(
+            ((contacts[:, -1] > 0.5) == data["next_contact"][:, h - 1].bool()).float().mean(-1), weight
+        )
+        return metrics
+
+    def write_metrics(self, iteration):
+        if self.log_dir and not self.is_mp_rank_other_process():
+            with (Path(self.log_dir) / "wm-metrics.jsonl").open("a") as stream:
+                stream.write(json.dumps(dict(iteration=iteration, **self.latest_metrics)) + "\n")
+
+    def save(self, path, infos=None):
+        # TerrainRunner performs collective rank-state capture and atomic base save.
+        base_path = str(path) + ".ppo"
+        local = dict(sampling_rng=self.generator.get_state().cpu(), terrain_sha256=self.terrain_digest)
+        ranks = [None] * dist.get_world_size() if dist.is_initialized() else [local]
+        if dist.is_initialized():
+            dist.all_gather_object(ranks, local)
+        super().save(base_path, infos)
+        if not self.is_mp_rank_other_process():
+            saved = torch.load(base_path, map_location="cpu", weights_only=True)
+            saved["supervised_wm"] = dict(
+                schema=self.schema,
+                options=self.options,
+                model=self.wm.state_dict(),
+                optimizer=self.wm_optimizer.state_dict(),
+                updates=self.wm_updates,
+                ranks=ranks,
+                reward_contract=self.rewards.contract,
+                initial_gate=self.initial_gate,
+            )
+            temporary = str(path) + ".tmp"
+            torch.save(saved, temporary)
+            Path(temporary).replace(path)
+            Path(base_path).unlink()
+        if dist.is_initialized():
+            dist.barrier()
+
+    def load(self, path):
+        saved = torch.load(path, map_location="cpu", weights_only=True)["supervised_wm"]
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        world = dist.get_world_size() if dist.is_initialized() else 1
+        changed = [
+            key
+            for key, expected in (
+                ("schema", self.schema),
+                ("options", self.options),
+                ("reward_contract", self.rewards.contract),
+            )
+            if saved[key] != expected
+        ]
+        if len(saved["ranks"]) != world:
+            changed.append("rank count")
+        elif saved["ranks"][rank]["terrain_sha256"] != self.terrain_digest:
+            changed.append(f"rank{rank} terrain raster")
+        # Reject collectively: another rank must not enter TerrainRunner's
+        # reset/normalizer collectives while this rank throws a local exception.
+        if dist.is_initialized():
+            differences = [None] * world
+            dist.all_gather_object(differences, changed)
+            changed = [f"rank{i}: {items}" for i, items in enumerate(differences) if items]
+        if changed:
+            raise ValueError(f"Supervised WM resume contract changed: {changed}")
+        result = super().load(path)
+        self.wm.load_state_dict(saved["model"])
+        self.wm_optimizer.load_state_dict(saved["optimizer"])
+        self.wm_updates = saved["updates"]
+        self.initial_gate = saved["initial_gate"]
+        self.generator.set_state(saved["ranks"][rank]["sampling_rng"])
+        self.replay.clear()
+        self.pending.clear()
+        self.frozen_validation = None
+        return result
