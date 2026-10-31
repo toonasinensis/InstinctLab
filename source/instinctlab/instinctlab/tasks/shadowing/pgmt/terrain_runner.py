@@ -27,7 +27,6 @@ class TerrainNormalization(StableNormalization):
         return torch.cat((normalized[:, :1678], x[:, 1678:]), -1)
 
 
-
 class TerrainRunner(OnPolicyRunner):
     def __init__(self, env, train_cfg, log_dir=None, device="cpu"):
         super().__init__(env, train_cfg, log_dir, device)
@@ -108,6 +107,7 @@ class TerrainRunner(OnPolicyRunner):
                 rank_states=states,
                 source_checkpoint=self.source_checkpoint,
                 terrain_gate_ramp=self.cfg.get("terrain_gate_ramp", 200),
+                sampling_contract=c.sampling_contract,
                 user=infos,
             ),
         )
@@ -130,6 +130,10 @@ class TerrainRunner(OnPolicyRunner):
             or info["terrain_gate_ramp"] != self.cfg.get("terrain_gate_ramp", 200)
         ):
             raise ValueError("Terrain resume changed schema, rank count, environment count or gate ramp")
+        if "sampling_contract" in info and info["sampling_contract"] != c.sampling_contract:
+            raise ValueError(
+                "Terrain resume changed motion selection, terrain columns or sampling settings; start a new run"
+            )
         super().load(path)
         state = info["rank_states"][rank]
         c.stratum_failure.copy_(state["failures"])

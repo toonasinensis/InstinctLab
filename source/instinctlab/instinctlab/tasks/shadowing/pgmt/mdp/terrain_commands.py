@@ -16,6 +16,10 @@ from .terrain_math import corrected_planar_velocity
 class TerrainMotion(CommandTerm):
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
+        if not 0 <= cfg.motion_uniform_fraction <= 1 or not 0 <= cfg.motion_failure_decay < 1:
+            raise ValueError("Motion uniform fraction must be in [0,1] and failure decay in [0,1)")
+        if cfg.curriculum_off_platform_steps < 0:
+            raise ValueError("curriculum_off_platform_steps must be nonnegative")
         self.env = env
         self.robot = env.scene["robot"]
         self.reference = env.scene["motion_reference"]
@@ -41,12 +45,22 @@ class TerrainMotion(CommandTerm):
         self.rotation[:, 3] = 1
         self.started = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.motion_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-        # 按「5 类地形 × 10 级难度 × 40 段动作」统计失败，用于后续动作采样。
-        self.stratum_failure = torch.zeros(5, 10, 40, device=self.device)
+        # 类别ID保持稳定，动作轴按实际选中的manifest子集建立。
+        self.num_motions = len(self.motion._all_motion_files)
+        self.stratum_failure = torch.zeros(5, 10, self.num_motions, device=self.device)
         self.stratum_visits = torch.zeros_like(self.stratum_failure)
         self._load_contacts()
         self.terrain = TerrainContext(self)
         self.contacts = TerrainContacts(self)
+        self.sampling_contract = dict(
+            motion_files=[Path(path).name for path in self.motion._all_motion_files],
+            terrain_columns=self.terrain.column_names,
+            motion_uniform_fraction=cfg.motion_uniform_fraction,
+            motion_failure_decay=cfg.motion_failure_decay,
+            curriculum_off_platform_steps=cfg.curriculum_off_platform_steps,
+            enable_terrain_curriculum=cfg.enable_terrain_curriculum,
+        )
+        print(f"[PGMT] Sampling contract: {self.sampling_contract}")
         for name in ("error_body_pos", "error_joint_pos", "terrain_level", "terrain_gate"):
             self.metrics[name] = torch.zeros(self.num_envs, device=self.device)
 
@@ -237,25 +251,29 @@ class TerrainMotion(CommandTerm):
             # 首次出生不结算；后续按上一轮实际所在的地形类别、难度和动作累积失败统计。
             family, level = self.terrain.family[old], self.terrain.level[old]
             failed = self.env.termination_manager.terminated[old]
-            index = (family * 10 + level) * 40 + self.motion_ids[old]
+            index = (family * 10 + level) * self.num_motions + self.motion_ids[old]
             self.stratum_visits.view(-1).scatter_add_(0, index, torch.ones_like(index, dtype=torch.float))
             counts = torch.zeros_like(self.stratum_failure).view(-1)
             counts.scatter_add_(0, index, failed.float())
-            self.stratum_failure.mul_(0.99).add_(counts.reshape_as(self.stratum_failure), alpha=0.01)
+            decay = self.cfg.motion_failure_decay
+            self.stratum_failure.mul_(decay).add_(counts.reshape_as(self.stratum_failure), alpha=1 - decay)
             if self.cfg.enable_terrain_curriculum and t.cfg.terrain_type == "generator":
                 # 无失败且未越界地跑满时长才算成功；非平地还需累计超过 50 步离开中心平台。
                 # 成功升一级、失败降一级，并同步更新地形出生原点。
                 success = self.env.termination_manager.get_term("time_out")[old] & ~failed & ~self.terrain.outside[old]
-                success &= (self.terrain.off_platform_steps[old] > 50) | (family == 0)
+                success &= (self.terrain.off_platform_steps[old] > self.cfg.curriculum_off_platform_steps) | (
+                    family == 0
+                )
                 t.terrain_levels[old] = (t.terrain_levels[old] + success.long() - failed.long()).clamp(0, 9)
                 t.env_origins[old] = t.terrain_origins[t.terrain_levels[old], t.terrain_types[old]]
         if t.cfg.terrain_type == "generator":
-            family, level = t.terrain_types[ids] // 2, t.terrain_levels[ids]
+            family, level = self.terrain.column_families[t.terrain_types[ids]], t.terrain_levels[ids]
         else:
             family = level = torch.zeros_like(ids)
         # 当前地形下失败较多的动作获得更高采样权重，同时保留 20% 均匀采样。
         weights = 1 + self.stratum_failure[family, level]
-        weights = 0.8 * weights / weights.sum(-1, keepdim=True) + 0.2 / 40
+        uniform = self.cfg.motion_uniform_fraction
+        weights = (1 - uniform) * weights / weights.sum(-1, keepdim=True) + uniform / self.num_motions
         selected = torch.multinomial(weights, 1).squeeze(-1)
         self.motion._assigned_env_motion_selection[ids] = selected
         # 均匀采样源动作起始帧，预留完整的 11 帧未来窗口；50 Hz 帧索引换算为秒。
@@ -304,6 +322,9 @@ class TerrainMotionCfg(CommandTermCfg):
     resampling_time_range: tuple = (1e9, 1e9)
     contact_labels_dir: str = ""
     enable_terrain_curriculum: bool = True
+    curriculum_off_platform_steps: int = 50
+    motion_uniform_fraction: float = 0.2
+    motion_failure_decay: float = 0.99
     enable_contact_objectives: bool = True
     enable_tolerance: bool = True
     tolerance_alpha: float = 1.0

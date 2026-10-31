@@ -27,3 +27,11 @@ register_backend_tasks(
     entry_point="instinctlab.tasks.shadowing.pgmt.terrain_env:PGMTTerrainEnv",
     instinct_rl_cfg_entry_point=f"{agents.__name__}.instinct_rl_terrain_cfg:G1PGMTTerrainPPORunnerCfg",
 )
+
+register_backend_tasks(
+    "Instinct-PGMT-TerrainPPOValidation-G1",
+    env_cfg_entry_point=f"{task_entry}.pgmt_terrain_cfg:G1PGMTTerrainPPOValidationEnvCfg",
+    play_env_cfg_entry_point=f"{task_entry}.pgmt_terrain_cfg:G1PGMTTerrainPPOValidationEnvCfg_PLAY",
+    entry_point="instinctlab.tasks.shadowing.pgmt.terrain_env:PGMTTerrainEnv",
+    instinct_rl_cfg_entry_point=f"{agents.__name__}.instinct_rl_terrain_cfg:G1PGMTTerrainPPORunnerCfg",
+)

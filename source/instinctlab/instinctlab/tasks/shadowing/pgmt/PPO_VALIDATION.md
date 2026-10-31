@@ -1,0 +1,168 @@
+# PPO terrain and motion validation
+
+This branch starts at native PGMT `ec5237e`. It contains no world model,
+imagined actor update, imagined critic, teacher, or WM checkpoint dependency.
+PPO uses the native four reward groups and the native terrain height scanner.
+
+## Presets and reversible configuration
+
+The original `Instinct-PGMT-Terrain-G1-Newton-v0` task retains all 40 manifest
+motions and the original terrain proportions. The new
+`Instinct-PGMT-TerrainPPOValidation-G1-Newton-v0` task selects only
+`dance1_subject2` and changes proportions, leaving geometry and L0--L9 intact:
+
+| Terrain | New share | Original share | Original difficulty parameters retained |
+| --- | --- | --- | --- |
+| Flat | 20% | 20% | Plane |
+| Uphill slope | 10% | 10% | Rise/run 0.03--0.30 |
+| Downhill slope | 10% | 10% | Rise/run 0.03--0.30, inverted |
+| Upstairs | 20% | 10% | Step height 0.02--0.20 m; step width 0.30 m |
+| Downstairs | 20% | 10% | Step height 0.02--0.20 m; step width 0.30 m |
+| Boxes | 0% | 20% | Retained configuration: width 0.45 m, height 0.02--0.25 m |
+| Rough | 20% | 20% | Amplitude +/-0.005--0.050 m, noise increment 0.005 m |
+
+There are 10 rows and 10 columns of 8 x 8 m tiles, a 10 m outer border,
+0.10 m horizontal and 0.005 m vertical terrain resolution. The column order is
+`flat, flat, slope_up, slope_down, stairs_up, stairs_up, stairs_down,
+stairs_down, rough, rough`. Slopes and stairs retain their original
+2 m center platform; rough terrain has no separately
+flattened center platform. Slope/rough border width is 0.25 m and stairs border
+width is 1 m. The height scanner is 21 x 21 points over 2 x 2 m, at 0.10 m spacing,
+yaw-aligned and updated at 50 Hz. Newton scans exclude robot geometry; this is
+the isolated fix previously recorded as `9652e32`, not a WM migration.
+
+Level `l` uses the original `l/9` difficulty, so upstairs/downstairs rise is
+`0.02 + 0.18*l/9` m, slope is `0.03 + 0.27*l/9`, and rough amplitude is
+`0.005 + 0.045*l/9` m. Removing boxes does not lower these ranges.
+
+Overrides are applied after preset construction and consumed at runtime:
+
+```bash
+# Select multiple motions, preserving their manifest order.
+'env.scene.motion_reference.motion_buffers.LAFAN.motion_names=[dance1_subject2,walk2_subject1]'
+# Restore the full manifest, without changing the diagnostic terrain preset.
+env.scene.motion_reference.motion_buffers.LAFAN.motion_names=null
+# Restore the original terrain mixture on the diagnostic task.
+env.scene.terrain.terrain_generator.sub_terrains.stairs_up.proportion=0.1
+env.scene.terrain.terrain_generator.sub_terrains.stairs_down.proportion=0.1
+env.scene.terrain.terrain_generator.sub_terrains.boxes.proportion=0.2
+```
+
+Changing the task back to `Instinct-PGMT-Terrain-G1-Newton-v0` restores both
+original selections. Explicit lists accept canonical names or `.named.npz`
+filenames. The loader filters the manifest before loading tensors/contact
+labels, so the diagnostic run actually loads one motion. Empty, duplicate and
+unknown selections are rejected. The motion axis of failure statistics uses
+the actual number of loaded files, not a hard-coded 40.
+
+Terrain proportions are normalized by Isaac Lab and realized as fixed columns,
+not fresh per-reset random draws. With 10 columns the current shares are exact.
+For custom mixtures, choose enough columns to represent every positive terrain
+weight. Runtime family IDs derive from the exact pinned generator column rule;
+removing boxes does not turn rough terrain into the boxes family. Family IDs
+remain flat=0, slope=1, stairs=2, boxes=3, rough=4, preserving reward tolerances.
+The mapping requires the original ten-row curriculum-generated grid.
+
+## Terrain curriculum
+
+The default training configuration starts every environment at L0
+(`env.scene.terrain.max_init_terrain_level=0`). L1--L9 remain generated and are
+reached through the original curriculum; this is not a difficulty-range cut.
+An environment retains its terrain column/type and changes only its level.
+At reset:
+
+- Actual failure termination decreases the level by one.
+- Reaching the 10 s time limit without failure or leaving the assigned tile
+  increases the level by one. On nonflat terrain it additionally requires
+  **more than** 50 accumulated control steps outside the center region.
+- The center-region condition is max absolute XY offset from the tile origin
+  greater than 1.1 m. Those steps are accumulated, not necessarily consecutive.
+- Timeouts without sufficient platform departure keep the level unchanged.
+  Motion-end and tile-exit timeouts do not themselves promote the level.
+- Levels are clamped to [0,9]; no reset accounting occurs at first placement.
+
+Configuration controls:
+
+```bash
+env.commands.motion.enable_terrain_curriculum=true
+env.commands.motion.curriculum_off_platform_steps=50
+env.scene.terrain.max_init_terrain_level=0
+```
+
+The generator's `curriculum=true` creates ordered difficulty rows and column
+types. `commands.motion.enable_terrain_curriculum` separately controls whether
+episodes promote/demote the assigned level. Disabling the latter leaves the
+grid intact. Fixed-level/balanced L0--L9 evaluation is separate from training;
+a low mean training level does not establish high-difficulty performance.
+
+## Motion sampling
+
+Motion and terrain are unpaired. For each reset, motion probabilities are
+conditioned on the assigned terrain family `f` and level `l`:
+
+`p(m|f,l) = (1-u)*(1+F[f,l,m])/sum_j(1+F[f,l,j]) + u/M`.
+
+`M` is the selected manifest size. `u=0.2` preserves a 20% uniform mixture;
+with one selected motion its probability is exactly one. The original score
+update is retained: `F <- d*F + (1-d)*failed_counts`, with `d=0.99`, once per
+reset callback containing previous episodes. It is a decayed failure **count**,
+not a failure rate divided by visits. Scores and visits are per rank and saved
+for each rank; no new global sampling synchronization is introduced.
+
+```bash
+env.commands.motion.motion_uniform_fraction=0.2
+env.commands.motion.motion_failure_decay=0.99
+```
+
+Within the selected motion, start frames are uniformly sampled using the
+original rule `floor(U*(N-11))`, hence 0 through N-12. Eleven reference frames
+are reserved. Playback is 50 Hz, with no time warping or retargeting changes.
+Initial yaw is uniform in [-pi,pi], XY is aligned to the tile origin, and the
+existing reference support-height filter (0.10 s time constant) is retained.
+Frame sampling is not failure-adaptive in this terrain task. The separate
+flat stage-one bin curriculum is disabled by the existing terrain preset.
+
+## Stage-one initialization and launch
+
+Use the original native `model_2700.pt`, not candidate600 or a stage-two policy.
+`agent.warm_start` copies actor weights, policy noise and observation statistics;
+the new terrain channels use the existing expansion and gate ramp. The terrain
+critic and optimizer are initialized afresh. Learning rate is inherited from
+the stage-one checkpoint, then follows the original PPO adaptive-KL schedule.
+The terrain gate ramps from 0 to 1 over 200 PPO iterations, as before.
+
+```bash
+python -m torch.distributed.run --standalone --nproc_per_node=4 \
+  scripts/instinct_rl/train.py \
+  --task Instinct-PGMT-TerrainPPOValidation-G1-Newton-v0 \
+  --num_envs 4096 --max_iterations 2000 --viz none \
+  --run_name dance1_subject2_no_boxes_ppo \
+  --logroot /mnt/data/JIN/PGMT/InstinctLab-local/ppo-validation-20261031/train \
+  agent.warm_start=/mnt/data/JIN/PGMT/InstinctLab-local/checkpoints/stage1/pgmt_native_2700/model_2700.pt \
+  agent.save_interval=100
+```
+
+The deployment wrapper supplies the verified interpreter, source path, assets,
+data paths and persistent caches. Four ranks each have 4096 environments:
+16384 total, 24 steps/environment/iteration, 393216 samples per PPO iteration.
+PPO retains five learning epochs and four minibatches, four reward groups,
+gamma=0.99, lambda=0.95 and its original noise, randomization and terminations.
+
+## Implementation decisions and verification boundary
+
+- The diagnostic behavior is a new task preset; the original task defaults
+  remain available. No global environment variables select a hidden profile.
+- The initial formal run is bounded to 2000 iterations, rather than the native
+  30000 default, after a short same-scale startup smoke. Duration is controlled
+  by `--max_iterations`; this is an initial training run, not a quality claim.
+- Initial level remains the native L0 for reproducible stage-one adaptation.
+  High difficulty is retained in geometry and curriculum, not assumed learned.
+- Changing selection starts a new warm-started run. New checkpoints record
+  motion filenames, realized terrain columns and sampling settings, and reject
+  resume with changed recorded settings. Legacy checkpoints without this field
+  retain their original loading behavior; geometry changes still require a new
+  run, since this field is not a full terrain-mesh identity hash.
+- Logs, runtime manifests, checkpoint hashes, smoke/train job IDs and measured
+  startup evidence live outside Git under `InstinctLab-local/ppo-validation-20261031/`.
+- Finite losses and saved checkpoints demonstrate operational training only.
+  Tracking, terrain traversal, and WM feasibility require later evaluations.

@@ -57,6 +57,8 @@ class G1PGMTTerrainEnvCfg(G1PGMTShadowingEnvCfg):
             ray_alignment="yaw",
             pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[2.0, 2.0], ordering="yx"),
             mesh_prim_paths=["/World/ground"],
+            # Newton must exclude the carrier robot from the terrain-only scan.
+            global_world_only=True,
             update_period=0.02,
             debug_vis=False,
         )
@@ -128,6 +130,28 @@ class G1PGMTTerrainEnvCfg(G1PGMTShadowingEnvCfg):
 
 @configclass
 class G1PGMTTerrainEnvCfg_PLAY(G1PGMTTerrainEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 32
+        self.commands.motion.enable_terrain_curriculum = False
+        self.observations.policy.enable_corruption = False
+
+
+@configclass
+class G1PGMTTerrainPPOValidationEnvCfg(G1PGMTTerrainEnvCfg):
+    """PPO-only diagnostic preset; all individual terrain difficulty ranges are unchanged."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        proportions = dict(flat=0.2, slope_up=0.1, slope_down=0.1, stairs_up=0.2, stairs_down=0.2, boxes=0.0, rough=0.2)
+        for name, proportion in proportions.items():
+            self.scene.terrain.terrain_generator.sub_terrains[name].proportion = proportion
+        self.scene.motion_reference.motion_buffers["LAFAN"].motion_names = ["dance1_subject2"]
+        self.run_name = "G1PGMTDance1Subject2TerrainPPO"
+
+
+@configclass
+class G1PGMTTerrainPPOValidationEnvCfg_PLAY(G1PGMTTerrainPPOValidationEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.scene.num_envs = 32

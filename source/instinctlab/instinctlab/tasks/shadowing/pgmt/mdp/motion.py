@@ -15,6 +15,8 @@ from instinctlab.motion_reference.motion_files.amass_motion import AmassMotion
 from instinctlab.motion_reference.motion_files.amass_motion_cfg import AmassMotionCfg
 from instinctlab.utils.torch import ConcatBatchTensor
 
+from ..selection import select_motion_files
+
 
 class LafanNamedMotion(AmassMotion):
     """Preserve supplied velocities and link poses instead of differentiating them again."""
@@ -22,7 +24,8 @@ class LafanNamedMotion(AmassMotion):
     def _refresh_motion_file_list(self) -> None:
         manifest_path = Path(self.cfg.manifest).expanduser()
         manifest = json.loads(manifest_path.read_text())
-        self._all_motion_files = [str(Path(self.cfg.path).expanduser() / f["name"]) for f in manifest["files"]]
+        files = select_motion_files([f["name"] for f in manifest["files"]], self.cfg.motion_names)
+        self._all_motion_files = [str(Path(self.cfg.path).expanduser() / name) for name in files]
         self._init_motion_weights()
 
     def _read_motion_file(self, motion_file_idx: int) -> MotionSequence:
@@ -98,6 +101,7 @@ class LafanNamedMotion(AmassMotion):
 class LafanNamedMotionCfg(AmassMotionCfg):
     class_type: type | str = "{DIR}.motion:LafanNamedMotion"
     manifest: str = ""
+    motion_names: list[str] | None = None
     motion_bin_length_s: float = 1.0
     env_starting_stub_sampling_strategy: str = "concat_motion_bins"
     ensure_link_below_zero_ground: bool = False

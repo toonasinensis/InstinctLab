@@ -4,6 +4,8 @@ import torch
 
 from isaaclab.utils.warp import raycast_mesh
 
+from ..selection import TERRAIN_FAMILIES, terrain_column_names
+
 
 class TerrainContext:
     def __init__(self, command):
@@ -16,6 +18,15 @@ class TerrainContext:
         self.off_platform_steps = torch.zeros(n, device=device)
         self.actual_tile = torch.zeros(n, 2, dtype=torch.long, device=device)
         self.initialized = torch.zeros(n, dtype=torch.bool, device=device)
+        self.column_names = []
+        if self.env.scene.terrain.cfg.terrain_type == "generator":
+            generator = self.env.scene.terrain.cfg.terrain_generator
+            if not generator.curriculum or generator.num_rows != 10:
+                raise ValueError("PGMT requires the curriculum terrain grid with ten difficulty rows L0--L9")
+            self.column_names = terrain_column_names(generator.sub_terrains, generator.num_cols)
+        self.column_families = torch.tensor(
+            [TERRAIN_FAMILIES[name] for name in self.column_names], device=device, dtype=torch.long
+        )
 
     def query(self, xy):
         """World xy of ANY shape [...,2] -> height, upward normal, validity."""
@@ -70,8 +81,7 @@ class TerrainContext:
             ij = ((xy - first) / size).floor().long()
             self.actual_tile.copy_(ij)
             inside = ((ij >= 0) & (ij < ij.new_tensor(origins.shape[:2]))).all(-1)
-            # The generator has ten fixed columns: flat 0/1, slope 2/3, stairs 4/5, boxes 6/7, rough 8/9.
-            self.family.copy_(ij[:, 1].clamp(0, 9) // 2)
+            self.family.copy_(self.column_families[ij[:, 1].clamp(0, origins.shape[1] - 1)])
             self.level.copy_(ij[:, 0].clamp(0, 9))
             assigned = torch.stack((terrain.terrain_levels, terrain.terrain_types), -1)
             self.outside.copy_(~inside | (ij != assigned).any(-1))
