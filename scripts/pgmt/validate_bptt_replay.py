@@ -8,6 +8,8 @@ from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
 @torch.jit.script
 def scripted_function(value):
     return value.sin() * value.cos()
+
+
 from pathlib import Path
 
 
