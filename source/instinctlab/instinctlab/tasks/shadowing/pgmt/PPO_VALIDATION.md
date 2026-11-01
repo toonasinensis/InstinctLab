@@ -1,8 +1,9 @@
 # PPO terrain and motion validation
 
-This branch starts at native PGMT `ec5237e`. It contains no world model,
-imagined actor update, imagined critic, teacher, or WM checkpoint dependency.
-PPO uses the native four reward groups and the native terrain height scanner.
+This branch starts at native PGMT `ec5237e`. The PPO presets described here
+do not train a world model or use imagined policy updates or WM checkpoints.
+The separate supervised WM tasks are described in `WM_DIAGNOSTICS.md`.
+The baseline PPO uses four reward groups and the native terrain height scanner.
 
 ## Presets and reversible configuration
 
@@ -202,3 +203,60 @@ gamma=0.99, lambda=0.95 and its original noise, randomization and terminations.
   startup evidence live outside Git under `InstinctLab-local/ppo-validation-20261031/`.
 - Finite losses and saved checkpoints demonstrate operational training only.
   Tracking, terrain traversal, and WM feasibility require later evaluations.
+
+## Pure PPO reward ablations (2026-11-01)
+
+These two tasks change the **PPO reward objective**, unlike the preceding WM
+head ablations, which all retained the same 27 PPO terms:
+
+| Task | Removed terms | Active terms / critic values |
+| --- | --- | --- |
+| `Instinct-PGMT-TerrainPPONoForce-G1-Newton-v0` | `auxiliary/impact`, `terrain/stumble`, `terrain/force` | 24 / 4 |
+| `Instinct-PGMT-TerrainPPONoContactForce-G1-Newton-v0` | Above, plus `auxiliary/undesired_contact`, `terrain/touchdown`, `terrain/match`, `terrain/slip`, `terrain/switch` | 19 / 3 |
+
+The force boundary follows the actual reward dependencies: impact, stumble and
+force use force magnitude/direction, while the other five terms depend on
+contact state or contact timing. Binary contact sensors may themselves use a
+force threshold; the first task retains that contact-state signal. Neither
+task removes contact sensors or contact labels: they remain necessary for
+reference support height, terrain adaptation and unchanged curriculum behavior.
+Thus the second task removes explicit contact/force **rewards**, not all contact
+information from the environment.
+
+Terms are set to `None`, rather than weight zero. The second task has no terrain
+reward group at all; its critic and rollout storage therefore use three values
+(upper/lower/auxiliary). Keeping an empty fourth head would add a noisy learned
+baseline to the actor advantage. The critic still has one shared trunk, and
+group advantages are summed and normalized by the existing PPO implementation.
+The number of critic outputs is the only network difference between the two
+reward objectives; the actor, observation dimensions and height scanner match.
+
+Both runs independently warm-start the original stage-one `model_2700.pt` and
+start with fresh terrain critics/optimizers. They use seed 42, four GPUs with
+4096 environments each, 2000 iterations, 24 rollout steps, five epochs and four
+minibatches. Motion selection, terrain proportions/difficulty, randomization,
+terminations, last-level resampling curriculum and 200-iteration terrain gate
+are identical to `TerrainPPOValidation`. There is no WM fit or BPTT update.
+Launch using the command above with the desired task and a distinct run name
+and log root. No additional reward override is required. The full-reward task
+remains available to restore the original objective.
+
+Checkpoints have distinct task schemas and record the active reward names,
+weights and parameters. Resume rejects changed recorded objectives. Original
+stage-one initialization uses `agent.warm_start`, not stage-two resume; the
+three-value critic cannot load a four-value stage-two critic. Legacy full-task
+checkpoints without the reward-contract field retain their original behavior.
+
+`scripts/pgmt/validate_terrain.py` checks actual term counts/value widths,
+stage-one action parity, shared critic gradients, summed grouped returns,
+timeout bootstrap, rejection of changed reward weights and exact restoration
+of model, optimizer, normalizers and sampler. It supports one or 40 motions.
+Resource snapshots, immutable source manifests, smoke reports, distributed job
+IDs, runtime/GPU measurements and checkpoints are stored outside Git under
+`InstinctLab-local/ppo-reward-ablation-20261101/`.
+
+Compare tracking errors, failures/completions, curriculum exposure and videos
+at matched evaluation settings; reward sums across these objectives have
+different meanings. A successful launch or finite checkpoint does not establish
+tracking quality. The proposed SuperMimic height-map experiment without contact
+rewards is a subsequent experiment after inspecting these PPO results.

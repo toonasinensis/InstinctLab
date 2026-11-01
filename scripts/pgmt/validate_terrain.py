@@ -47,16 +47,30 @@ def main():
         obs, extras = env.get_observations()
         assert obs.shape == (env.num_envs, 2119)
         assert extras["observations"]["critic"].shape == (env.num_envs, 296)
-        assert env.num_rewards == 4
-        assert len(c.motion._all_motion_files) == 40
+        groups = env.num_rewards
+        assert groups in (3, 4)
+        contract = runner.reward_contract()
+        if "TerrainPPONoContactForce" in args.task:
+            assert list(contract) == ["upper", "lower", "auxiliary"]
+            assert sum(map(len, contract.values())) == 19
+            assert "undesired_contact" not in contract["auxiliary"]
+        elif "TerrainPPONoForce" in args.task:
+            assert groups == 4
+            assert sum(map(len, contract.values())) == 24
+            assert set(contract["terrain"]) == {"touchdown", "match", "slip", "switch"}
+        if "TerrainPPONo" in args.task:
+            assert "impact" not in contract["auxiliary"]
+            assert c.num_motions == 1
         report = dict(
             rank=rank,
             world=world,
             envs=env.num_envs,
-            motions=40,
+            motions=c.num_motions,
             policy_dim=2119,
             critic_dim=296,
             reward_groups=list(base.reward_manager.active_terms),
+            reward_contract=contract,
+            value_outputs=groups,
         )
         # Check deterministic stage-one action preservation after channel/normalizer expansion.
         saved = torch.load(agent.warm_start, map_location=env.device, weights_only=True)
@@ -77,7 +91,9 @@ def main():
         # Critic-only gradients reach shared intent parameters, exactly one optimizer registration.
         model = runner.alg.actor_critic
         model.act_inference(torch.randn(16, 2119, device=env.device))
-        model.evaluate(torch.randn(16, 296, device=env.device)).square().mean().backward()
+        values = model.evaluate(torch.randn(16, 296, device=env.device))
+        assert values.shape == (16, groups)
+        values.square().mean().backward()
         assert model.actor.intent_attention.q.weight.grad.abs().sum() > 0
         params = [p for g in runner.alg.optimizer.param_groups for p in g["params"]]
         assert len(params) == len({id(p) for p in params})
@@ -85,19 +101,19 @@ def main():
         report["shared_critic_gradient"] = True
         report["unique_optimizer_parameters"] = True
         # Independent Monte Carlo return example: two steps, gamma=lambda=1, terminal at t=1.
-        storage = TerrainStorage(2, 2, [1], [1], [1], num_rewards=4, device=env.device)
+        storage = TerrainStorage(2, 2, [1], [1], [1], num_rewards=groups, device=env.device)
         storage.rewards[:] = torch.tensor(
             [[[1.0, 2, 3, 4], [2.0, 4, 6, 8]], [[4.0, 3, 2, 1], [8.0, 6, 4, 2]]], device=env.device
-        )
+        )[..., :groups]
         storage.values.zero_()
         storage.dones[0] = 0
         storage.dones[1] = 1
-        storage.compute_returns(torch.zeros(2, 4, device=env.device), 1.0, 1.0)
+        storage.compute_returns(torch.zeros(2, groups, device=env.device), 1.0, 1.0)
         torch.testing.assert_close(storage.returns[0], storage.rewards.sum(0))
         torch.testing.assert_close(storage.returns[1], storage.rewards[1])
-        assert torch.equal(storage.advantages[..., 0], storage.advantages[..., 3])
+        assert torch.equal(storage.advantages[..., 0], storage.advantages[..., -1])
         report["summed_group_gae"] = True
-        # Exercise timeout observations before reset and bootstrap of four terminal values.
+        # Exercise timeout observations before reset and bootstrap of every terminal value.
         if not cfg.flat_precheck:
             terrain = base.scene.terrain
             indices = torch.arange(env.num_envs, device=env.device)
@@ -132,9 +148,23 @@ def main():
         failure = c.stratum_failure.clone()
         visits = c.stratum_visits.clone()
         optimizer = copy.deepcopy(runner.alg.optimizer.state_dict())
+        term = base.reward_manager.get_term_cfg("action_rate", group_name="auxiliary")
+        weight = term.weight
+        term.weight += 1.0
+        try:
+            runner.load(str(checkpoint))
+        except ValueError as error:
+            assert "reward terms or weights" in str(error)
+        else:
+            raise AssertionError("Resume accepted a changed reward objective")
+        finally:
+            term.weight = weight
+        report["changed_reward_resume_rejected"] = True
         runner.load(str(checkpoint))
         torch.testing.assert_close(model.state_dict(), before, rtol=0, atol=0)
-        torch.testing.assert_close({k: v.state_dict() for k, v in runner.normalizers.items()}, norm_before, rtol=0, atol=0)
+        torch.testing.assert_close(
+            {k: v.state_dict() for k, v in runner.normalizers.items()}, norm_before, rtol=0, atol=0
+        )
         torch.testing.assert_close(c.stratum_failure, failure, rtol=0, atol=0)
         torch.testing.assert_close(c.stratum_visits, visits, rtol=0, atol=0)
         for key, state in optimizer["state"].items():

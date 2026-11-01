@@ -33,7 +33,7 @@ class TerrainRunner(OnPolicyRunner):
         # The pinned runner only resolves built-in algorithm names. Keep the specialization task-local.
         self.alg = TerrainPPO(self.alg.actor_critic, device=device, **self.alg_cfg)
         self.alg.init_storage(
-            env.num_envs, self.num_steps_per_env, env.get_obs_format(), env.num_actions, num_rewards=4
+            env.num_envs, self.num_steps_per_env, env.get_obs_format(), env.num_actions, num_rewards=env.num_rewards
         )
         self.alg.normalizers = self.normalizers
         self.source_checkpoint = None
@@ -82,6 +82,16 @@ class TerrainRunner(OnPolicyRunner):
         self.env.unwrapped.command_manager.get_term("motion").metrics["terrain_gate"][:] = gate
         return super().rollout_step(obs, extra_obs)
 
+    def reward_contract(self):
+        manager = self.env.unwrapped.reward_manager
+        contract = {}
+        for group, names in manager.active_terms.items():
+            contract[group] = {}
+            for name in names:
+                term = manager.get_term_cfg(name, group_name=group)
+                contract[group][name] = dict(weight=term.weight, params=term.params)
+        return contract
+
     def save(self, path, infos=None):
         env = self.env.unwrapped
         c = env.command_manager.get_term("motion")
@@ -108,6 +118,7 @@ class TerrainRunner(OnPolicyRunner):
                 source_checkpoint=self.source_checkpoint,
                 terrain_gate_ramp=self.cfg.get("terrain_gate_ramp", 200),
                 sampling_contract=c.sampling_contract,
+                reward_contract=self.reward_contract(),
                 user=infos,
             ),
         )
@@ -134,6 +145,8 @@ class TerrainRunner(OnPolicyRunner):
             raise ValueError(
                 "Terrain resume changed motion selection, terrain columns or sampling settings; start a new run"
             )
+        if "reward_contract" in info and info["reward_contract"] != self.reward_contract():
+            raise ValueError("Terrain resume changed reward terms or weights; start a new run")
         super().load(path)
         state = info["rank_states"][rank]
         c.stratum_failure.copy_(state["failures"])

@@ -43,3 +43,12 @@ register_backend_tasks(
     entry_point="instinctlab.tasks.shadowing.pgmt.terrain_env:PGMTTerrainEnv",
     instinct_rl_cfg_entry_point=f"{agents.__name__}.instinct_rl_wm_cfg:G1PGMTSupervisedWMRunnerCfg",
 )
+
+for suffix in ("NoForce", "NoContactForce"):
+    register_backend_tasks(
+        f"Instinct-PGMT-TerrainPPO{suffix}-G1",
+        env_cfg_entry_point=f"{task_entry}.pgmt_terrain_cfg:G1PGMTTerrainPPO{suffix}EnvCfg",
+        play_env_cfg_entry_point=f"{task_entry}.pgmt_terrain_cfg:G1PGMTTerrainPPO{suffix}EnvCfg_PLAY",
+        entry_point="instinctlab.tasks.shadowing.pgmt.terrain_env:PGMTTerrainEnv",
+        instinct_rl_cfg_entry_point=f"{agents.__name__}.instinct_rl_terrain_cfg:G1PGMTTerrainPPORunnerCfg",
+    )

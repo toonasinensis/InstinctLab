@@ -162,6 +162,51 @@ class G1PGMTTerrainPPOValidationEnvCfg_PLAY(G1PGMTTerrainPPOValidationEnvCfg):
 
 
 @configclass
+class G1PGMTTerrainPPONoForceEnvCfg(G1PGMTTerrainPPOValidationEnvCfg):
+    """Remove force-dependent objectives, retaining contact-state objectives."""
+
+    mdp_schema: str = "pgmt-lafan-terrain-no-force-v1"
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.auxiliary.impact = None
+        self.rewards.terrain.stumble = None
+        self.rewards.terrain.force = None
+        self.run_name = "G1PGMTDance1Subject2PPONoForce"
+
+
+@configclass
+class G1PGMTTerrainPPONoForceEnvCfg_PLAY(G1PGMTTerrainPPONoForceEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 32
+        self.commands.motion.enable_terrain_curriculum = False
+        self.observations.policy.enable_corruption = False
+
+
+@configclass
+class G1PGMTTerrainPPONoContactForceEnvCfg(G1PGMTTerrainPPONoForceEnvCfg):
+    """Remove contact/force objectives; retain contact data for terrain adaptation."""
+
+    mdp_schema: str = "pgmt-lafan-terrain-no-contact-force-v1"
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.auxiliary.undesired_contact = None
+        self.rewards.terrain = None
+        self.run_name = "G1PGMTDance1Subject2PPONoContactForce"
+
+
+@configclass
+class G1PGMTTerrainPPONoContactForceEnvCfg_PLAY(G1PGMTTerrainPPONoContactForceEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 32
+        self.commands.motion.enable_terrain_curriculum = False
+        self.observations.policy.enable_corruption = False
+
+
+@configclass
 class G1PGMTTerrainFlatEnvCfg(G1PGMTTerrainEnvCfg):
     flat_precheck: bool = True
 

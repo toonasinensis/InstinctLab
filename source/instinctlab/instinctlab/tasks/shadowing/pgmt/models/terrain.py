@@ -1,4 +1,4 @@
-"""Terrain glimpses and shared-intent four-value PGMT model."""
+"""Terrain glimpses and a shared-intent grouped-value PGMT model."""
 
 import torch
 from torch import nn
@@ -51,9 +51,10 @@ class TerrainActor(CrossAttentionActor):
 
 class TerrainActorCritic(CrossAttentionActorCritic):
     def __init__(self, *args, num_rewards=4, **kwargs):
-        if num_rewards != 4:
-            raise ValueError("PGMT terrain requires upper/lower/auxiliary/terrain reward groups")
-        # One shared trunk with four outputs, rather than four duplicate critic trunks.
+        if num_rewards not in (3, 4):
+            raise ValueError("PGMT terrain requires upper/lower/auxiliary and an optional terrain reward group")
+        self.num_value_groups = num_rewards
+        # One shared trunk with one output per active group.
         super().__init__(*args, num_rewards=1, **kwargs)
 
     def _build_actor(self, num_actions):
@@ -62,7 +63,7 @@ class TerrainActorCritic(CrossAttentionActorCritic):
         return TerrainActor(num_actions)
 
     def _build_critic(self, num_values=1):
-        dims = (self.mlp_input_dim_c + 256, *self.critic_hidden_dims, 4)
+        dims = (self.mlp_input_dim_c + 256, *self.critic_hidden_dims, self.num_value_groups)
         layers = []
         for i, (a, b) in enumerate(zip(dims[:-1], dims[1:])):
             layers.append(nn.Linear(a, b))
