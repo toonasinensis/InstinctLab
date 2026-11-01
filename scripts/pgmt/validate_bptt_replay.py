@@ -15,7 +15,7 @@ def main():
     ids = torch.arange(4)
     for refill in range(2):
         histories, expected = torch.randn(4, 10, 93, generator=generator), []
-        steps = torch.full((4,), 5, dtype=torch.long)
+        steps = torch.full((4,), 20, dtype=torch.long)
         for t in range(57):
             frame = torch.randn(4, 93, generator=generator)
             reset = (t + ids) % (11 + ids) == 0
