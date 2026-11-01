@@ -22,6 +22,7 @@ from instinctlab.utils import instinct_rl_cli as cli
 def main():
     parser = cli.build_train_parser()
     parser.add_argument("--report-dir", required=True)
+    parser.add_argument("--prefill-steps", type=int, default=32)
     args, overrides = cli.parse_cli(parser, require_run_name=True)
     args.distributed = "LOCAL_RANK" in os.environ
     cfg, agent = cli.resolve_train_cfg(args.task, overrides)
@@ -125,7 +126,7 @@ def main():
             torch.testing.assert_close(runner.replay.histories(latest, ids), record["history"], rtol=0, atol=0)
 
         runner.replay.add = check_history
-        runner.collect(32)
+        runner.collect(args.prefill_steps)
         runner.fit_world_model()
         runner.collect()
         runner.fit_world_model()
