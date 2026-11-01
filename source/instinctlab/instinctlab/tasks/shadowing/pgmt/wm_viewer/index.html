@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>WM Rollout Inspector</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="importmap">{"imports":{"three":"./vendor/three.module.js"}}</script>
+</head>
+<body>
+  <header>
+    <div><strong>WM Rollout Inspector</strong><span class="badge">真实采集 · 离线回放</span></div>
+    <span id="identity">Loading checkpoint…</span>
+  </header>
+  <section class="selection">
+    <label>场景<select id="case"></select></label>
+    <label class="window">预测起点<select id="window"></select></label>
+    <button id="previous">上一窗口</button><button id="next">下一窗口</button>
+    <button id="worst">本场景最大 root 误差</button>
+    <button id="export-view">导出当前视图</button>
+    <button id="details">采集说明</button>
+  </section>
+  <main>
+    <section class="viewport">
+      <canvas id="scene"></canvas>
+      <div class="legend"><span class="blue">●</span> Simulator <span class="amber">●</span> WM prediction</div>
+      <div id="scene-title"></div>
+      <div class="view-controls">
+        <button data-mode="overlay" class="selected">叠加</button><button data-mode="split">同步分屏</button>
+        <button data-camera="orbit">3D</button><button data-camera="top">俯视</button><button data-camera="side">侧视</button>
+        <label><input type="checkbox" id="paths" checked>轨迹</label>
+        <label><input type="checkbox" id="vectors" checked>误差连线</label>
+      </div>
+      <span id="split-labels" hidden>SIMULATOR <span>WORLD MODEL</span></span>
+      <div class="viewport-note">左键旋转 · 右键平移 · 滚轮缩放 · 两侧共享世界坐标</div>
+    </section>
+    <aside>
+      <section class="card">
+        <div class="card-title">当前步误差 <span id="step-label"></span></div>
+        <div class="metrics">
+          <div><span>Root 距离</span><strong id="root-error">—</strong></div>
+          <div><span>最大脚部距离</span><strong id="foot-error">—</strong></div>
+          <div><span>关节 RMSE</span><strong id="joint-error">—</strong></div>
+        </div>
+        <canvas id="top-path" class="top-path"></canvas>
+        <small>俯视 root 轨迹 · 实际与预测共用起点</small>
+      </section>
+      <section class="card">
+        <div class="card-title">Local heightmap <span id="map-error"></span></div>
+        <div class="maps"><div>Actual<canvas id="map-actual"></canvas></div><div>WM pose<canvas id="map-predicted"></canvas></div><div>Difference<canvas id="map-difference"></canvas></div></div>
+        <small id="map-scale"></small>
+        <small>同一高程场按各自位姿采样；未预测图像。X → / Y ↑</small>
+      </section>
+      <section class="card">
+        <div class="card-title">脚部接触 <span>实际蓝色 / 预测橙色</span></div>
+        <canvas id="contact"></canvas><small>预测概率 &gt; 0.5 为接触；每行上实际、下预测</small>
+      </section>
+      <section class="card status"><strong id="validity"></strong><small id="window-info"></small></section>
+    </aside>
+  </main>
+  <section class="playback">
+    <div class="play-controls">
+      <button id="play" class="primary">▶ 播放</button><button id="back">−1 帧</button><button id="forward">+1 帧</button>
+      <select id="speed"><option value="0.1">0.1×</option><option value="0.25" selected>0.25×</option><option value="0.5">0.5×</option><option value="1">1×</option></select>
+      <label><input type="checkbox" id="loop" checked>循环当前窗口</label>
+      <span class="horizons">Horizon <button data-h="1">1</button><button data-h="4">4</button><button data-h="8">8</button><button data-h="16">16</button><button data-h="32" class="selected">32</button></span>
+      <span id="time"></span>
+    </div>
+    <input id="scrub" type="range" min="0" max="32" value="32" step="1" aria-label="预测步数">
+    <div class="timeline-labels"><span>t₀ · 同一真实起点</span><span>H8 = 0.16 s 训练范围；H16 / H32 为外推</span><span>H32 = 0.64 s</span></div>
+  </section>
+  <section class="plots">
+    <div class="plot"><div><strong>位置误差 / cm</strong><span class="blue">Root</span><span class="amber">最大脚部</span></div><canvas id="error-plot"></canvas></div>
+    <div class="plot"><div><strong>奖励对照 / 每控制步</strong><select id="reward"></select><span class="blue">Native</span><span class="gray">解析 GT</span><span class="amber">解析 WM</span></div><canvas id="reward-plot"></canvas></div>
+  </section>
+  <footer><span>固定 PPO / WM · 同一串实际 action · 仅起点注入真实状态 · 不逐帧对齐 · 不跨 reset</span><span id="load-status">读取真实采集数据…</span></footer>
+  <dialog id="metadata"><button id="close-details">关闭</button><h3>采集与比较协议</h3><pre id="metadata-text"></pre></dialog>
+  <div id="fatal" hidden></div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
