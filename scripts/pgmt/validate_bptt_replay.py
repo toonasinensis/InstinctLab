@@ -2,6 +2,12 @@
 
 import importlib.util
 import torch
+from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
+
+
+@torch.jit.script
+def scripted_function(value):
+    return value.sin() * value.cos()
 from pathlib import Path
 
 
@@ -35,6 +41,13 @@ def main():
         replay.clear()
         assert replay.added == 0
     print("PASS: exact compact history, native reset backfill, ring overwrite, sequence sampling and refill")
+    value = torch.linspace(-1, 1, 19, requires_grad=True)
+    direct = torch.autograd.grad(scripted_function(value).sum(), value)[0]
+    with set_checkpoint_early_stop(False):
+        result = checkpoint(scripted_function, value, use_reentrant=False, preserve_rng_state=False)
+    recomputed = torch.autograd.grad(result.sum(), value)[0]
+    torch.testing.assert_close(direct, recomputed, rtol=0, atol=0)
+    print("PASS: full non-reentrant checkpoint recomputation through TorchScript")
 
 
 if __name__ == "__main__":

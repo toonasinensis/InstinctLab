@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 from pathlib import Path
 from torch import nn
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
 
 from tensorboardX import SummaryWriter
 
@@ -214,7 +214,10 @@ class BPTTRunner(SupervisedWMRunner):
         # These two forwards have no RNG. Observation noise is drawn outside the
         # recomputed region, so backward uses exactly the original noisy inputs.
         if self.bptt["checkpoint_activations"] and torch.is_grad_enabled():
-            return checkpoint(module, *inputs, use_reentrant=False, preserve_rng_state=False)
+            # Complete recomputation avoids propagating checkpoint's Python
+            # early-stop exception through scripted quaternion functions.
+            with set_checkpoint_early_stop(False):
+                return checkpoint(module, *inputs, use_reentrant=False, preserve_rng_state=False)
         return module(*inputs)
 
     def imagine(self, data):
