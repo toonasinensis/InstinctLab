@@ -103,6 +103,44 @@ def robot_meshes(urdf, joint_names, arrays):
     return dict(links=links, joints=joints, root="pelvis", quaternion="xyzw", urdf_sha256=digest(urdf))
 
 
+def terrain_component_centers(points, faces):
+    """One owner per complete primitive, so selection never tears a stair box."""
+    import trimesh
+
+    mesh = trimesh.Trimesh(vertices=points, faces=faces, process=False)
+    labels = trimesh.graph.connected_component_labels(mesh.face_adjacency, node_count=len(faces))
+    count = int(labels.max()) + 1
+    lo, hi = np.full((count, 3), np.inf), np.full((count, 3), -np.inf)
+    triangles = points[faces]
+    np.minimum.at(lo, labels, triangles.min(1))
+    np.maximum.at(hi, labels, triangles.max(1))
+    return ((lo + hi) / 2)[labels]
+
+
+def terrain_tile_faces(faces, owners, origin, size):
+    """Whole connected components assigned to this tile; no per-face trimming."""
+    center, half = np.asarray(origin)[:2], np.asarray(size) / 2
+    selected = faces[((owners[:, :2] >= center - half) & (owners[:, :2] < center + half)).all(1)]
+    if not len(selected):
+        raise ValueError("No complete terrain components belong to the requested tile")
+    return selected
+
+
+def terrain_description(family, level, generator):
+    cfg = generator.sub_terrains[family]
+    result = dict(tile_size=list(generator.size), selection="complete connected components of assigned tile")
+    if family in ("stairs_up", "stairs_down"):
+        low, high = cfg.step_height_range
+        result.update(
+            layout="pyramid_stairs" if family == "stairs_up" else "inverted_pyramid_stairs",
+            step_height=low + level / 9 * (high - low), step_width=cfg.step_width,
+            platform_width_config=cfg.platform_width,
+        )
+    else:
+        result["layout"] = family
+    return result
+
+
 @torch.no_grad()
 def export_windows(runner, rows, stride, arrays):
     """Every regular anchor is exported, including terminal/invalid prefixes."""
@@ -328,17 +366,17 @@ def main():
             mesh = c.terrain._mesh
             points = wp.to_torch(mesh.points).cpu().numpy()
             faces = wp.to_torch(mesh.indices).cpu().numpy().reshape(-1, 3)
-            centers = points[faces].mean(1)
+            owners = terrain_component_centers(points, faces)
             cases = []
             for lane, (family, level, shifted) in enumerate(CASES):
-                trajectory = torch.stack([r["state"][lane, :3] for r in rows]).cpu().numpy()
-                lo, hi = trajectory[:, :2].min(0) - 2.5, trajectory[:, :2].max(0) + 2.5
-                chosen = faces[((centers[:, :2] >= lo) & (centers[:, :2] <= hi)).all(1)]
+                origin = terrain.env_origins[lane].cpu().numpy()
+                generator = terrain.cfg.terrain_generator
+                chosen = terrain_tile_faces(faces, owners, origin, generator.size)
                 vertices, remap = np.unique(chosen, return_inverse=True)
                 cases.append(dict(
                     name=f"{family} · L{level} · {'off-platform spawn' if shifted else 'native center'}",
                     family=family, level=level, off_platform_spawn=shifted,
-                    origin=terrain.env_origins[lane].cpu().tolist(),
+                    origin=origin.tolist(), display_terrain=terrain_description(family, level, generator),
                     terrain=dict(vertices=mesh_arrays.add(points[vertices]), faces=mesh_arrays.add(remap.reshape(-1, 3), "u4")),
                 ))
             mesh_arrays.stream.close()
@@ -351,6 +389,7 @@ def main():
             summary.update(frozen_weights_and_normalizers=True, checkpoint_unchanged=True, optimizer_updates=0)
             manifest = dict(
                 schema="pgmt-wm-viewer-v1", dt=native.step_dt, horizon=32, train_horizon=wm["options"]["train_horizon"],
+                display_terrain_revision=2,
                 motion="dance1_subject2", checkpoint=str(args.checkpoint), checkpoint_sha256=checkpoint_sha,
                 checkpoint_iteration=saved.get("iter"), wm_updates=wm["updates"], scene_seed=cfg.seed, trajectory_seed=args.seed,
                 source_sha256=digest(__file__), state="p3, xyzw4, world COM v3, world w3, q29, qd29",

@@ -126,7 +126,7 @@ class Viewport {
   selectWindow() {
     const w = manifest.windows[windowIndex], c = manifest.cases[w.case];
     if (this.terrain) this.world.remove(this.terrain);
-    this.terrain = new THREE.Mesh(geometry(c.terrain), new THREE.MeshStandardMaterial({color: "#bdc2c5", roughness: .94, flatShading: true, side: THREE.DoubleSide}));
+    this.terrain = new THREE.Mesh(geometry(c.terrain), new THREE.MeshStandardMaterial({color: "#bdc2c5", roughness: .94, flatShading: true}));
     this.terrain.receiveShadow = true;
     this.world.add(this.terrain);
     this.world.position.set(...c.origin.map((value) => -value));
@@ -327,6 +327,9 @@ function update() {
   $("step-label").textContent = `H${frame} / ${maximum}`;
   $("time").textContent = `+${(frame * manifest.dt).toFixed(2)} s · step ${w.start_step + frame}`;
   $("scene-title").textContent = `${manifest.cases[w.case].name} · 起点 step ${w.start_step} · episode ${w.episode}`;
+  const terrain = manifest.cases[w.case].display_terrain;
+  const layouts = {pyramid_stairs: "四面金字塔楼梯 · 中心高", inverted_pyramid_stairs: "四面倒金字塔楼梯 · 中心低", flat: "平地", rough: "粗糙地形"};
+  $("terrain-description").textContent = terrain ? `${layouts[terrain.layout] || terrain.layout} · 完整 ${terrain.tile_size.join(" × ")} m 地形块${terrain.step_height ? ` · 阶高 ${(terrain.step_height * 100).toFixed(0)} cm / 阶宽 ${(terrain.step_width * 100).toFixed(0)} cm` : ""}` : "旧版局部裁剪地形";
   $("validity").textContent = maximum < horizon ? `窗口在 H${maximum} 结束：${w.terminal ? "真实 episode 终止" : "地形采样无效"}` : `有效预测 H${maximum} · ${frame <= manifest.train_horizon ? "训练范围内" : "超出 H8 训练范围"}`;
   $("window-info").textContent = `采集步 ${w.start_step}；episode 内第 ${w.episode_step} 步。终止前最后一步保留。`;
   const step = Math.max(0, frame - 1), actualMap = row("actual_map").subarray(step * 441, (step + 1) * 441), predictedMap = row("predicted_map").subarray(step * 441, (step + 1) * 441);
@@ -378,7 +381,7 @@ function advance(now) {
 
 async function main() {
   const responses = await Promise.all(["manifest.json", "data.bin", "meshes.bin"].map(async (path) => {
-    const response = await fetch(path); if (!response.ok) throw new Error(`${path}: HTTP ${response.status}`); return response;
+    const response = await fetch(path, {cache: "no-store"}); if (!response.ok) throw new Error(`${path}: HTTP ${response.status}`); return response;
   }));
   [manifest, dataBuffer, meshBuffer] = await Promise.all([responses[0].json(), responses[1].arrayBuffer(), responses[2].arrayBuffer()]);
   if (manifest.schema !== "pgmt-wm-viewer-v1" || !manifest.windows.length) throw new Error("不支持的数据格式或无可用窗口");
@@ -391,6 +394,8 @@ async function main() {
     checkpoint: manifest.checkpoint, sha256: manifest.checkpoint_sha256, policy: manifest.policy,
     scene_seed: manifest.scene_seed, trajectory_seed: manifest.trajectory_seed,
     terrain_matches_training: manifest.terrain_sha256 === manifest.training_terrain_sha256,
+    display_terrain_revision: manifest.display_terrain_revision || 1,
+    display_terrain: manifest.cases.map((c) => ({case: c.name, ...c.display_terrain})),
     heightmap: manifest.map_convention, summary: manifest.summary,
     note: "离线真实采集；灰色曲线为真实状态的解析奖励，橙色为预测状态的解析奖励。高难度边缘场景使用明确标注的 +1.6m 出生偏移。未对预测施加物理修正。",
   }, null, 2);
@@ -436,8 +441,11 @@ async function main() {
     ctx.fillText(`H${frame} · root ${$("root-error").textContent} · feet ${$("foot-error").textContent} · anchor step ${w.start_step} · checkpoint ${manifest.checkpoint_sha256.slice(0, 12)}`, 20, output.height - 16);
     output.toBlob((blob) => {
       const url = URL.createObjectURL(blob), link = document.createElement("a");
+      const previous = $("export-download");
+      if (previous) { URL.revokeObjectURL(previous.href); previous.remove(); }
+      link.id = "export-download"; link.textContent = "保存 PNG";
       link.href = url; link.download = `wm-rollout-case${w.case}-step${w.start_step}-h${frame}.png`; link.click();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      $("export-view").after(link);
     }, "image/png");
   };
   window.addEventListener("resize", () => update());

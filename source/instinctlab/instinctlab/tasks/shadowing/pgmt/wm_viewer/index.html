@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>WM Rollout Inspector</title>
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=2">
   <script type="importmap">{"imports":{"three":"./vendor/three.module.js"}}</script>
 </head>
 <body>
@@ -25,6 +25,7 @@
       <canvas id="scene"></canvas>
       <div class="legend"><span class="blue">●</span> Simulator <span class="amber">●</span> WM prediction</div>
       <div id="scene-title"></div>
+      <div id="terrain-description"></div>
       <div class="view-controls">
         <button data-mode="overlay" class="selected">叠加</button><button data-mode="split">同步分屏</button>
         <button data-camera="orbit">3D</button><button data-camera="top">俯视</button><button data-camera="side">侧视</button>
@@ -76,6 +77,6 @@
   <footer><span>固定 PPO / WM · 同一串实际 action · 仅起点注入真实状态 · 不逐帧对齐 · 不跨 reset</span><span id="load-status">读取真实采集数据…</span></footer>
   <dialog id="metadata"><button id="close-details">关闭</button><h3>采集与比较协议</h3><pre id="metadata-text"></pre></dialog>
   <div id="fatal" hidden></div>
-  <script type="module" src="app.js"></script>
+  <script type="module" src="app.js?v=3"></script>
 </body>
 </html>

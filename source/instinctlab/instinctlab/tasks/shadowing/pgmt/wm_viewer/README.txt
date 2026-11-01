@@ -50,7 +50,22 @@ native simulator, analytic true state/exact mesh, and analytic predicted state/r
 Only supported predicted reward terms are selectable; totals use that same subset.
 This distinguishes formula parity from compounded model/raster/event errors.
 
-The full mesh is cropped only for display; WM queries retain the original map.
+Terrain display selects complete connected mesh components of the assigned
+8x8m tile. It never removes individual triangles based on their centers: that
+old method opened stair boxes and exposed misleading walls and slabs.
+The terrain's stairs-up/down are FOUR-SIDED pyramid/inverted-pyramid patterns,
+not straight stair flights. Up/down describes the central platform elevation,
+not necessarily the robot's instantaneous travel direction. At L9 the configured
+step height/width are 0.20/0.30m. The configured central platform width is 2m;
+the discrete step layout makes the actual central square about 1.8m wide.
+WM queries retain the original global map. Display selection changes no states,
+actions, rewards, contact records, terrain difficulty or training configuration.
+For legacy captures, CPU-only repair preserves the original directory:
+  python scripts/pgmt/repair_wm_viewer_terrain.py --capture /path/to/r1 --output /path/to/r2
+It reconstructs the same seeded terrain, requires exact float32 matches for
+ALL previously exported triangles (including winding), and exports full tiles.
+The repair checks stair components have zero open boundary edges, and verifies
+trajectory bytes and the robot geometry prefix are unchanged.
 Robot visuals are exported from the SAME URDF using the native joint ordering.
 Capture verifies URDF/native link FK (<0.3 mm), and the browser also checks both
 native ankle positions (<0.3 mm). World quaternions are XYZW throughout.

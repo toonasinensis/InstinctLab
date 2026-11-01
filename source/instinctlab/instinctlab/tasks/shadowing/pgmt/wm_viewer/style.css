@@ -24,6 +24,7 @@ main { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 12px; }
 .legend span:nth-of-type(2) { margin-left: 15px; }
 .blue { color: #237de0; } .amber { color: #c98017; } .gray { color: #768394; }
 #scene-title { position: absolute; top: 58px; left: 18px; color: #667488; font-size: 12px; pointer-events: none; }
+#terrain-description { position: absolute; top: 81px; left: 18px; color: #667488; background: #ffffffdf; padding: 3px 7px; border-radius: 4px; font-size: 11px; pointer-events: none; }
 .view-controls { position: absolute; left: 14px; bottom: 38px; display: flex; gap: 5px; flex-wrap: wrap; align-items: center; }
 .view-controls button { background: #ffffffea; padding: 5px 10px; }
 .view-controls button.selected { color: white; background: #287de1; }
