@@ -78,6 +78,9 @@ This keeps anchor-age/reference eligibility rules independent of H. Reference
 windows come from the known motion bank and episode placement, not future
 simulated robot states. Proprioceptive history and previous actions are carried
 through the differentiable imagined rollout.
+Terrain level/family descriptors stay fixed at the sampled anchor during an
+imagined window, while the raster is sampled at each predicted pose. Descriptor
+changes when crossing a tile boundary are not modeled in this initial matrix.
 
 - **Real critic:** kinematic states and native 19-term rewards come from the
   recent real window. Lambda returns use each transition's pre-reset successor.
@@ -167,3 +170,8 @@ imagined states/actions, allowing the actual failed batch to be examined.
 The validator checks native-mesh border heights and deliberate invalid-window
 capture without a parameter update. Existing healthy attempts keep their
 immutable snapshots; a repaired attempt records its distinct version and budget.
+The same old guard subsequently ended real-H32 at 218 actor updates,
+imagined-H32 at 210 and real-H16 at 272. Their replacements use the same
+coverage correction; all original failure records are retained. The two H8
+attempts continue on the original snapshot while valid. Version differences
+and actual task IDs are recorded in `active-experiments.json` outside Git.
