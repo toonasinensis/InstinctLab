@@ -50,6 +50,26 @@ def main():
         # The raster approximation is measured separately; all nonterrain channels must match.
         torch.testing.assert_close(obs[:, :1678], runner.observation[:, :1678], atol=3e-4, rtol=1e-5)
         assert valid.all() and torch.isfinite(obs).all()
+        generator = cfg.scene.terrain.terrain_generator
+        origins = env.unwrapped.scene.terrain.terrain_origins[..., :2].reshape(-1, 2)
+        half_tile = origins.new_tensor(generator.size) / 2
+        low, high = origins.amin(0) - half_tile, origins.amax(0) + half_tile
+        middle = (low + high) / 2
+        margin = generator.border_width / 2
+        probes = torch.stack(
+            (
+                torch.stack((low[0] - margin, middle[1])),
+                torch.stack((high[0] + margin, middle[1])),
+                torch.stack((middle[0], low[1] - margin)),
+                torch.stack((middle[0], high[1] + margin)),
+            )
+        )
+        baked, baked_valid = runner.heightfield.query(probes)
+        native, _, native_valid = runner.rewards.command.terrain.query(probes)
+        assert baked_valid.all() and native_valid.all()
+        torch.testing.assert_close(baked, native, atol=2e-4, rtol=0)
+        outside = runner.heightfield.origin[None] - 0.1
+        assert not runner.heightfield.query(outside)[1].any()
         report = dict(
             observation_parity_max_error=float((obs[:, :1678] - runner.observation[:, :1678]).abs().max()),
             reward_count=len(runner.rewards.terms),
@@ -57,6 +77,9 @@ def main():
             horizon=runner.bptt["horizon"],
             rank=runner.rank,
             world=runner.world,
+            physical_border_probes_valid=True,
+            physical_border_height_max_error=float((baked - native).abs().max()),
+            beyond_raster_rejected=True,
         )
         assert runner.wm.contact_head is None and runner.wm.force_head is None
         assert not {id(p) for p in runner.value.parameters()} & {id(p) for p in runner.actor.parameters()}
@@ -144,6 +167,30 @@ def main():
                     expected = value.clone()
                     dist.broadcast(expected, src=0)
                     torch.testing.assert_close(value, expected, rtol=0, atol=0)
+        # A collective invalid window must preserve weights/counters and retain evidence.
+        local_map = runner.heightfield.local
+
+        def invalid_local(*args, **kwargs):
+            heights, valid = local_map(*args, **kwargs)
+            return heights, torch.zeros_like(valid)
+
+        runner.heightfield.local = invalid_local
+        counters = (runner.actor_updates, runner.critic_updates, runner.wm_updates)
+        try:
+            runner.update_bptt()
+        except RuntimeError as error:
+            assert "no actor update was applied" in str(error)
+        else:
+            raise AssertionError("Invalid imagined window was accepted")
+        finally:
+            runner.heightfield.local = local_map
+        assert counters == (runner.actor_updates, runner.critic_updates, runner.wm_updates)
+        torch.testing.assert_close(runner.actor.state_dict(), saved_actor, rtol=0, atol=0)
+        torch.testing.assert_close(runner.value.state_dict(), saved_value, rtol=0, atol=0)
+        window_path = root / f"invalid-rollout-{runner.actor_updates}-rank-{runner.rank}.pt"
+        window = torch.load(window_path, map_location="cpu", weights_only=True)
+        assert not window["valid"].any() and len(window["states"]) == runner.bptt["horizon"] + 1
+        assert (root / f"invalid-rollout-{runner.actor_updates}.pt").is_file()
         report.update(
             actor_updates=runner.actor_updates,
             critic_updates=runner.critic_updates,
@@ -151,6 +198,7 @@ def main():
             exact_reload=True,
             normalizers_frozen=True,
             independent_mlp=True,
+            invalid_window_capture=True,
             parameters_finite=all(
                 torch.isfinite(p).all().item()
                 for module in (runner.actor, runner.wm, runner.value)

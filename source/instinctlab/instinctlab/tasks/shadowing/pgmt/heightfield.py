@@ -55,8 +55,11 @@ class HeightField(nn.Module):
             lo, hi = origins.amin(0) - 100, origins.amax(0) + 100
         else:
             origins = terrain.terrain_origins[..., :2].reshape(-1, 2)
-            half_tile = origins.new_tensor(terrain.cfg.terrain_generator.size) / 2
-            lo, hi = origins.amin(0) - half_tile - 2, origins.amax(0) + half_tile + 2
+            generator = terrain.cfg.terrain_generator
+            half_tile = origins.new_tensor(generator.size) / 2
+            # Cover the existing mesh border, excluding its outermost ray edge.
+            border = max(float(generator.border_width) - resolution, 0)
+            lo, hi = origins.amin(0) - half_tile - border, origins.amax(0) + half_tile + border
         counts = ((hi - lo) / resolution).ceil().long() + 1
         x = torch.arange(int(counts[0]), device=lo.device) * resolution + lo[0]
         y = torch.arange(int(counts[1]), device=lo.device) * resolution + lo[1]

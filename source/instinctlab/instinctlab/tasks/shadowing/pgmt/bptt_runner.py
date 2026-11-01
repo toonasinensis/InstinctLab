@@ -302,12 +302,31 @@ class BPTTRunner(SupervisedWMRunner):
         self.value.requires_grad_(False)
         try:
             with torch.set_grad_enabled(actor):
-                loss, features, targets, alive, valid, _, _ = self.imagine(data)
+                loss, features, targets, alive, valid, states, actions = self.imagine(data)
             bad = (~valid).any().float()
             if dist.is_initialized():
                 dist.all_reduce(bad, op=dist.ReduceOp.MAX)
             if bad:
-                raise RuntimeError("Imagined rollout left the terrain raster; no actor update was applied")
+                if self.log_root:
+                    prefix = self.log_root / f"invalid-rollout-{self.actor_updates}"
+                    torch.save(
+                        dict(
+                            data={key: value.detach().cpu() for key, value in data.items()},
+                            states=[value.detach().cpu() for value in states],
+                            actions=[value.detach().cpu() for value in actions],
+                            valid=valid.detach().cpu(),
+                            raster_origin=self.heightfield.origin.cpu(),
+                            raster_extent=self.heightfield.extent.cpu(),
+                            rank=self.rank,
+                            actor_updates=self.actor_updates,
+                        ),
+                        str(prefix) + f"-rank-{self.rank}.pt",
+                    )
+                    self.save(str(prefix) + ".pt")
+                raise RuntimeError(
+                    "Imagined rollout left the terrain raster/reference domain; "
+                    "no actor update was applied; model and per-rank windows saved in log directory"
+                )
             norm = 0.0
             if actor:
                 loss.backward()

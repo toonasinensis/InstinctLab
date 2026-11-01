@@ -148,3 +148,22 @@ collection steps per rank. The real simulation batch is 8192 globally.
 Compare real tracking/error/failure metrics at matched checkpoints and
 evaluation conditions. Imagined return can improve while real behavior worsens;
 finite checkpoints or successful launches alone do not establish policy quality.
+
+## Raster coverage correction
+
+The first imagined-H16 attempt (25880) completed 140 actor updates, then failed
+the collective validity guard. Its original offending window was not saved.
+A fixed-model100 diagnostic made 56 scans with no optimization and did not
+reproduce that window. It did independently confirm that all four points just
+outside the old raster `[-42,42]^2` still hit the physical terrain mesh: the
+mesh has a 10 m border, whereas the old bake included only 2 m. This establishes
+a coverage bug, not the original failure's exact cause or policy convergence.
+
+The corrected bake uses the configured physical border, keeping one raster
+cell inside its outer ray edge. It adds neither terrain nor an invented floor.
+Samples beyond that finite domain still fail collectively before optimization.
+Such failures now save the current model and each rank's sampled window and
+imagined states/actions, allowing the actual failed batch to be examined.
+The validator checks native-mesh border heights and deliberate invalid-window
+capture without a parameter update. Existing healthy attempts keep their
+immutable snapshots; a repaired attempt records its distinct version and budget.

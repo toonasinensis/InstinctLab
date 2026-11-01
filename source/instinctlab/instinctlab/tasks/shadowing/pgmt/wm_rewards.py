@@ -1,7 +1,7 @@
 """Stateless native reward reconstruction, separate from learned dynamics.
 
 Hard contact events deliberately retain native semantics for diagnostic parity.
-No reward here is an actor training objective.
+The BPTT task uses only the 19 analytic terms, without contact/force events.
 """
 
 import torch
