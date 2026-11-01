@@ -41,6 +41,11 @@ Both initialization sources are explicit CLI arguments:
 These are transfer initializations, not exact continuation of either source run.
 This first matrix tests BPTT integration from a stable terrain policy, not whether
 stage1-only BPTT can learn stage2 from scratch.
+Simulator episodes, failure-sampling statistics and terrain curriculum start
+fresh at L0 in every case; source curriculum state is not resumed.
+The source WM's input/delta moments each contain 200245248 samples, above their
+200000000 update cap. These inherited moments remain fixed; recalibration here
+updates the WM weights, not its input/output normalization statistics.
 
 There are 32 preliminary collection/WM/value-fitting rounds with the actor
 frozen, followed by 5000 actor updates. Warmup is additional to the requested
