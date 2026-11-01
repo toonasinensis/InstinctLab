@@ -6,7 +6,8 @@ import torch
 import torch.distributed as dist
 from pathlib import Path
 from torch import nn
-from torch.utils.tensorboard import SummaryWriter
+
+from tensorboardX import SummaryWriter
 
 from .bptt_mdp import BPTTMDP, lambda_returns, raw_history
 from .wm_dynamics import average_gradients
@@ -85,6 +86,13 @@ class BPTTRunner(SupervisedWMRunner):
         self.ppo_updates = 0
         if self.log_root:
             self.log_root.mkdir(parents=True, exist_ok=True)
+            if self.rank == 0:
+                contract_path = self.log_root / "wm-contract.json"
+                contract = json.loads(contract_path.read_text())
+                contract["actor_update"] = "BPTT only through frozen WM parameters; no PPO update"
+                contract["critic_source"] = self.bptt["critic_source"]
+                contract["policy_horizon"] = self.bptt["horizon"]
+                contract_path.write_text(json.dumps(contract, indent=2) + "\n")
             (self.log_root / f"bptt-rank-{self.rank}-contract.json").write_text(
                 json.dumps(
                     dict(
@@ -142,7 +150,8 @@ class BPTTRunner(SupervisedWMRunner):
         return {k: torch.stack([x[k] for x in rows]).mean() for k in rows[0]}
 
     def sample_actor(self):
-        count, horizon = self.bptt["actor_batch"], self.bptt["horizon"]
+        # Sample identical H32 anchors/noise prefixes even when the actor uses H8 or H16.
+        count, horizon = self.bptt["actor_batch"], 32
         eligible = torch.arange(self.env.num_envs, device=self.device)
         eligible = eligible[eligible % 8 != 0]
         pieces, total = [], 0
@@ -255,7 +264,7 @@ class BPTTRunner(SupervisedWMRunner):
                 self.features(data["next_state"][:, t], history, data["next_support"][:, t], next_context, ids)[0]
             )
         features, successors = torch.stack(features, 1), torch.stack(successors, 1)
-        values, next_values = self.value(features), self.value(successors)
+        next_values = self.value(successors)
         # Values after a reset are excluded; each transition has its own pre-reset successor.
         future, targets = next_values[:, -1], []
         for t in range(self.bptt["horizon"] - 1, -1, -1):
@@ -264,7 +273,7 @@ class BPTTRunner(SupervisedWMRunner):
                 + self.bptt["lambda"] * torch.where(data["done"][:, t], next_values[:, t], future)
             )
             targets.append(future)
-        return features, torch.stack(targets[::-1], 1), data["mask"]
+        return features, torch.stack(targets[::-1], 1), data["mask"][:, : self.bptt["horizon"]]
 
     def fit_value(self, features, targets, mask):
         features, targets = features.flatten(0, 1), targets.flatten()
@@ -399,6 +408,7 @@ class BPTTRunner(SupervisedWMRunner):
                             self.save(str(self.log_root / f"model_{self.current_learning_iteration}.pt"))
                 if phase == "warmup":
                     self.warmup_complete = True
+                    self.save(str(self.log_root / "warmup.pt"))
             self.save(str(self.log_root / f"model_{self.current_learning_iteration}.pt"))
         finally:
             stream.close()

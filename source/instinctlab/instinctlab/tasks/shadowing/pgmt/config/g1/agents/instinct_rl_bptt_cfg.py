@@ -10,7 +10,7 @@ class G1PGMTBPTTRunnerCfg(G1PGMTSupervisedWMRunnerCfg):
     runner_class_name: str = "instinctlab.tasks.shadowing.pgmt.bptt_runner:BPTTRunner"
     wm_checkpoint: str | None = None
     world_model: dict = {
-        **G1PGMTSupervisedWMRunnerCfg.world_model,
+        **G1PGMTSupervisedWMRunnerCfg().world_model,
         "amp": False,
         "predict_contact": False,
         "predict_force": False,
