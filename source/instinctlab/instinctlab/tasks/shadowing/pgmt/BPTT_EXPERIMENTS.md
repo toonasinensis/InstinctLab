@@ -14,8 +14,8 @@ hidden widths 512/256/128 and SiLU, with no actor intent or shared parameters.
 
 All cases use `Instinct-PGMT-TerrainBPTT-G1-Newton-v0` with
 `agent.bptt.critic_source=real|imagined` and `agent.bptt.horizon=8|16|32`.
-Each case has four GPUs and 4096 real environments per GPU, 24 real control
-steps per collection, 2000 actor-training iterations and seed 42. Motion is
+Each case has two GPUs and 4096 real environments per GPU, 24 real control
+steps per collection, 5000 actor-training iterations and seed 42. Motion is
 `dance1_subject2`; terrain proportions, L0--L9 geometry and the highest-level
 resampling curriculum are inherited from the PPO validation preset.
 
@@ -43,15 +43,15 @@ This first matrix tests BPTT integration from a stable terrain policy, not wheth
 stage1-only BPTT can learn stage2 from scratch.
 
 There are 32 preliminary collection/WM/value-fitting rounds with the actor
-frozen, followed by 2000 actor updates. Warmup is additional to the requested
-2000 actor-training iterations. The first round has only 24 replay steps, so
+frozen, followed by 5000 actor updates. Warmup is additional to the requested
+5000 actor-training iterations. The first round has only 24 replay steps, so
 value fitting starts in round two. `warmup.pt` preserves the state at that boundary.
 WM train length stays 8, with eight AdamW updates per collection, local batch
 512 and learning rate 3e-4. Real replay spans 48 steps. Validation retains
 H1/4/8/16/32 and environment holdout; neither WM nor actor/value fitting samples
 local `env_id % 8 == 0`.
 
-Actor batch is separately 256 per GPU (1024 globally); it does not equal the
+Actor batch is separately 256 per GPU (512 globally); it does not equal the
 4096 real simulator environments. Actor Adam uses learning rate 1e-5 and
 betas (0.9, 0.95); gradients are averaged across ranks, then clipped by global
 norm 1 and elementwise magnitude 0.1. Critic Adam uses learning rate 3e-4,
@@ -135,6 +135,10 @@ paths, independent value/actor optimizers and per-rank RNGs. Resume refills real
 episodes/replay; it is not bitwise physics continuation. Runtime manifests,
 resource evidence, immutable snapshots and results live outside Git in
 `InstinctLab-local/bptt-critic-horizon-20261101/`.
+
+A fresh full run has 5000 actor updates, 40256 new WM updates (plus the
+16000-update pretrained source), 100620 critic updates and 120768 real
+collection steps per rank. The real simulation batch is 8192 globally.
 
 Compare real tracking/error/failure metrics at matched checkpoints and
 evaluation conditions. Imagined return can improve while real behavior worsens;
