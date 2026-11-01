@@ -56,6 +56,17 @@ remains lr 3e-4, 5 epochs x 4 minibatches, hence 20 updates per round. Critic
 unchanged. Gamma/lambda remain 0.99/0.95. There is no new LR scaling or schedule.
 **FP32 remains in use and WM AMP stays disabled**; BF16 is deferred.
 
+The first two-GPU full-size H32 acceptance at snapshot 488c8f6 exhausted both
+44.52 GiB devices in the first differentiable forward, before any actor update.
+Retain that evidence; do not call it a completed training profile. Actor and WM
+forwards now use non-reentrant activation checkpointing during actor gradients.
+Their deterministic forwards are recomputed in backward; observation noise is
+sampled outside those regions and is not resampled. This changes memory/compute
+cost, not batch, horizon, objective, precision or optimizers. Small-batch loss
+and gradient parity against direct evaluation is required before full-size
+capacity validation. Actor anchor eligibility is resolved before gathering full
+H32 replay records, avoiding duplicate oversized candidate/history tensors.
+
 Replay capacity is exactly **1000 control steps per environment** (20 seconds).
 It stores one already-noisy proprioceptive frame, an episode-step counter and a
 nine-frame prefix before the oldest retained row. Sampling reconstructs exact

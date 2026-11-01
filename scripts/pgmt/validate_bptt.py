@@ -147,6 +147,22 @@ def main():
         runner.wm_optimizer.zero_grad(set_to_none=True)
         runner.wm.requires_grad_(False)
         runner.value.requires_grad_(False)
+        if runner.bptt["actor_batch"] <= 128:
+            # A small batch fits both forms. Full-size validation must not run
+            # the uncheckpointed form which already demonstrably exhausts VRAM.
+            parameter = runner.actor.action_head[-1].bias
+            noise_state = runner.noise_generator.get_state()
+            runner.bptt["checkpoint_activations"] = False
+            direct_loss = runner.imagine(data)[0]
+            direct_gradient = torch.autograd.grad(direct_loss, parameter)[0]
+            runner.noise_generator.set_state(noise_state)
+            runner.bptt["checkpoint_activations"] = True
+            recomputed_loss = runner.imagine(data)[0]
+            recomputed_gradient = torch.autograd.grad(recomputed_loss, parameter)[0]
+            torch.testing.assert_close(direct_loss, recomputed_loss, rtol=1e-5, atol=1e-6)
+            torch.testing.assert_close(direct_gradient, recomputed_gradient, rtol=1e-4, atol=1e-6)
+            report["checkpoint_gradient_parity"] = True
+            del direct_loss, direct_gradient, recomputed_loss, recomputed_gradient
         loss, _, _, _, valid, states, actions = runner.imagine(data)
         future_map = runner.heightfield.local(states[1][:, :3], yaw_angle(states[1][:, 3:7]))[0]
         map_gradient = torch.autograd.grad(future_map.square().mean(), actions[0], retain_graph=True)[0]
@@ -205,6 +221,7 @@ def main():
         saved_actor = copy.deepcopy(runner.actor.state_dict())
         saved_value = copy.deepcopy(runner.value.state_dict())
         saved_optimizer = copy.deepcopy(runner.actor_optimizer.state_dict())
+        saved_noise_rng = runner.noise_generator.get_state().clone()
         checkpoint = root / "acceptance.pt"
         runner.save(str(checkpoint))
         # A collective invalid window must preserve weights/counters and retain evidence.
@@ -236,6 +253,7 @@ def main():
         torch.testing.assert_close(runner.actor.state_dict(), saved_actor, rtol=0, atol=0)
         torch.testing.assert_close(runner.value.state_dict(), saved_value, rtol=0, atol=0)
         torch.testing.assert_close(runner.actor_optimizer.state_dict(), saved_optimizer, rtol=0, atol=0)
+        torch.testing.assert_close(runner.noise_generator.get_state(), saved_noise_rng, rtol=0, atol=0)
         if dist.is_initialized():
             for module in (runner.actor, runner.wm, runner.value):
                 for value in module.state_dict().values():
@@ -252,6 +270,8 @@ def main():
             replay_capacity=runner.replay.capacity,
             wm_hidden=runner.options["hidden"],
             wm_amp=runner.options["amp"],
+            checkpoint_activations=runner.bptt["checkpoint_activations"],
+            observation_noise_rng_exact_reload=True,
             independent_mlp=True,
             invalid_window_capture=True,
             parameters_finite=all(

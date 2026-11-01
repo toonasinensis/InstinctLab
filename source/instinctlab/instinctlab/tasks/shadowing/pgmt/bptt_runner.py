@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 from pathlib import Path
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from tensorboardX import SummaryWriter
 
@@ -170,7 +171,7 @@ class BPTTRunner(SupervisedWMRunner):
         return {k: torch.stack([x[k] for x in rows]).mean() for k in rows[0]}
 
     def sample_actor(self):
-        # Sample identical H32 anchors/noise prefixes even when the actor uses H8 or H16.
+        # Sample identical H32 anchors even when the actor uses H8 or H16.
         count, horizon = self.bptt["actor_batch"], 32
         eligible = torch.arange(self.env.num_envs, device=self.device)
         eligible = eligible[eligible % 8 != 0]
@@ -179,14 +180,23 @@ class BPTTRunner(SupervisedWMRunner):
             ids = eligible[
                 torch.randint(len(eligible), (2 * count,), device=self.device, generator=self.actor_generator)
             ]
-            data = self.replay.sequences(ids, horizon, self.actor_generator)
+            ages = torch.randint(
+                len(self.replay) - horizon + 1, ids.shape, device=self.device, generator=self.actor_generator
+            )
+            rows = self.replay.rows(ages)
+            frame, motion = (self.replay.data[key][rows, ids] for key in ("frame", "motion"))
             # Identical maximum-H reference eligibility in all six groups.
-            valid = data["frame"][:, 0] + 32 + 11 < self.rewards.command.label_lengths[data["motion"][:, 0]]
+            valid = frame + 32 + 11 < self.rewards.command.label_lengths[motion]
             selected = valid.nonzero().flatten()[: count - total]
-            pieces.append({key: value[selected] for key, value in data.items()})
+            pieces.append((ids[selected], ages[selected]))
             total += len(selected)
             if total == count:
-                return {key: torch.cat([part[key] for part in pieces]) for key in pieces[0]}
+                return self.replay.sequences(
+                    torch.cat([part[0] for part in pieces]),
+                    horizon,
+                    self.actor_generator,
+                    ages=torch.cat([part[1] for part in pieces]),
+                )
         raise RuntimeError("Insufficient eligible motion windows for BPTT; refusing a smaller batch")
 
     @staticmethod
@@ -200,6 +210,13 @@ class BPTTRunner(SupervisedWMRunner):
         obs, valid = self.mdp.observations(state, history, support, context, generator)
         return self.mdp.value_features(state, obs, support, context, self.xi[ids]), obs, valid
 
+    def network_forward(self, module, *inputs):
+        # These two forwards have no RNG. Observation noise is drawn outside the
+        # recomputed region, so backward uses exactly the original noisy inputs.
+        if self.bptt["checkpoint_activations"] and torch.is_grad_enabled():
+            return checkpoint(module, *inputs, use_reentrant=False, preserve_rng_state=False)
+        return module(*inputs)
+
     def imagine(self, data):
         horizon = self.bptt["horizon"]
         ids, start = data["env_id"], self.start(data)
@@ -210,8 +227,10 @@ class BPTTRunner(SupervisedWMRunner):
         features, observation, valid = self.features(state, history, support, context, ids, self.noise_generator)
         feature_rows, rewards, survival, states, actions = [features], [], [], [state], []
         for step in range(horizon):
-            action = self.actor(self.normalizers["policy"](observation))
-            successor, _, _ = self.wm(state, action, previous_action, None, observation[:, 1678:], self.xi[ids])
+            action = self.network_forward(self.actor, self.normalizers["policy"](observation))
+            successor, _, _ = self.network_forward(
+                self.wm, state, action, previous_action, None, observation[:, 1678:], self.xi[ids]
+            )
             next_context = self.mdp.context(start, step + 1)
             bodies = self.rewards.bodies(successor, ids)
             next_support, support_valid = self.rewards.support(successor, support, next_context, bodies)

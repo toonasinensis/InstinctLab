@@ -34,6 +34,7 @@ class G1PGMTBPTTRunnerCfg(G1PGMTSupervisedWMRunnerCfg):
         "warmup_iterations": 32,
         "initial_collect_steps": 32,
         "utd": 0.4,
+        "checkpoint_activations": True,
     }
     experiment_name: str = "g1_pgmt_bptt_critic_horizon"
     run_name: str = "NoContactForceBPTT"

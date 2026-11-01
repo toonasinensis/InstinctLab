@@ -53,11 +53,15 @@ class WMReplay:
         prefix = self.history_prefix[env_ids[..., None], (history_ages + 9).clamp(0, 8)]
         return torch.where((history_ages < 0)[..., None], prefix, values)
 
-    def sequences(self, env_ids, horizon, generator, history=True):
+    def sequences(self, env_ids, horizon, generator, history=True, ages=None):
         if not 1 <= horizon <= self.size:
             raise ValueError("WM replay does not yet contain the requested horizon")
         device = env_ids.device
-        age = torch.randint(self.size - horizon + 1, env_ids.shape, device=device, generator=generator)
+        age = (
+            ages
+            if ages is not None
+            else torch.randint(self.size - horizon + 1, env_ids.shape, device=device, generator=generator)
+        )
         rows = self.rows(age[:, None] + torch.arange(horizon, device=device))
         data = {key: value[rows, env_ids[:, None]] for key, value in self.data.items()}
         if history and self.history_prefix is not None:
