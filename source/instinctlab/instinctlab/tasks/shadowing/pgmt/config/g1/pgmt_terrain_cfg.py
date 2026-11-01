@@ -207,6 +207,24 @@ class G1PGMTTerrainPPONoContactForceEnvCfg_PLAY(G1PGMTTerrainPPONoContactForceEn
 
 
 @configclass
+class G1PGMTTerrainBPTTEnvCfg(G1PGMTTerrainPPONoContactForceEnvCfg):
+    """Common noise-free observation contract for the initial BPTT matrix."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.policy.enable_corruption = False
+        self.run_name = "G1PGMTDance1Subject2BPTT"
+
+
+@configclass
+class G1PGMTTerrainBPTTEnvCfg_PLAY(G1PGMTTerrainBPTTEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 32
+        self.commands.motion.enable_terrain_curriculum = False
+
+
+@configclass
 class G1PGMTTerrainFlatEnvCfg(G1PGMTTerrainEnvCfg):
     flat_precheck: bool = True
 

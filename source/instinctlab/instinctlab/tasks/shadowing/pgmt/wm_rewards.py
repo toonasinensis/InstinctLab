@@ -350,6 +350,7 @@ class AnalyticRewards:
                 if key.startswith("terrain/"):
                     terms[key] = torch.zeros_like(terms[key])
         keys = self.supported_keys(contact is not None, force is not None)
+        terms = {key: value for key, value in terms.items() if key in self.terms}
         if set(terms) != set(keys):
             raise ValueError("Analytic reward implementation does not cover the active native reward contract")
         weighted = torch.stack([terms[key] * self.terms[key].weight * self.dt for key in keys], -1)
