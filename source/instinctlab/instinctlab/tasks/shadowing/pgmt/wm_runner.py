@@ -33,7 +33,7 @@ class SupervisedWMRunner(TerrainRunner):
         super().__init__(env, train_cfg, log_dir, device)
         self.options = train_cfg["world_model"]
         horizons = [self.options["train_horizon"], *self.options["validation_horizons"]]
-        capacity = self.options["replay_chunks"] * self.num_steps_per_env
+        capacity = self.options.get("replay_steps", self.options["replay_chunks"] * self.num_steps_per_env)
         if env.num_envs < 2 or min(horizons) < 1 or max(horizons) > capacity:
             raise ValueError("WM requires >=2 environments and replay capacity covering all horizons")
         if self.options["train_horizon"] > self.num_steps_per_env:
@@ -234,7 +234,7 @@ class SupervisedWMRunner(TerrainRunner):
         eligible = eligible[eligible % 8 == 0] if validation else eligible[eligible % 8 != 0]
         count = self.options["validation_batch"] if validation else self.options["batch_size"]
         ids = eligible[torch.randint(len(eligible), (count,), device=self.device, generator=self.generator)]
-        return self.replay.sequences(ids, horizon, self.generator)
+        return self.replay.sequences(ids, horizon, self.generator, history=False)
 
     @torch.no_grad()
     def update_moments(self):
@@ -243,7 +243,7 @@ class SupervisedWMRunner(TerrainRunner):
         # Bound the heightmap temporary allocation at 4096 environments/GPU.
         inputs, deltas, forces = [], [], []
         rows = self.replay.rows(
-            torch.arange(len(self.replay) - self.num_steps_per_env, len(self.replay), device=self.device)
+            torch.arange(len(self.replay) - self.replay.added, len(self.replay), device=self.device)
         )
         for row in rows:
             data = {
@@ -264,6 +264,7 @@ class SupervisedWMRunner(TerrainRunner):
         self.wm.delta_norm.update(torch.cat(deltas))
         if self.wm.predict_force:
             self.wm.force_norm.update(torch.cat(forces))
+        self.replay.added = 0
 
     def predict(self, data, horizon):
         state = data["state"][:, 0]

@@ -47,8 +47,30 @@ def main():
         obs, valid = runner.mdp.observations(
             state, raw_history(runner.observation), runner.rewards.command.terrain.support_z, context
         )
+        # The real history already contains noise. Compare remaining channels against
+        # a read-only, noise-disabled native computation without advancing that history.
+        terms = runner.native.observation_manager._group_obs_term_cfgs["policy"]
+        noises = [term.noise for term in terms]
+        try:
+            for term in terms:
+                term.noise = None
+            clean = runner.native.observation_manager.compute_group("policy", update_history=False)
+            clean = torch.cat([value.flatten(1) for value in clean.values()], -1)
+        finally:
+            for term, noise in zip(terms, noises):
+                term.noise = noise
         # The raster approximation is measured separately; all nonterrain channels must match.
-        torch.testing.assert_close(obs[:, :1678], runner.observation[:, :1678], atol=3e-4, rtol=1e-5)
+        torch.testing.assert_close(obs[:, :1678], clean[:, :1678], atol=3e-4, rtol=1e-5)
+        noisy = runner.mdp.observations(
+            state,
+            raw_history(runner.observation),
+            runner.rewards.command.terrain.support_z,
+            context,
+            runner.noise_generator,
+        )[0]
+        assert not torch.equal(noisy[:, 930:1678], obs[:, 930:1678])
+        torch.testing.assert_close(noisy[:, :930], obs[:, :930], rtol=0, atol=0)
+        torch.testing.assert_close(noisy[:, 1678:], obs[:, 1678:], rtol=0, atol=0)
         assert valid.all() and torch.isfinite(obs).all()
         generator = cfg.scene.terrain.terrain_generator
         origins = env.unwrapped.scene.terrain.terrain_origins[..., :2].reshape(-1, 2)
@@ -71,7 +93,9 @@ def main():
         outside = runner.heightfield.origin[None] - 0.1
         assert not runner.heightfield.query(outside)[1].any()
         report = dict(
-            observation_parity_max_error=float((obs[:, :1678] - runner.observation[:, :1678]).abs().max()),
+            observation_parity_max_error=float((obs[:, :1678] - clean[:, :1678]).abs().max()),
+            observation_noise=True,
+            imagined_noise_changes_only_configured_channels=True,
             reward_count=len(runner.rewards.terms),
             critic_source=runner.bptt["critic_source"],
             horizon=runner.bptt["horizon"],
@@ -92,11 +116,33 @@ def main():
         torch.testing.assert_close(result, torch.tensor([[6.0, 17.0]], device=runner.device))
         actor_before = copy.deepcopy(runner.actor.state_dict())
         norms_before = copy.deepcopy({k: v.state_dict() for k, v in runner.normalizers.items()})
-        runner.collect()
+        replay_add = runner.replay.add
+
+        def check_history(record):
+            replay_add(record)
+            ids = torch.arange(env.num_envs, device=runner.device)
+            latest = torch.full_like(ids, len(runner.replay) - 1)
+            torch.testing.assert_close(runner.replay.histories(latest, ids), record["history"], rtol=0, atol=0)
+
+        runner.replay.add = check_history
+        runner.collect(32)
         runner.fit_world_model()
         runner.collect()
         runner.fit_world_model()
+        runner.replay.add = replay_add
+        report["native_noisy_history_reconstruction_exact"] = True
         data = runner.sample_actor()
+        # Recorded real exploration must have no effect on imagined actions/objective.
+        noise_state = runner.noise_generator.get_state()
+        with torch.no_grad():
+            original = runner.imagine(data)
+            runner.noise_generator.set_state(noise_state)
+            altered = dict(data, action_noise=torch.full_like(data["action_noise"], 100))
+            without = runner.imagine(altered)
+            torch.testing.assert_close(original[0], without[0], rtol=0, atol=0)
+            torch.testing.assert_close(torch.stack(original[-1]), torch.stack(without[-1]), rtol=0, atol=0)
+        report["no_imagined_action_exploration"] = True
+        del original, without
         runner.wm_optimizer.zero_grad(set_to_none=True)
         runner.wm.requires_grad_(False)
         runner.value.requires_grad_(False)
@@ -125,14 +171,17 @@ def main():
         runner.value.requires_grad_(False)
         original_tf32 = torch.backends.cuda.matmul.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = False
+        noise_state = runner.noise_generator.get_state()
         value = runner.imagine(data)[0]
         gradient = torch.autograd.grad(value, parameter)[0]
         expected = (gradient * direction).sum().item()
         epsilon = 0.003
         with torch.no_grad():
             parameter.add_(epsilon * direction)
+            runner.noise_generator.set_state(noise_state)
             plus = float(runner.imagine(data)[0])
             parameter.add_(-2 * epsilon * direction)
+            runner.noise_generator.set_state(noise_state)
             minus = float(runner.imagine(data)[0])
             parameter.add_(epsilon * direction)
         actual = (plus - minus) / (2 * epsilon)
@@ -198,6 +247,10 @@ def main():
             ppo_updates=0,
             exact_reload=True,
             normalizers_frozen=True,
+            critic_architecture_unchanged=True,
+            replay_capacity=runner.replay.capacity,
+            wm_hidden=runner.options["hidden"],
+            wm_amp=runner.options["amp"],
             independent_mlp=True,
             invalid_window_capture=True,
             parameters_finite=all(

@@ -5,6 +5,7 @@ import torch
 from torch.nn import functional as F
 
 from isaaclab.utils.math import matrix_from_quat, quat_apply, quat_apply_inverse, quat_inv, quat_mul, yaw_quat
+from isaaclab.utils.noise import UniformNoiseCfg
 
 from .mdp.terrain_math import corrected_planar_velocity, tolerance_error
 from .models.cross_attention import unpack_terms
@@ -45,6 +46,26 @@ class BPTTMDP:
             name: c.env.termination_manager.get_term_cfg(name).params["threshold"]
             for name in ("root_height", "root_tilt", "body_error")
         }
+        manager = c.env.observation_manager
+        self.observation_terms = dict(
+            zip(manager._group_obs_term_names["policy"], manager._group_obs_term_cfgs["policy"])
+        )
+        for name, cfg in self.observation_terms.items():
+            if cfg.noise is not None and (not isinstance(cfg.noise, UniformNoiseCfg) or cfg.noise.operation != "add"):
+                raise ValueError(f"Imagined observation noise requires additive uniform noise: {name}")
+            if cfg.modifiers or cfg.delay_max_lag > 0:
+                raise ValueError(f"Imagined observations do not implement modifiers or delay: {name}")
+
+    def process_observation(self, value, name, generator=None):
+        cfg = self.observation_terms[name]
+        if generator is not None and cfg.noise is not None:
+            noise = torch.rand(value.shape, device=value.device, dtype=value.dtype, generator=generator)
+            value = value + cfg.noise.n_min + noise * (cfg.noise.n_max - cfg.noise.n_min)
+        if cfg.clip:
+            value = value.clamp(*cfg.clip)
+        if cfg.scale is not None:
+            value = value * cfg.scale
+        return value
 
     def placement(self):
         c = self.command
@@ -106,20 +127,19 @@ class BPTTMDP:
             phase=frames[:, 0].float() / lengths[:, 0],
         )
 
-    def proprioception(self, state, previous_action, ids):
+    def proprioception(self, state, previous_action, ids, generator=None):
         gravity = state.new_tensor([0, 0, -1]).expand(len(state), -1)
-        return torch.cat(
-            (
-                quat_apply_inverse(state[:, 3:7], gravity),
-                quat_apply_inverse(state[:, 3:7], state[:, 10:13]),
-                state[:, 13:42] - self.default_q[ids],
-                state[:, 42:71] - self.default_qd[ids],
-                previous_action,
-            ),
-            -1,
+        terms = (
+            quat_apply_inverse(state[:, 3:7], gravity),
+            quat_apply_inverse(state[:, 3:7], state[:, 10:13]),
+            state[:, 13:42] - self.default_q[ids],
+            state[:, 42:71] - self.default_qd[ids],
+            previous_action,
         )
+        names = ("projected_gravity", "base_ang_vel", "joint_pos", "joint_vel", "last_action")
+        return torch.cat([self.process_observation(v, k, generator) for k, v in zip(names, terms)], -1)
 
-    def observations(self, state, history, support, context):
+    def observations(self, state, history, support, context, generator=None):
         rotation = context["window_rotation"]
         inverse = quat_inv(state[:, 3:7])[:, None].expand_as(rotation)
         orientation = matrix_from_quat(quat_mul(inverse, rotation))[..., :2].flatten(1)
@@ -130,16 +150,25 @@ class BPTTMDP:
             quat_apply_inverse(heading, context["window_velocity"]), quat_apply_inverse(heading, error)
         )
         heights, valid = self.heightfield.local(state[:, :3], yaw_angle(state[:, 3:7]))
+        # History is already processed once per frame; never add noise to it again.
+        values = (
+            context["ref_joints"][:, :319],
+            context["ref_joints"][:, 319:],
+            orientation,
+            context["ref_clearance"],
+            correction.flatten(1),
+            heights,
+        )
+        names = (
+            "joint_pos_ref",
+            "joint_vel_ref",
+            "motion_orientation",
+            "motion_height",
+            "corrected_velocity",
+            "terrain",
+        )
         obs = torch.cat(
-            (
-                pack_history(history),
-                context["ref_joints"],
-                orientation,
-                context["ref_clearance"],
-                correction.flatten(1),
-                heights,
-            ),
-            -1,
+            (pack_history(history), *[self.process_observation(v, k, generator) for k, v in zip(names, values)]), -1
         )
         return obs, valid
 

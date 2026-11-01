@@ -45,15 +45,19 @@ class BPTTRunner(SupervisedWMRunner):
             raise ValueError(
                 "The initial BPTT experiment requires exactly 19 noncontact rewards and no auxiliary heads"
             )
-        if self.native.cfg.observations.policy.enable_corruption:
-            raise ValueError("The initial six-way experiment uses matching noise-free real/imagined observations")
-        if not train_cfg.get("ppo_checkpoint") or not train_cfg.get("wm_checkpoint"):
-            raise ValueError("Choose explicit, independently recorded PPO actor and pretrained WM sources")
-        saved = torch.load(train_cfg["wm_checkpoint"], map_location=self.device, weights_only=True)["supervised_wm"]
-        if saved["options"]["predict_contact"] or saved["options"]["predict_force"]:
-            raise ValueError("WM initialization source must have neither contact nor force heads")
-        self.wm.load_state_dict(saved["model"], strict=True)
-        self.pretrained_wm_updates = saved["updates"]
+        if not self.native.cfg.observations.policy.enable_corruption:
+            raise ValueError("The aligned BPTT matrix requires real and imagined observation noise")
+        if not train_cfg.get("ppo_checkpoint"):
+            raise ValueError("Choose an explicit PPO actor initialization source")
+        self.pretrained_wm_updates = 0
+        if train_cfg.get("wm_checkpoint"):
+            saved = torch.load(train_cfg["wm_checkpoint"], map_location=self.device, weights_only=True)["supervised_wm"]
+            if saved["options"]["predict_contact"] or saved["options"]["predict_force"]:
+                raise ValueError("WM initialization source must have neither contact nor force heads")
+            if saved["options"]["hidden"] != self.options["hidden"]:
+                raise ValueError("WM source width differs; initialize the new width from scratch, not a partial load")
+            self.wm.load_state_dict(saved["model"], strict=True)
+            self.pretrained_wm_updates = saved["updates"]
         self.mdp = BPTTMDP(self.rewards, self.normalizers["policy"], self.wm)
         self.actor = self.alg.actor_critic.actor
         self.alg.actor_critic.critic.requires_grad_(False)
@@ -70,6 +74,13 @@ class BPTTRunner(SupervisedWMRunner):
         self.actor_generator = torch.Generator(device=self.device).manual_seed(train_cfg["seed"] + 8009 + self.rank)
         self.real_generator = torch.Generator(device=self.device).manual_seed(train_cfg["seed"] + 9001 + self.rank)
         self.critic_generator = torch.Generator(device=self.device).manual_seed(train_cfg["seed"] + 10009 + self.rank)
+        self.noise_generator = torch.Generator(device=self.device).manual_seed(train_cfg["seed"] + 12007 + self.rank)
+        self.critic_noise_generator = torch.Generator(device=self.device).manual_seed(
+            train_cfg["seed"] + 13001 + self.rank
+        )
+        self.step_accumulator = 0.0
+        if self.bptt["utd"] <= 0 or self.bptt["initial_collect_steps"] < 32:
+            raise ValueError("BPTT requires positive UTD and an initial H32 replay prefill")
         width = 2119 + 68 + self.xi.shape[-1] + 8
         with torch.random.fork_rng(devices=[self.device]):
             torch.manual_seed(train_cfg["seed"] + 11003)
@@ -108,8 +119,11 @@ class BPTTRunner(SupervisedWMRunner):
                         num_envs=env.num_envs,
                         world_size=self.world,
                         sampling_contract=self.rewards.command.sampling_contract,
-                        observation_noise=False,
-                        action_noise="paired recorded Gaussian noise in real and imagined rollouts",
+                        observation_noise=True,
+                        action_noise="Gaussian exploration in real collection only; no added imagined action noise",
+                        replay_capacity=self.replay.capacity,
+                        wm_initialization="checkpoint" if train_cfg.get("wm_checkpoint") else "fresh",
+                        precision="unchanged FP32; WM AMP disabled",
                     ),
                     indent=2,
                 )
@@ -117,13 +131,18 @@ class BPTTRunner(SupervisedWMRunner):
             )
 
     @torch.inference_mode()
-    def collect(self):
+    def collect(self, steps=None):
         c = self.rewards.command
         rows = []
         self.actor.eval()
         self.actor.terrain_gate.fill_(self.initial_gate)
         c.metrics["terrain_gate"][:] = self.initial_gate
-        for _ in range(self.num_steps_per_env):
+        if steps is None:
+            self.step_accumulator += 1 / self.bptt["utd"]
+            steps = int(self.step_accumulator)
+            self.step_accumulator -= steps
+        self.last_collection_steps = steps
+        for _ in range(steps):
             record = dict(
                 state=ordinary(self.rewards.state()),
                 contact=ordinary(c.contacts.contact.float()),
@@ -131,6 +150,7 @@ class BPTTRunner(SupervisedWMRunner):
                 support=ordinary(c.terrain.support_z),
                 previous_ref_velocity=ordinary(c.contacts.previous_ref_velocity),
                 history=ordinary(raw_history(self.observation)),
+                episode_step=ordinary(self.native.episode_length_buf),
                 **{k: ordinary(v) for k, v in self.mdp.placement().items()},
             )
             noise = torch.randn(self.env.num_envs, 29, device=self.device, generator=self.real_generator)
@@ -176,8 +196,8 @@ class BPTTRunner(SupervisedWMRunner):
             for key in ("motion", "frame", "placement_position", "placement_rotation", "level", "family")
         } | {"env_id": data["env_id"]}
 
-    def features(self, state, history, support, context, ids):
-        obs, valid = self.mdp.observations(state, history, support, context)
+    def features(self, state, history, support, context, ids, generator=None):
+        obs, valid = self.mdp.observations(state, history, support, context, generator)
         return self.mdp.value_features(state, obs, support, context, self.xi[ids]), obs, valid
 
     def imagine(self, data):
@@ -187,10 +207,10 @@ class BPTTRunner(SupervisedWMRunner):
             data[k][:, 0] for k in ("state", "history", "support", "previous_action")
         )
         context = self.mdp.context(start)
-        features, observation, valid = self.features(state, history, support, context, ids)
+        features, observation, valid = self.features(state, history, support, context, ids, self.noise_generator)
         feature_rows, rewards, survival, states, actions = [features], [], [], [state], []
         for step in range(horizon):
-            action = self.actor(self.normalizers["policy"](observation)) + data["action_noise"][:, step]
+            action = self.actor(self.normalizers["policy"](observation))
             successor, _, _ = self.wm(state, action, previous_action, None, observation[:, 1678:], self.xi[ids])
             next_context = self.mdp.context(start, step + 1)
             bodies = self.rewards.bodies(successor, ids)
@@ -210,8 +230,12 @@ class BPTTRunner(SupervisedWMRunner):
                 ids,
             )
             alive = self.mdp.soft_survival(successor, next_support, next_context, bodies)
-            history = torch.cat((history[:, 1:], self.mdp.proprioception(successor, action, ids)[:, None]), 1)
-            features, observation, next_valid = self.features(successor, history, next_support, next_context, ids)
+            history = torch.cat(
+                (history[:, 1:], self.mdp.proprioception(successor, action, ids, self.noise_generator)[:, None]), 1
+            )
+            features, observation, next_valid = self.features(
+                successor, history, next_support, next_context, ids, self.noise_generator
+            )
             valid = valid & support_valid & next_valid & next_context["reference_valid"]
             rewards.append(reward.sum(-1))
             survival.append(alive)
@@ -251,17 +275,33 @@ class BPTTRunner(SupervisedWMRunner):
             ids = data["env_id"]
             context, next_context = self.mdp.context(start), self.mdp.context(start, 1)
             features.append(
-                self.features(data["state"][:, t], data["history"][:, t], data["support"][:, t], context, ids)[0]
+                self.features(
+                    data["state"][:, t],
+                    data["history"][:, t],
+                    data["support"][:, t],
+                    context,
+                    ids,
+                    self.critic_noise_generator,
+                )[0]
             )
             history = torch.cat(
                 (
                     data["history"][:, t, 1:],
-                    self.mdp.proprioception(data["next_state"][:, t], data["action"][:, t], ids)[:, None],
+                    self.mdp.proprioception(
+                        data["next_state"][:, t], data["action"][:, t], ids, self.critic_noise_generator
+                    )[:, None],
                 ),
                 1,
             )
             successors.append(
-                self.features(data["next_state"][:, t], history, data["next_support"][:, t], next_context, ids)[0]
+                self.features(
+                    data["next_state"][:, t],
+                    history,
+                    data["next_support"][:, t],
+                    next_context,
+                    ids,
+                    self.critic_noise_generator,
+                )[0]
             )
         features, successors = torch.stack(features, 1), torch.stack(successors, 1)
         next_values = self.value(successors)
@@ -362,6 +402,8 @@ class BPTTRunner(SupervisedWMRunner):
         phases = [] if self.warmup_complete else [("warmup", self.bptt["warmup_iterations"])]
         phases.append(("train", num_learning_iterations))
         try:
+            if len(self.replay) < 32:
+                self.collect(self.bptt["initial_collect_steps"])
             for phase, iterations in phases:
                 for iteration in range(iterations):
                     started = time.perf_counter()
@@ -388,6 +430,10 @@ class BPTTRunner(SupervisedWMRunner):
                         world_size=self.world,
                         critic_source=self.bptt["critic_source"],
                         policy_horizon=self.bptt["horizon"],
+                        collection_steps=self.collection_steps,
+                        collected_this_round=self.last_collection_steps,
+                        replay_size=len(self.replay),
+                        replay_capacity=self.replay.capacity,
                         collection_seconds=collected - started,
                         wm_seconds=fitted - collected,
                         policy_critic_seconds=updated - fitted,
@@ -439,7 +485,13 @@ class BPTTRunner(SupervisedWMRunner):
         super().save(intermediate, infos)
         local = {
             name: getattr(self, name).get_state().cpu()
-            for name in ("actor_generator", "real_generator", "critic_generator")
+            for name in (
+                "actor_generator",
+                "real_generator",
+                "critic_generator",
+                "noise_generator",
+                "critic_noise_generator",
+            )
         }
         ranks = [None] * self.world
         if dist.is_initialized():
@@ -449,7 +501,7 @@ class BPTTRunner(SupervisedWMRunner):
         if self.rank == 0:
             saved = torch.load(intermediate, map_location="cpu", weights_only=True)
             saved["bptt"] = dict(
-                schema="pgmt-bptt-v1",
+                schema="pgmt-bptt-v2",
                 options=self.bptt,
                 value=self.value.state_dict(),
                 actor_optimizer=self.actor_optimizer.state_dict(),
@@ -460,6 +512,7 @@ class BPTTRunner(SupervisedWMRunner):
                 pretrained_wm_updates=self.pretrained_wm_updates,
                 wm_checkpoint=self.cfg["wm_checkpoint"],
                 warmup_complete=self.warmup_complete,
+                step_accumulator=self.step_accumulator,
                 ppo_updates=0,
                 ranks=ranks,
             )
@@ -472,7 +525,7 @@ class BPTTRunner(SupervisedWMRunner):
 
     def load(self, path):
         saved = torch.load(path, map_location="cpu", weights_only=True)["bptt"]
-        if saved["schema"] != "pgmt-bptt-v1" or saved["options"] != self.bptt:
+        if saved["schema"] != "pgmt-bptt-v2" or saved["options"] != self.bptt:
             raise ValueError("BPTT resume changed critic source or training options")
         result = super().load(path)
         self.value.load_state_dict(saved["value"])
@@ -480,6 +533,7 @@ class BPTTRunner(SupervisedWMRunner):
         self.value_optimizer.load_state_dict(saved["value_optimizer"])
         for name in ("actor_updates", "critic_updates", "collection_steps", "pretrained_wm_updates", "warmup_complete"):
             setattr(self, name, saved[name])
+        self.step_accumulator = saved["step_accumulator"]
         for name, state in saved["ranks"][self.rank].items():
             getattr(self, name).set_state(state)
         for normalizer in self.normalizers.values():
