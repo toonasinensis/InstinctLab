@@ -157,17 +157,8 @@ def main():
         saved_optimizer = copy.deepcopy(runner.actor_optimizer.state_dict())
         checkpoint = root / "acceptance.pt"
         runner.save(str(checkpoint))
-        runner.load(str(checkpoint))
-        torch.testing.assert_close(runner.actor.state_dict(), saved_actor, rtol=0, atol=0)
-        torch.testing.assert_close(runner.value.state_dict(), saved_value, rtol=0, atol=0)
-        torch.testing.assert_close(runner.actor_optimizer.state_dict(), saved_optimizer, rtol=0, atol=0)
-        if dist.is_initialized():
-            for module in (runner.actor, runner.wm, runner.value):
-                for value in module.state_dict().values():
-                    expected = value.clone()
-                    dist.broadcast(expected, src=0)
-                    torch.testing.assert_close(value, expected, rtol=0, atol=0)
         # A collective invalid window must preserve weights/counters and retain evidence.
+        # Check before load(), which deliberately clears the simulator replay.
         local_map = runner.heightfield.local
 
         def invalid_local(*args, **kwargs):
@@ -191,6 +182,16 @@ def main():
         window = torch.load(window_path, map_location="cpu", weights_only=True)
         assert not window["valid"].any() and len(window["states"]) == runner.bptt["horizon"] + 1
         assert (root / f"invalid-rollout-{runner.actor_updates}.pt").is_file()
+        runner.load(str(checkpoint))
+        torch.testing.assert_close(runner.actor.state_dict(), saved_actor, rtol=0, atol=0)
+        torch.testing.assert_close(runner.value.state_dict(), saved_value, rtol=0, atol=0)
+        torch.testing.assert_close(runner.actor_optimizer.state_dict(), saved_optimizer, rtol=0, atol=0)
+        if dist.is_initialized():
+            for module in (runner.actor, runner.wm, runner.value):
+                for value in module.state_dict().values():
+                    expected = value.clone()
+                    dist.broadcast(expected, src=0)
+                    torch.testing.assert_close(value, expected, rtol=0, atol=0)
         report.update(
             actor_updates=runner.actor_updates,
             critic_updates=runner.critic_updates,
