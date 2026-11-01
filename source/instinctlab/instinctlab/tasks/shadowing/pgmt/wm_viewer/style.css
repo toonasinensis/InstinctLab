@@ -25,12 +25,14 @@ main { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 12px; }
 .blue { color: #237de0; } .amber { color: #c98017; } .gray { color: #768394; }
 #scene-title { position: absolute; top: 58px; left: 18px; color: #667488; font-size: 12px; pointer-events: none; }
 #terrain-description { position: absolute; top: 81px; left: 18px; color: #667488; background: #ffffffdf; padding: 3px 7px; border-radius: 4px; font-size: 11px; pointer-events: none; }
+#capture-warning { position: absolute; top: 110px; left: 18px; right: 18px; color: #8a4a08; background: #fff0dce8; border: 1px solid #e9c48f; padding: 5px 8px; border-radius: 4px; font-size: 11px; pointer-events: none; }
+#validity.invalid-capture { color: #a34e10; }
 .view-controls { position: absolute; left: 14px; bottom: 38px; display: flex; gap: 5px; flex-wrap: wrap; align-items: center; }
 .view-controls button { background: #ffffffea; padding: 5px 10px; }
 .view-controls button.selected { color: white; background: #287de1; }
 .view-controls label { padding: 4px; background: #ffffffdc; border-radius: 4px; font-size: 12px; }
 .viewport-note { position: absolute; left: 18px; bottom: 12px; color: #748196; font-size: 11px; pointer-events: none; }
-#split-labels { position: absolute; top: 90px; left: 10%; right: 10%; color: #64748b; pointer-events: none; }
+#split-labels { position: absolute; top: 170px; left: 10%; right: 10%; color: #64748b; pointer-events: none; }
 #split-labels span { float: right; }
 aside { display: flex; flex-direction: column; gap: 9px; }
 .card { background: white; border: 1px solid #e0e5eb; border-radius: 7px; padding: 12px; }

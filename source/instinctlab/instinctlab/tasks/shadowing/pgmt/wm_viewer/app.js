@@ -129,6 +129,7 @@ class Viewport {
     this.terrain = new THREE.Mesh(geometry(c.terrain), new THREE.MeshStandardMaterial({color: "#bdc2c5", roughness: .94, flatShading: true}));
     this.terrain.receiveShadow = true;
     this.world.add(this.terrain);
+    this.setTerrainOpacity();
     this.world.position.set(...c.origin.map((value) => -value));
     const initial = state("actual", 0);
     this.heading = Math.atan2(2 * (initial[6] * initial[5] + initial[3] * initial[4]), 1 - 2 * (initial[4] ** 2 + initial[5] ** 2));
@@ -182,6 +183,13 @@ class Viewport {
     this.camera.position.copy(this.focus).addScaledVector(direction, distance * 1.08);
     this.controls.target.copy(this.focus);
     this.controls.update();
+  }
+  setTerrainOpacity() {
+    const transparent = $("terrain-transparent").checked, material = this.terrain.material;
+    material.transparent = transparent;
+    material.opacity = transparent ? .32 : 1;
+    material.depthWrite = !transparent;
+    material.needsUpdate = true;
   }
   update() {
     this.actual.pose(state("actual", frame)); this.predicted.pose(state("predicted", frame));
@@ -330,7 +338,12 @@ function update() {
   const terrain = manifest.cases[w.case].display_terrain;
   const layouts = {pyramid_stairs: "四面金字塔楼梯 · 中心高", inverted_pyramid_stairs: "四面倒金字塔楼梯 · 中心低", flat: "平地", rough: "粗糙地形"};
   $("terrain-description").textContent = terrain ? `${layouts[terrain.layout] || terrain.layout} · 完整 ${terrain.tile_size.join(" × ")} m 地形块${terrain.step_height ? ` · 阶高 ${(terrain.step_height * 100).toFixed(0)} cm / 阶宽 ${(terrain.step_width * 100).toFixed(0)} cm` : ""}` : "旧版局部裁剪地形";
+  const scene = manifest.cases[w.case], invalidInitialPose = scene.initial_visual_pose_valid === false;
+  $("capture-warning").textContent = scene.capture_warning || "";
+  $("capture-warning").hidden = !scene.capture_warning;
   $("validity").textContent = maximum < horizon ? `窗口在 H${maximum} 结束：${w.terminal ? "真实 episode 终止" : "地形采样无效"}` : `有效预测 H${maximum} · ${frame <= manifest.train_horizon ? "训练范围内" : "超出 H8 训练范围"}`;
+  if (invalidInitialPose) $("validity").textContent = "初始可视姿态相交 · 仅作异常诊断";
+  $("validity").classList.toggle("invalid-capture", invalidInitialPose);
   $("window-info").textContent = `采集步 ${w.start_step}；episode 内第 ${w.episode_step} 步。终止前最后一步保留。`;
   const step = Math.max(0, frame - 1), actualMap = row("actual_map").subarray(step * 441, (step + 1) * 441), predictedMap = row("predicted_map").subarray(step * 441, (step + 1) * 441);
   if (frame > 0 && row("map_valid")[step]) {
@@ -348,14 +361,15 @@ function update() {
     {color: AMBER, values: Array.from(row("foot_error").slice(0, maximum + 1), (v) => v * 100)},
   ]);
 }
-function selectWindow(index) {
-  windowIndex = index; playing = false; frame = cap(); remainder = 0;
+function selectWindow(index, autoPlay = $("autoplay").checked) {
+  windowIndex = index; playing = autoPlay && cap() > 0; frame = playing ? 0 : cap(); remainder = 0;
+  lastTick = performance.now();
   const values = [...row("actual_map"), ...row("predicted_map")];
   mapRange = [Math.min(...values), Math.max(...values) + .001];
   $("window").value = index;
   viewport.selectWindow(); update();
 }
-function selectCase(index) {
+function selectCase(index, autoPlay = $("autoplay").checked) {
   $("case").value = index; $("window").replaceChildren();
   for (const w of manifest.windows.filter((w) => w.case === index)) {
     const option = new Option(`step ${w.start_step} · e${w.episode} · H${w.valid_steps} · root ${w.root_end_cm.toFixed(1)} cm`, w.index);
@@ -363,7 +377,7 @@ function selectCase(index) {
   }
   const available = manifest.windows.filter((w) => w.case === index);
   const chosen = available.find((w) => w.start_step >= 32 && w.valid_steps === 32) || available[0];
-  selectWindow(chosen.index);
+  selectWindow(chosen.index, autoPlay);
 }
 function advance(now) {
   if (!manifest || !viewport) return;
@@ -396,6 +410,7 @@ async function main() {
     terrain_matches_training: manifest.terrain_sha256 === manifest.training_terrain_sha256,
     display_terrain_revision: manifest.display_terrain_revision || 1,
     display_terrain: manifest.cases.map((c) => ({case: c.name, ...c.display_terrain})),
+    capture_quality: manifest.capture_quality,
     heightmap: manifest.map_convention, summary: manifest.summary,
     note: "离线真实采集；灰色曲线为真实状态的解析奖励，橙色为预测状态的解析奖励。高难度边缘场景使用明确标注的 +1.6m 出生偏移。未对预测施加物理修正。",
   }, null, 2);
@@ -408,7 +423,7 @@ async function main() {
   };
   $("worst").onclick = () => {
     const available = manifest.windows.filter((w) => w.case === Number($("case").value) && w.valid_steps >= horizon);
-    if (available.length) selectWindow(available.reduce((a, b) => rowAtError(a) > rowAtError(b) ? a : b).index);
+    if (available.length) selectWindow(available.reduce((a, b) => rowAtError(a) > rowAtError(b) ? a : b).index, false);
   };
   function rowAtError(w) { return data.root_error[w.index * 33 + horizon]; }
   $("play").onclick = () => { if (!cap()) return; playing = !playing; if (playing && frame === cap()) frame = 0; remainder = 0; update(); };
@@ -425,6 +440,7 @@ async function main() {
   };
   for (const button of document.querySelectorAll("[data-camera]")) button.onclick = () => viewport.setCamera(button.dataset.camera);
   for (const id of ["paths", "vectors", "reward"]) $(id).onchange = update;
+  $("terrain-transparent").onchange = () => viewport.setTerrainOpacity();
   $("details").onclick = () => $("metadata").showModal(); $("close-details").onclick = () => $("metadata").close();
   $("export-view").onclick = () => {
     viewport.render();
@@ -455,7 +471,7 @@ async function main() {
     if (keys[event.code]) { event.preventDefault(); $(keys[event.code]).click(); }
   });
   $("load-status").textContent = `${manifest.windows.length} 窗口 · ${((dataBuffer.byteLength + meshBuffer.byteLength) / 1048576).toFixed(1)} MiB · 无需 GPU`;
-  selectCase(1);
+  selectCase(1, false);
 }
 function showError(error) {
   playing = false;

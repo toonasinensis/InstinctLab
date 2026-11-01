@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>WM Rollout Inspector</title>
-  <link rel="stylesheet" href="style.css?v=2">
+  <link rel="stylesheet" href="style.css?v=3">
   <script type="importmap">{"imports":{"three":"./vendor/three.module.js"}}</script>
 </head>
 <body>
@@ -26,11 +26,13 @@
       <div class="legend"><span class="blue">●</span> Simulator <span class="amber">●</span> WM prediction</div>
       <div id="scene-title"></div>
       <div id="terrain-description"></div>
+      <div id="capture-warning" hidden></div>
       <div class="view-controls">
         <button data-mode="overlay" class="selected">叠加</button><button data-mode="split">同步分屏</button>
         <button data-camera="orbit">3D</button><button data-camera="top">俯视</button><button data-camera="side">侧视</button>
         <label><input type="checkbox" id="paths" checked>轨迹</label>
         <label><input type="checkbox" id="vectors" checked>误差连线</label>
+        <label title="仅改变显示透明度，不移动机器人或修正穿透"><input type="checkbox" id="terrain-transparent">地形半透明</label>
       </div>
       <span id="split-labels" hidden>SIMULATOR <span>WORLD MODEL</span></span>
       <div class="viewport-note">左键旋转 · 右键平移 · 滚轮缩放 · 两侧共享世界坐标</div>
@@ -64,6 +66,7 @@
       <button id="play" class="primary">▶ 播放</button><button id="back">−1 帧</button><button id="forward">+1 帧</button>
       <select id="speed"><option value="0.1">0.1×</option><option value="0.25" selected>0.25×</option><option value="0.5">0.5×</option><option value="1">1×</option></select>
       <label><input type="checkbox" id="loop" checked>循环当前窗口</label>
+      <label><input type="checkbox" id="autoplay" checked>切换窗口自动播放</label>
       <span class="horizons">Horizon <button data-h="1">1</button><button data-h="4">4</button><button data-h="8">8</button><button data-h="16">16</button><button data-h="32" class="selected">32</button></span>
       <span id="time"></span>
     </div>
@@ -77,6 +80,6 @@
   <footer><span>固定 PPO / WM · 同一串实际 action · 仅起点注入真实状态 · 不逐帧对齐 · 不跨 reset</span><span id="load-status">读取真实采集数据…</span></footer>
   <dialog id="metadata"><button id="close-details">关闭</button><h3>采集与比较协议</h3><pre id="metadata-text"></pre></dialog>
   <div id="fatal" hidden></div>
-  <script type="module" src="app.js?v=3"></script>
+  <script type="module" src="app.js?v=5"></script>
 </body>
 </html>

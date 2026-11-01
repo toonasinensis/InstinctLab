@@ -35,6 +35,18 @@ Joint RMSE is the raw 29-joint angle RMSE in degrees.
 Plots and metrics use original 50 Hz samples; no temporal interpolation is applied.
 H8 is 0.16 s of training horizon; H32 is 0.64 s, including extrapolation.
 The loop control repeats a single explicitly labeled window, not a long rollout.
+Window/scene switching automatically plays from H0 by default. Disable
+"切换窗口自动播放" to keep newly selected windows paused at the horizon.
+The initial page and worst-error lookup remain paused for inspection.
+Manual pause, frame stepping and scrubbing still pause the current window.
+These are independent overlapping WM windows, not a stitched long prediction.
+"地形半透明" reveals occluded feet/geometry without lifting the robot, changing
+the terrain or applying corrective physics. Predictions can intersect terrain.
+Per-case capture warnings identify known invalid initial visual poses. Such
+cases remain inspectable, but must not establish normal WM accuracy. The
+time/reset/map validity mask does not certify collision-free initial placement.
+The extra +1.6m diagnostic reset uses root-point support height; it does not
+validate every foot/collision point against stair risers. Inspect H0 first.
 The worst-window button searches the selected scene at the selected horizon.
 The fixed camera frames both full window trajectories, including the feet;
 it never follows or realigns a prediction at each time step. Orbit/side presets

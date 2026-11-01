@@ -376,6 +376,9 @@ def main():
                 cases.append(dict(
                     name=f"{family} · L{level} · {'off-platform spawn' if shifted else 'native center'}",
                     family=family, level=level, off_platform_spawn=shifted,
+                    capture_warning=(
+                        "人工偏移出生：尚未验证整脚与地形无相交，请先检查 H0。" if shifted else ""
+                    ),
                     origin=origin.tolist(), display_terrain=terrain_description(family, level, generator),
                     terrain=dict(vertices=mesh_arrays.add(points[vertices]), faces=mesh_arrays.add(remap.reshape(-1, 3), "u4")),
                 ))
