@@ -7,6 +7,7 @@
 | --- | --- | --- | --- |
 | 2026-11-02 | [BPTT 短时域与 critic 依赖](2026-11-02-bptt-horizon-and-critic.md) | 默认 actor H32，保留 real/imagined critic | 表现趋势已观察；critic 因果解释待验证 |
 | 2026-11-02 | [BPTT 训练吞吐与重复 FK](2026-11-02-bptt-throughput.md) | 保留 support 递归；原生批量奖励与软终止，拒绝未通过的编译路径 | 原实现瓶颈已实测；加速与正确性见外部验收报告 |
+| 2026-11-02 | [BPTT 首轮超时同步与错峰](2026-11-02-initial-reset-phase.md) | 首轮独立截断错峰，保留真实历史与完整 episode 完成条件 | 同步超时已由代码/日志核实；修复效果见外部验收 |
 
 ## 记录约定
 

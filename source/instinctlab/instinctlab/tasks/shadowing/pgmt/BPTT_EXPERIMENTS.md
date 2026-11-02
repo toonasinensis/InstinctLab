@@ -44,6 +44,18 @@ must have matching width and no contact/force heads; incompatible widths are not
 partially loaded. Simulator episodes, failure sampling and curriculum start
 fresh at L0. Critic architecture and normalization are identical in both modes.
 
+BPTT training staggers the first episode with an independent seeded per-environment
+time limit, uniform from 1 to 500 control steps at the default 10-second limit.
+The separate `initial_time_out` term truncates only that first episode; later
+episodes retain the full limit. It does not change the real episode-step counter,
+reference timestamps or noisy history. Initial truncations bootstrap the pre-reset
+terminal value and stop replay recursion, like other timeouts. They are logged as
+`PGMT/initial_truncations`, not completions, and cannot promote terrain difficulty.
+Failures still take precedence. Repeated startup resets before stepping preserve
+the sampled deadlines. Play presets disable the term; use
+`env.terminations.initial_time_out=null` for the synchronized historical baseline.
+This changes the collection protocol; comparisons must record whether it is enabled.
+
 The replay window covers the maximum of the actor rollout, WM training and WM
 validation lengths: **32 steps with the current defaults**. The configured initial
 collection must cover that window. Prefill 32 real steps without optimizer
