@@ -1,4 +1,4 @@
-"""Six-way BPTT experiment: value supervision source x policy horizon."""
+"""H32 model-gradient actor with real or imagined critic supervision."""
 
 from isaaclab.utils import configclass
 
@@ -22,7 +22,7 @@ class G1PGMTBPTTRunnerCfg(G1PGMTSupervisedWMRunnerCfg):
     }
     bptt: dict = {
         "critic_source": "imagined",
-        "horizon": 8,
+        "horizon": 32,
         "actor_batch": 4096,
         "actor_lr": 1e-5,
         "critic_lr": 3e-4,
@@ -36,5 +36,5 @@ class G1PGMTBPTTRunnerCfg(G1PGMTSupervisedWMRunnerCfg):
         "utd": 0.4,
         "checkpoint_activations": True,
     }
-    experiment_name: str = "g1_pgmt_bptt_critic_horizon"
+    experiment_name: str = "g1_pgmt_bptt"
     run_name: str = "NoContactForceBPTT"

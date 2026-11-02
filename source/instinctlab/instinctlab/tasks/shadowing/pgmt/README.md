@@ -1,5 +1,8 @@
 # PGMT flat LAFAN stage one
 
+Development references: [BPTT training](BPTT_EXPERIMENTS.md) and
+[debugging experience index](../../../../../../agents/pgmt/DEBUGGING_NOTES.md).
+
 `Instinct-PGMT-Shadowing-G1-Newton-v0` trains a G1 CrossAttention actor and independent scalar critic
 on flat ground. The implementation follows the `shadowing/perceptive` configuration layout and uses
 its public motion-reference, reward, event, termination and monitor components.

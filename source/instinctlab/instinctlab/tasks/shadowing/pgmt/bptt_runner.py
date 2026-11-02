@@ -40,14 +40,16 @@ class BPTTRunner(SupervisedWMRunner):
     def __init__(self, env, train_cfg, log_dir=None, device="cpu"):
         super().__init__(env, train_cfg, log_dir, device)
         self.bptt = train_cfg["bptt"]
-        if self.bptt["critic_source"] not in ("real", "imagined") or self.bptt["horizon"] not in (8, 16, 32):
-            raise ValueError("BPTT requires real/imagined critic and H8/H16/H32")
+        if self.bptt["critic_source"] not in ("real", "imagined"):
+            raise ValueError("BPTT critic source must be real or imagined")
+        horizon = self.bptt["horizon"]
+        if not isinstance(horizon, int) or not 1 <= horizon <= self.replay.capacity:
+            raise ValueError("BPTT horizon must be a positive integer within replay capacity")
+        self.replay_horizon = max(horizon, self.options["train_horizon"], *self.options["validation_horizons"])
         if self.wm.predict_contact or self.wm.predict_force or len(self.rewards.terms) != 19:
-            raise ValueError(
-                "The initial BPTT experiment requires exactly 19 noncontact rewards and no auxiliary heads"
-            )
+            raise ValueError("BPTT requires exactly 19 noncontact rewards and no contact or force heads")
         if not self.native.cfg.observations.policy.enable_corruption:
-            raise ValueError("The aligned BPTT matrix requires real and imagined observation noise")
+            raise ValueError("BPTT requires real and imagined policy observation noise")
         if not train_cfg.get("ppo_checkpoint"):
             raise ValueError("Choose an explicit PPO actor initialization source")
         self.pretrained_wm_updates = 0
@@ -80,8 +82,8 @@ class BPTTRunner(SupervisedWMRunner):
             train_cfg["seed"] + 13001 + self.rank
         )
         self.step_accumulator = 0.0
-        if self.bptt["utd"] <= 0 or self.bptt["initial_collect_steps"] < 32:
-            raise ValueError("BPTT requires positive UTD and an initial H32 replay prefill")
+        if self.bptt["utd"] <= 0 or self.bptt["initial_collect_steps"] < self.replay_horizon:
+            raise ValueError(f"BPTT requires positive UTD and at least {self.replay_horizon} initial replay steps")
         width = 2119 + 68 + self.xi.shape[-1] + 8
         with torch.random.fork_rng(devices=[self.device]):
             torch.manual_seed(train_cfg["seed"] + 11003)
@@ -171,8 +173,8 @@ class BPTTRunner(SupervisedWMRunner):
         return {k: torch.stack([x[k] for x in rows]).mean() for k in rows[0]}
 
     def sample_actor(self):
-        # Sample identical H32 anchors even when the actor uses H8 or H16.
-        count, horizon = self.bptt["actor_batch"], 32
+        # Keep complete windows covering policy learning and WM validation.
+        count, horizon = self.bptt["actor_batch"], self.replay_horizon
         eligible = torch.arange(self.env.num_envs, device=self.device)
         eligible = eligible[eligible % 8 != 0]
         pieces, total = [], 0
@@ -185,8 +187,7 @@ class BPTTRunner(SupervisedWMRunner):
             )
             rows = self.replay.rows(ages)
             frame, motion = (self.replay.data[key][rows, ids] for key in ("frame", "motion"))
-            # Identical maximum-H reference eligibility in all six groups.
-            valid = frame + 32 + 11 < self.rewards.command.label_lengths[motion]
+            valid = frame + horizon + 11 < self.rewards.command.label_lengths[motion]
             selected = valid.nonzero().flatten()[: count - total]
             pieces.append((ids[selected], ages[selected]))
             total += len(selected)
@@ -424,7 +425,7 @@ class BPTTRunner(SupervisedWMRunner):
         phases = [] if self.warmup_complete else [("warmup", self.bptt["warmup_iterations"])]
         phases.append(("train", num_learning_iterations))
         try:
-            if len(self.replay) < 32:
+            if len(self.replay) < self.replay_horizon:
                 self.collect(self.bptt["initial_collect_steps"])
             for phase, iterations in phases:
                 for iteration in range(iterations):
@@ -433,9 +434,11 @@ class BPTTRunner(SupervisedWMRunner):
                     collected = time.perf_counter()
                     self.fit_world_model()
                     fitted = time.perf_counter()
-                    stats = self.update_bptt(actor=phase == "train") if len(self.replay) >= 32 else {}
+                    stats = self.update_bptt(actor=phase == "train") if len(self.replay) >= self.replay_horizon else {}
                     updated = time.perf_counter()
-                    validating = len(self.replay) >= 32 and iteration % self.options["validation_interval"] == 0
+                    validating = (
+                        len(self.replay) >= self.replay_horizon and iteration % self.options["validation_interval"] == 0
+                    )
                     if validating:
                         self.latest_metrics = self.validate()
                         self.write_metrics(self.current_learning_iteration)
