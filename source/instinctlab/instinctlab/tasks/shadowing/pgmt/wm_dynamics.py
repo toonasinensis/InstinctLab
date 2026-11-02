@@ -4,6 +4,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_inv, quat_mul, yaw_quat
 
@@ -122,6 +123,7 @@ class TerrainDynamics(nn.Module):
     def __init__(self, context_width, hidden=512, amp=True, predict_contact=True, predict_force=True):
         super().__init__()
         self.amp = amp
+        self.amp_heads = True
         self.context_width = context_width
         self.predict_contact, self.predict_force = predict_contact, predict_force
         self.input_norm = RunningMoments(68 + 29 + 29 + (14 if predict_contact else 0) + context_width)
@@ -167,13 +169,30 @@ class TerrainDynamics(nn.Module):
         # Use the ground-truth orientation for error coordinates, as in the base.
         return state_delta(reference, predicted)
 
-    def forward(self, state, action, previous_action, contact, heights, context):
-        normalized = self.input_norm(self.inputs(state, action, previous_action, contact, heights, context))
-        with torch.autocast(device_type=state.device.type, dtype=torch.bfloat16, enabled=self.amp and state.is_cuda):
+    def predict_delta(self, normalized, heights):
+        with torch.autocast(
+            device_type=heights.device.type, dtype=torch.bfloat16, enabled=self.amp and heights.is_cuda
+        ):
             hidden = self.trunk(torch.cat((normalized, self.terrain_encoder(heights)), -1))
-            delta = self.delta_head(hidden).float()
-            logits = self.contact_head(hidden).float() if self.contact_head is not None else None
-            forces = self.force_head(hidden).float() if self.force_head is not None else None
+            if self.amp and not self.amp_heads:
+                with torch.autocast(device_type=hidden.device.type, enabled=False):
+                    return self.predict_heads(hidden.float())
+            return self.predict_heads(hidden)
+
+    def predict_heads(self, hidden):
+        delta = self.delta_head(hidden).float()
+        logits = self.contact_head(hidden).float() if self.contact_head is not None else None
+        forces = self.force_head(hidden).float() if self.force_head is not None else None
+        return delta, logits, forces
+
+    def forward(self, state, action, previous_action, contact, heights, context, checkpoint_network=False):
+        normalized = self.input_norm(self.inputs(state, action, previous_action, contact, heights, context))
+        if checkpoint_network and torch.is_grad_enabled():
+            delta, logits, forces = checkpoint(
+                self.predict_delta, normalized, heights, use_reentrant=False, preserve_rng_state=False, early_stop=False
+            )
+        else:
+            delta, logits, forces = self.predict_delta(normalized, heights)
         delta = delta * self.delta_norm.std() + self.delta_norm.mean
         dp, dr, dv, dw, dq, dqd = delta.split((3, 3, 3, 3, 29, 29), -1)
         p, rot, v, w, q, qd = state.split((3, 4, 3, 3, 29, 29), -1)

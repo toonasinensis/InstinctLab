@@ -6,18 +6,34 @@ import torch
 import torch.distributed as dist
 from pathlib import Path
 from torch import nn
-from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
+from torch.utils.checkpoint import checkpoint
 
 from tensorboardX import SummaryWriter
 
-from .bptt_mdp import BPTTMDP, lambda_returns, raw_history
+from .bptt_mdp import BPTTMDP, OBSERVATION_WIDTHS, PROPRIO_WIDTHS, lambda_returns, raw_history
 from .wm_dynamics import average_gradients
 from .wm_runner import SupervisedWMRunner, ordinary
+
+
+def compile_forward(forward):
+    from torch._functorch import config as functorch_config
+
+    compiled = torch.compile(forward, fullgraph=True, options={"triton.cudagraphs": False})
+
+    def call(*args):
+        # AOTAutograd captures the backward assumption during the lazy first
+        # invocation. All backward calls run outside the network autocast scopes.
+        with functorch_config.patch(backward_pass_autocast="off"):
+            return compiled(*args)
+
+    return call
 
 
 class IndependentValue(nn.Module):
     def __init__(self, width):
         super().__init__()
+        self.amp = False
+        self.amp_heads = True
         self.network = nn.Sequential(
             nn.Linear(width, 512),
             nn.SiLU(),
@@ -31,7 +47,15 @@ class IndependentValue(nn.Module):
         nn.init.zeros_(self.network[-1].bias)
 
     def forward(self, features):
-        return self.network(features).squeeze(-1)
+        with torch.autocast(
+            device_type=features.device.type, dtype=torch.bfloat16, enabled=self.amp and features.is_cuda
+        ):
+            if not self.amp or self.amp_heads:
+                return self.network(features).float().squeeze(-1)
+            for index in range(len(self.network) - 1):
+                features = self.network[index](features)
+            with torch.autocast(device_type=features.device.type, enabled=False):
+                return self.network[-1](features.float()).squeeze(-1)
 
 
 class BPTTRunner(SupervisedWMRunner):
@@ -93,6 +117,7 @@ class BPTTRunner(SupervisedWMRunner):
                 dist.broadcast(value, src=0)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=self.bptt["actor_lr"], betas=(0.9, 0.95))
         self.value_optimizer = torch.optim.Adam(self.value.parameters(), lr=self.bptt["critic_lr"])
+        self.configure_execution(train_cfg.get("bptt_execution", {}))
         self.actor_updates = self.critic_updates = self.collection_steps = 0
         self.warmup_complete = False
         self.observation, _ = self.env.get_observations()
@@ -106,6 +131,8 @@ class BPTTRunner(SupervisedWMRunner):
                 contract["actor_update"] = "BPTT only through frozen WM parameters; no PPO update"
                 contract["critic_source"] = self.bptt["critic_source"]
                 contract["policy_horizon"] = self.bptt["horizon"]
+                contract["options"] = self.options
+                contract["bptt_execution"] = self.execution
                 contract_path.write_text(json.dumps(contract, indent=2) + "\n")
             (self.log_root / f"bptt-rank-{self.rank}-contract.json").write_text(
                 json.dumps(
@@ -126,12 +153,57 @@ class BPTTRunner(SupervisedWMRunner):
                         action_noise="Gaussian exploration in real collection only; no added imagined action noise",
                         replay_capacity=self.replay.capacity,
                         wm_initialization="checkpoint" if train_cfg.get("wm_checkpoint") else "fresh",
-                        precision="unchanged FP32; WM AMP disabled",
+                        execution=self.execution,
+                        precision=(
+                            "BF16 networks"
+                            + (" including heads" if self.execution["bf16_heads"] else ", FP32 output heads")
+                            + "; FP32 geometry/returns/parameters"
+                            if self.wm.amp
+                            else "FP32"
+                        ),
                     ),
                     indent=2,
                 )
                 + "\n"
             )
+
+    def configure_execution(self, options):
+        """Select execution before a run (or an explicitly recorded benchmark fork).
+
+        Raw modules retain parameter/optimizer/checkpoint ownership. Compiled
+        callables never replace modules, so state_dict keys remain portable.
+        """
+        self.execution = dict(
+            bf16=False,
+            bf16_heads=False,
+            compile=False,
+            actor_checkpoint=self.bptt["checkpoint_activations"],
+            wm_checkpoint=self.bptt["checkpoint_activations"],
+        )
+        unknown = options.keys() - self.execution.keys()
+        if unknown or any(type(value) is not bool for value in options.values()):
+            raise ValueError(f"Invalid BPTT execution options: {options}")
+        self.execution.update(options)
+        self.actor.amp = self.value.amp = self.wm.amp = self.execution["bf16"]
+        self.actor.amp_heads = self.value.amp_heads = self.wm.amp_heads = self.execution["bf16_heads"]
+        self.options["amp"] = self.wm.amp
+        self.cfg["bptt_execution"] = self.execution.copy()
+        self._imagine_step = self.imagine_step
+        self._policy_rollout = self.imagine_rollout
+        self._world_model_loss = self.world_model_loss
+        self._value_forward = self.value.forward
+        if self.execution["compile"]:
+            # Keep the outer H32 graph complete, but reuse its unchanged repeated
+            # transition. Eager execution has no compiler API dependency.
+            imagine_step = self.imagine_step
+
+            def native_step(*inputs):
+                return imagine_step(*inputs)
+
+            self._imagine_step = torch.compiler.nested_compile_region(native_step)
+            self._policy_rollout = compile_forward(self.imagine_rollout)
+            self._world_model_loss = compile_forward(self.world_model_loss)
+            self._value_forward = compile_forward(self.value.forward)
 
     @torch.inference_mode()
     def collect(self, steps=None):
@@ -214,44 +286,83 @@ class BPTTRunner(SupervisedWMRunner):
     def network_forward(self, module, *inputs):
         # These two forwards have no RNG. Observation noise is drawn outside the
         # recomputed region, so backward uses exactly the original noisy inputs.
-        if self.bptt["checkpoint_activations"] and torch.is_grad_enabled():
-            # Complete recomputation avoids propagating checkpoint's Python
-            # early-stop exception through scripted quaternion functions.
-            with set_checkpoint_early_stop(False):
-                return checkpoint(module, *inputs, use_reentrant=False, preserve_rng_state=False)
-        return module(*inputs)
+        enabled = self.execution["actor_checkpoint" if module is self.actor else "wm_checkpoint"]
+        enabled = enabled and self.bptt["checkpoint_activations"]
+        if module is self.wm:
+            return self.wm(*inputs, checkpoint_network=enabled)
+        # Keep tuple-producing view operations outside the recomputed network.
+        # PyTorch2.11's min-cut partitioner cannot save/recompute a split tuple
+        # reused across the boundary. Geometry and all gradients stay connected.
+        inputs = self.actor.inputs(*inputs)
+        forward = self.actor.action_from_inputs
+        if enabled and torch.is_grad_enabled():
+            return checkpoint(forward, *inputs, use_reentrant=False, preserve_rng_state=False, early_stop=False)
+        return forward(*inputs)
 
     def imagine(self, data):
+        start = self.start(data)
+        contexts = [self.mdp.context(start, step) for step in range(self.bptt["horizon"] + 1)]
+        batch = len(data["env_id"])
+        observation_noise = [self.mdp.draw_noise(batch, OBSERVATION_WIDTHS, self.noise_generator)]
+        proprio_noise = []
+        for _ in range(self.bptt["horizon"]):
+            proprio_noise.append(self.mdp.draw_noise(batch, PROPRIO_WIDTHS, self.noise_generator))
+            observation_noise.append(self.mdp.draw_noise(batch, OBSERVATION_WIDTHS, self.noise_generator))
+        return self._policy_rollout(data, contexts, proprio_noise, observation_noise)
+
+    def imagine_step(
+        self, state, history, support, previous_action, observation, context, ids, proprio_noise, observation_noise
+    ):
+        action = self.network_forward(self.actor, self.normalizers["policy"](observation))
+        successor, _, _ = self.network_forward(
+            self.wm, state, action, previous_action, None, observation[:, 1678:], self.xi[ids]
+        )
+        next_support, support_valid = self.rewards.support_from_state(successor, support, context, ids)
+        history = torch.cat(
+            (history[:, 1:], self.mdp.proprioception(successor, action, ids, proprio_noise)[:, None]), 1
+        )
+        features, observation, valid = self.features(successor, history, next_support, context, ids, observation_noise)
+        return (
+            successor,
+            history,
+            next_support,
+            action,
+            features,
+            observation,
+            support_valid & valid & context["reference_valid"],
+        )
+
+    def imagine_rollout(self, data, contexts, proprio_noise, observation_noise):
         horizon = self.bptt["horizon"]
-        ids, start = data["env_id"], self.start(data)
+        ids = data["env_id"]
         state, history, support, previous_action = (
             data[k][:, 0] for k in ("state", "history", "support", "previous_action")
         )
-        context = self.mdp.context(start)
-        features, observation, valid = self.features(state, history, support, context, ids, self.noise_generator)
+        context = contexts[0]
+        features, observation, valid = self.features(state, history, support, context, ids, observation_noise[0])
         feature_rows, states, actions = [features], [state], []
-        contexts, supports, previous_actions = [], [], []
+        reward_contexts, supports, previous_actions = [], [], []
         reference_velocities = [context["ref_body_velocity"]]
         for step in range(horizon):
-            action = self.network_forward(self.actor, self.normalizers["policy"](observation))
-            successor, _, _ = self.network_forward(
-                self.wm, state, action, previous_action, None, observation[:, 1678:], self.xi[ids]
+            next_context = contexts[step + 1]
+            successor, history, next_support, action, features, observation, next_valid = self._imagine_step(
+                state,
+                history,
+                support,
+                previous_action,
+                observation,
+                next_context,
+                ids,
+                proprio_noise[step],
+                observation_noise[step + 1],
             )
-            next_context = self.mdp.context(start, step + 1)
-            next_support, support_valid = self.rewards.support_from_state(successor, support, next_context, ids)
-            history = torch.cat(
-                (history[:, 1:], self.mdp.proprioception(successor, action, ids, self.noise_generator)[:, None]), 1
-            )
-            features, observation, next_valid = self.features(
-                successor, history, next_support, next_context, ids, self.noise_generator
-            )
-            valid = valid & support_valid & next_valid & next_context["reference_valid"]
+            valid = valid & next_valid
             feature_rows.append(features)
             states.append(successor)
             actions.append(action)
             previous_actions.append(previous_action)
             supports.append(next_support)
-            contexts.append(next_context)
+            reward_contexts.append(next_context)
             reference_velocities.append(next_context["ref_body_velocity"])
             state, previous_action, support, context = successor, action, next_support, next_context
 
@@ -265,7 +376,7 @@ class BPTTRunner(SupervisedWMRunner):
         bodies = tuple(value[:, 1:].flatten(0, 1) for value in body_rows)
         previous_bodies = tuple(value[:, :-1].flatten(0, 1) for value in body_rows)
         reward_context = {
-            key: torch.stack([row[key] for row in contexts], 1).flatten(0, 1)
+            key: torch.stack([row[key] for row in reward_contexts], 1).flatten(0, 1)
             for key in (
                 "ref_position",
                 "ref_rotation",
@@ -365,7 +476,7 @@ class BPTTRunner(SupervisedWMRunner):
                 )[0]
             )
         features, successors = torch.stack(features, 1), torch.stack(successors, 1)
-        next_values = self.value(successors)
+        next_values = self._value_forward(successors)
         # Values after a reset are excluded; each transition has its own pre-reset successor.
         future, targets = next_values[:, -1], []
         for t in range(self.bptt["horizon"] - 1, -1, -1):
@@ -384,7 +495,7 @@ class BPTTRunner(SupervisedWMRunner):
         for _ in range(self.bptt["critic_epochs"]):
             order = torch.randperm(len(targets), device=self.device, generator=self.critic_generator)
             for ids in order.tensor_split(self.bptt["critic_minibatches"]):
-                loss = (self.value(features[ids]) - targets[ids]).square().mean()
+                loss = (self._value_forward(features[ids]) - targets[ids]).square().mean()
                 self.value_optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 average_gradients(self.value)
@@ -566,6 +677,7 @@ class BPTTRunner(SupervisedWMRunner):
             saved["bptt"] = dict(
                 schema="pgmt-bptt-v2",
                 options=self.bptt,
+                execution=self.execution,
                 value=self.value.state_dict(),
                 actor_optimizer=self.actor_optimizer.state_dict(),
                 value_optimizer=self.value_optimizer.state_dict(),
@@ -590,6 +702,18 @@ class BPTTRunner(SupervisedWMRunner):
         saved = torch.load(path, map_location="cpu", weights_only=True)["bptt"]
         if saved["schema"] != "pgmt-bptt-v2" or saved["options"] != self.bptt:
             raise ValueError("BPTT resume changed critic source or training options")
+        legacy_execution = dict(
+            bf16=False,
+            compile=False,
+            actor_checkpoint=saved["options"]["checkpoint_activations"],
+            wm_checkpoint=saved["options"]["checkpoint_activations"],
+        )
+        saved_execution = saved.get("execution", legacy_execution).copy()
+        # Early BF16 forks autocast every output head. Never silently change
+        # their precision on resume; old FP32 checkpoints remain compatible.
+        saved_execution.setdefault("bf16_heads", saved_execution["bf16"])
+        if saved_execution != self.execution:
+            raise ValueError("BPTT resume changed execution options; use an explicit benchmark fork instead")
         result = super().load(path)
         self.value.load_state_dict(saved["value"])
         self.actor_optimizer.load_state_dict(saved["actor_optimizer"])

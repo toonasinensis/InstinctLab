@@ -59,9 +59,51 @@ Adam uses lr 1e-5, betas (0.9, 0.95), global gradient norm 1 and elementwise cli
 round. Gamma/lambda are 0.99/0.95. The independent value head starts at zero.
 **FP32 remains in use and WM AMP is disabled.**
 
+Optional execution controls live in `agent.bptt_execution`:
+
+- `bf16=True` enables local BF16 autocast in the actor, WM and independent
+  critic backbones. Sensitive final linear layers (action, terrain coordinates,
+  WM deltas and value) remain FP32 by default (`bf16_heads=False`). The hidden
+  features entering those heads still have BF16 precision. `bf16_heads=True`
+  also autocasts the output heads, reproducing the first rejected BF16 candidate.
+  Network outputs return to FP32 before
+  state integration, terrain sampling, analytic rewards, survival, lambda returns
+  and loss reductions. Parameters, accumulated parameter gradients, optimizer
+  states and normalization means/variances remain FP32; existing counter dtypes
+  are unchanged. Casting a BF16 output to FP32 does not recover lost precision.
+- `compile=True` requests full-graph compilation of the WM H8 supervised loss, policy H32 rollout and
+  critic forward. Replay sampling, reference/noise preparation, optimizer steps,
+  communication, counters and error-artifact handling remain outside compilation.
+  Compilation requires a complete graph and reports unsupported operations rather
+  than silently falling back. Compiler CUDA graphs are disabled; existing native
+  simulator execution is unchanged. Backward runs outside autocast and is declared
+  accordingly to AOTAutograd during lazy compilation.
+  This remains an experimental validation path: bounded H32 candidates have
+  reached their cold-compilation time limits without completing a compiled
+  forward/backward. It is not an accepted production speedup and defaults off.
+- `actor_checkpoint` and `wm_checkpoint` independently control activation
+  recomputation during actor backward. Both default to `True`. The legacy
+  `agent.bptt.checkpoint_activations=False` still disables both. Test full-size peak
+  memory before turning either off; available memory alone does not prove it fits.
+  At actor4096/GPU, H32 and FP32, actor recomputation off exceeded the tested
+  4090 runtime's roughly44.5GiB visible capacity. WM recomputation off fit, but
+  same-process actor timing did not establish a substantial gain for its extra
+  approximately5GiB of activations. Both therefore remain enabled by default.
+
+These controls default to FP32 eager with both recomputations enabled. For BPTT,
+the execution precision flag sets WM AMP as well; the standalone supervised-WM
+runner retains its own `world_model.amp` setting. Compiled callables do not replace
+the raw modules or alter their checkpoint keys. Execution options are recorded
+and checked on resume. Loading an old FP32 eager checkpoint under a different
+execution mode requires an explicit, recorded benchmark fork; normal resume does
+not silently change precision or recomputation.
+
 Actor and WM forwards use non-reentrant activation recomputation during actor
-backward. Complete recomputation avoids propagating the checkpoint early-stop
-exception through scripted quaternion operations. Observation noise is drawn
+backward. Recomputed regions contain network activations; actor input-view
+unpacking and WM state integration stay outside those regions. This avoids a
+PyTorch 2.11 min-cut conflict for tuple-producing splits reused across checkpoint
+boundaries, without detaching geometry or disabling recomputation checks.
+Observation noise is drawn
 outside those deterministic forwards and is not resampled during backward.
 Direct/recomputed loss and gradient parity is part of acceptance validation.
 
@@ -71,8 +113,9 @@ batched FK pass supplies both current and previous body states; acceleration
 rewards retain their cross-step derivatives. The discounted objective, lambda
 targets and noise draw order are unchanged. Critic loss logging transfers one
 aggregate to the CPU per round. Geometry uses the original native matrix
-operations and precision settings. Experimental compiled geometry kernels failed
-numerical acceptance and are not part of this execution path. Mathematical parity
+operations and precision settings. Earlier experimental geometry replacements
+failed numerical acceptance and are not reused by the optional compiler path.
+Compilation must pass its own numerical and learning checks. Mathematical parity
 is checked separately with TF32 disabled; timing uses the original TF32 setting.
 TF32 batch/loop rounding differences are recorded rather than claimed bitwise equal.
 
@@ -149,7 +192,11 @@ imagined trajectory. Invalid samples are not silently dropped or filled.
 returns, independent critic parameters, future heightmap gradients, frozen WM
 parameters, policy directional finite differences, exact optimizer/RNG reload,
 invalid-window capture and distributed consistency. Computational gradient
-agreement does not establish the accuracy of real dynamics Jacobians.
+agreement does not establish the accuracy of real dynamics Jacobians. Prepared
+noise is compared exactly with the original draw order. Under compilation, future
+heightmap gradients are checked through a policy parameter across the AOTAutograd
+boundary. Finite differences use a separate FP32 eager reference, since BF16
+rounding is not a smooth finite-difference oracle.
 
 Runs record warmup separately, update counts, critic validity, real tracking and
 failure/completion metrics, imagined survival, WM fixed/current holdouts,

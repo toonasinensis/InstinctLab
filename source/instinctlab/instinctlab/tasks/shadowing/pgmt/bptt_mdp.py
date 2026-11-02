@@ -11,6 +11,11 @@ from .mdp.terrain_math import corrected_planar_velocity, tolerance_error
 from .models.cross_attention import unpack_terms
 from .wm_dynamics import state_features, yaw_angle
 
+PROPRIO_WIDTHS = dict(projected_gravity=3, base_ang_vel=3, joint_pos=29, joint_vel=29, last_action=29)
+OBSERVATION_WIDTHS = dict(
+    joint_pos_ref=319, joint_vel_ref=319, motion_orientation=66, motion_height=11, corrected_velocity=33, terrain=441
+)
+
 
 def pack_history(history):
     return torch.cat([term.flatten(1) for term in history.split((3, 3, 29, 29, 29), -1)], -1)
@@ -59,13 +64,28 @@ class BPTTMDP:
     def process_observation(self, value, name, generator=None):
         cfg = self.observation_terms[name]
         if generator is not None and cfg.noise is not None:
-            noise = torch.rand(value.shape, device=value.device, dtype=value.dtype, generator=generator)
+            noise = (
+                generator[name]
+                if isinstance(generator, dict)
+                else torch.rand(value.shape, device=value.device, dtype=value.dtype, generator=generator)
+            )
             value = value + cfg.noise.n_min + noise * (cfg.noise.n_max - cfg.noise.n_min)
         if cfg.clip:
             value = value.clamp(*cfg.clip)
         if cfg.scale is not None:
             value = value * cfg.scale
         return value
+
+    def draw_noise(self, batch, widths, generator):
+        # Same individual shapes and draw order as process_observation. Keeping
+        # RNG outside compile/checkpoint must not change the stochastic inputs.
+        return {
+            name: torch.rand(
+                (batch, width), device=self.default_q.device, dtype=self.default_q.dtype, generator=generator
+            )
+            for name, width in widths.items()
+            if self.observation_terms[name].noise is not None
+        }
 
     def placement(self):
         c = self.command

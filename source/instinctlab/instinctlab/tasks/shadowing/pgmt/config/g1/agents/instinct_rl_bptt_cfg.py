@@ -36,5 +36,12 @@ class G1PGMTBPTTRunnerCfg(G1PGMTSupervisedWMRunnerCfg):
         "utd": 0.4,
         "checkpoint_activations": True,
     }
+    bptt_execution: dict = {
+        "bf16": False,
+        "bf16_heads": False,
+        "compile": False,
+        "actor_checkpoint": True,
+        "wm_checkpoint": True,
+    }
     experiment_name: str = "g1_pgmt_bptt"
     run_name: str = "NoContactForceBPTT"

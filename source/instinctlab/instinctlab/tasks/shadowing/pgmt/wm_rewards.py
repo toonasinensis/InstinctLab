@@ -59,32 +59,59 @@ class RobotKinematics:
         self.rotation = matrix_from_quat(quat_from_euler_xyz(*rpy.unbind(-1)))
         self.axis = torch.nn.functional.normalize(torch.tensor(axes, device=device), dim=-1)
         self.tracked = [self.names.index(name) for name in tracked_bodies]
+        # Outputs depend only on their ancestors. Keep the original topological
+        # order and exact transforms, omitting unrelated URDF branches.
+        required = {0}
+        for index in self.tracked:
+            while index >= 0:
+                required.add(index)
+                index = self.parents[index]
+        selected = sorted(required)
+        remap = {old: new for new, old in enumerate(selected)}
+        self.names = [self.names[index] for index in selected]
+        self.parents = [-1 if index == 0 else remap[self.parents[index]] for index in selected]
+        self.joint_ids = [self.joint_ids[index] for index in selected]
+        self.offset = self.offset[selected]
+        self.rotation = self.rotation[selected]
+        self.axis = self.axis[selected]
+        self.tracked = [remap[index] for index in self.tracked]
 
-    def forward(self, state, root_com, tracked_com):
+    def forward(self, state, root_com, tracked_com, velocities=True):
         positions, rotations = [state[:, :3]], [matrix_from_quat(state[:, 3:7])]
         # Native state pairs a link-origin position with a COM linear velocity.
-        root_offset = (rotations[0] @ root_com[..., None]).squeeze(-1)
-        velocities = [state[:, 7:10] - torch.cross(state[:, 10:13], root_offset, dim=-1)]
-        angular = [state[:, 10:13]]
+        if velocities:
+            root_offset = (rotations[0] @ root_com[..., None]).squeeze(-1)
+            linear = [state[:, 7:10] - torch.cross(state[:, 10:13], root_offset, dim=-1)]
+            angular = [state[:, 10:13]]
         q, qd = state[:, 13:42], state[:, 42:71]
         for index in range(1, len(self.names)):
             parent, joint = self.parents[index], self.joint_ids[index]
             offset = (rotations[parent] @ self.offset[index, :, None]).squeeze(-1)
             position = positions[parent] + offset
             rotation = rotations[parent] @ self.rotation[index]
-            velocity = velocities[parent] + torch.cross(angular[parent], offset, dim=-1)
-            spin = angular[parent]
+            if velocities:
+                velocity = linear[parent] + torch.cross(angular[parent], offset, dim=-1)
+                spin = angular[parent]
             if joint >= 0:
-                axis = (rotation @ self.axis[index, :, None]).squeeze(-1)
-                spin = spin + axis * qd[:, joint : joint + 1]
+                if velocities:
+                    axis = (rotation @ self.axis[index, :, None]).squeeze(-1)
+                    spin = spin + axis * qd[:, joint : joint + 1]
                 rotation = rotation @ matrix_from_quat(rotation_increment(self.axis[index] * q[:, joint : joint + 1]))
             positions.append(position)
             rotations.append(rotation)
-            velocities.append(velocity)
-            angular.append(spin)
+            if velocities:
+                linear.append(velocity)
+                angular.append(spin)
+        if not velocities:
+            return (
+                torch.stack([positions[index] for index in self.tracked], 1),
+                torch.stack([rotations[index] for index in self.tracked], 1),
+                None,
+                None,
+            )
         position, rotation, velocity, spin = (
             torch.stack([values[index] for index in self.tracked], 1)
-            for values in (positions, rotations, velocities, angular)
+            for values in (positions, rotations, linear, angular)
         )
         com_offset = (rotation @ tracked_com[..., None]).squeeze(-1)
         return position, rotation, velocity + torch.cross(spin, com_offset, dim=-1), spin
@@ -128,6 +155,12 @@ class AnalyticRewards:
         robot = env.scene["robot"]
         self.kinematics = RobotKinematics(
             c.reference.cfg.robot_model_path, robot.joint_names, c.reference.cfg.link_of_interests, env.device
+        )
+        self.support_kinematics = RobotKinematics(
+            c.reference.cfg.robot_model_path,
+            robot.joint_names,
+            [c.reference.cfg.link_of_interests[index] for index in c.foot_ids],
+            env.device,
         )
         self.root_com = robot.data.body_com_pos_b.torch[:, 0].clone()
         self.body_com = robot.data.body_com_pos_b.torch[:, c.body_ids].clone()
@@ -197,8 +230,11 @@ class AnalyticRewards:
         return self.kinematics.forward(state, self.root_com[ids], self.body_com[ids])
 
     def support(self, state, previous, context, bodies):
+        return self.support_from_feet(state, previous, context, bodies[0][:, self.command.foot_ids, :2])
+
+    def support_from_feet(self, state, previous, context, feet_xy):
         c = self.command
-        h, valid = self.heightfield.query(bodies[0][:, c.foot_ids, :2])
+        h, valid = self.heightfield.query(feet_xy)
         root, root_valid = self.heightfield.query(state[:, :2])
         labels = context["ref_contact"][:, c.foot_ids] * context["ref_valid"][:, c.foot_ids]
         target = torch.where(labels.sum(-1) > 0, (h * labels).sum(-1) / labels.sum(-1).clamp_min(1), root)
@@ -206,7 +242,10 @@ class AnalyticRewards:
         return previous.lerp(target, blend), valid.all(-1) & root_valid
 
     def support_from_state(self, state, previous, context, ids):
-        return self.support(state, previous, context, self.bodies(state, ids))
+        # Support reads only foot positions. Keep the native pose operations,
+        # without tracing/recomputing unused COM velocities at every H32 step.
+        feet = self.support_kinematics.forward(state, None, None, velocities=False)[0]
+        return self.support_from_feet(state, previous, context, feet[..., :2])
 
     def surface(self, xy, exact=False):
         offsets = xy.new_tensor([[0, 0], [-0.08, 0], [0.08, 0], [0, -0.04], [0, 0.04]])

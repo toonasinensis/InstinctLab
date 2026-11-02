@@ -13,7 +13,7 @@ import warp as wp
 from isaaclab.app import launch_simulation
 
 import instinctlab.tasks  # noqa: F401
-from instinctlab.tasks.shadowing.pgmt.bptt_mdp import lambda_returns, raw_history
+from instinctlab.tasks.shadowing.pgmt.bptt_mdp import OBSERVATION_WIDTHS, lambda_returns, raw_history
 from instinctlab.tasks.shadowing.pgmt.bptt_runner import BPTTRunner
 from instinctlab.tasks.shadowing.pgmt.wm_dynamics import yaw_angle
 from instinctlab.utils import instinct_rl_cli as cli
@@ -62,6 +62,7 @@ def main():
                 term.noise = noise
         # The raster approximation is measured separately; all nonterrain channels must match.
         torch.testing.assert_close(obs[:, :1678], clean[:, :1678], atol=3e-4, rtol=1e-5)
+        noise_state = runner.noise_generator.get_state()
         noisy = runner.mdp.observations(
             state,
             raw_history(runner.observation),
@@ -69,6 +70,14 @@ def main():
             context,
             runner.noise_generator,
         )[0]
+        after_noise = runner.noise_generator.get_state()
+        runner.noise_generator.set_state(noise_state)
+        prepared = runner.mdp.draw_noise(env.num_envs, OBSERVATION_WIDTHS, runner.noise_generator)
+        prepared_obs = runner.mdp.observations(
+            state, raw_history(runner.observation), runner.rewards.command.terrain.support_z, context, prepared
+        )[0]
+        torch.testing.assert_close(prepared_obs, noisy, rtol=0, atol=0)
+        torch.testing.assert_close(runner.noise_generator.get_state(), after_noise, rtol=0, atol=0)
         assert not torch.equal(noisy[:, 930:1678], obs[:, 930:1678])
         torch.testing.assert_close(noisy[:, :930], obs[:, :930], rtol=0, atol=0)
         torch.testing.assert_close(noisy[:, 1678:], obs[:, 1678:], rtol=0, atol=0)
@@ -105,6 +114,7 @@ def main():
             physical_border_probes_valid=True,
             physical_border_height_max_error=float((baked - native).abs().max()),
             beyond_raster_rejected=True,
+            prepared_observation_noise_exact=True,
         )
         assert runner.wm.contact_head is None and runner.wm.force_head is None
         assert not {id(p) for p in runner.value.parameters()} & {id(p) for p in runner.actor.parameters()}
@@ -165,18 +175,24 @@ def main():
             del direct_loss, direct_gradient, recomputed_loss, recomputed_gradient
         loss, _, _, _, valid, states, actions = runner.imagine(data)
         future_map = runner.heightfield.local(states[1][:, :3], yaw_angle(states[1][:, 3:7]))[0]
-        map_gradient = torch.autograd.grad(future_map.square().mean(), actions[0], retain_graph=True)[0]
+        # AOTAutograd exposes returned states/actions as sibling outputs. Check
+        # the future-map path to a policy parameter across that compiled boundary.
+        gradient_input = runner.actor.action_head[-1].bias if runner.execution["compile"] else actions[0]
+        map_gradient = torch.autograd.grad(future_map.square().mean(), gradient_input, retain_graph=True)[0]
         assert torch.isfinite(map_gradient).all() and map_gradient.abs().sum() > 0
-        action_gradient = torch.autograd.grad(loss, actions[0], retain_graph=True)[0]
+        action_gradient = torch.autograd.grad(loss, gradient_input, retain_graph=True)[0]
         assert valid.all() and torch.isfinite(action_gradient).all() and action_gradient.abs().sum() > 0
         loss.backward()
         assert all(p.grad is None for p in runner.wm.parameters())
         assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in runner.actor.parameters())
         report.update(
-            first_action_gradient_norm=float(action_gradient.norm()),
+            objective_gradient_norm=float(action_gradient.norm()),
             future_heightmap_gradient_norm=float(map_gradient.norm()),
             wm_parameters_frozen_in_actor_backward=True,
+            gradient_input="policy head bias" if runner.execution["compile"] else "first action",
         )
+        if not runner.execution["compile"]:
+            report["first_action_gradient_norm"] = float(action_gradient.norm())
         runner.actor_optimizer.zero_grad(set_to_none=True)
         runner.wm.requires_grad_(True)
         runner.value.requires_grad_(True)
@@ -188,6 +204,10 @@ def main():
         runner.value.requires_grad_(False)
         original_tf32 = torch.backends.cuda.matmul.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = False
+        execution = runner.execution.copy()
+        # BF16 quantization is not a smooth finite-difference oracle. Verify the
+        # FP32 eager computational graph separately, then restore actual execution.
+        runner.configure_execution(dict(execution, bf16=False, compile=False))
         noise_state = runner.noise_generator.get_state()
         value = runner.imagine(data)[0]
         gradient = torch.autograd.grad(value, parameter)[0]
@@ -203,6 +223,7 @@ def main():
             parameter.add_(epsilon * direction)
         actual = (plus - minus) / (2 * epsilon)
         torch.backends.cuda.matmul.allow_tf32 = original_tf32
+        runner.configure_execution(execution)
         runner.wm.requires_grad_(True)
         runner.value.requires_grad_(True)
         assert abs(actual - expected) < 0.05 * max(abs(expected), 0.01), (actual, expected)
@@ -210,6 +231,7 @@ def main():
             policy_direction_autograd=expected,
             policy_direction_finite_difference=actual,
             gradient_scope="Computational graph consistency; not a real-simulator Jacobian accuracy claim",
+            finite_difference_execution="FP32 eager, TF32 disabled",
         )
         runner.warmup_complete = True
         runner.learn(args.max_iterations or 3)
@@ -226,13 +248,11 @@ def main():
         runner.save(str(checkpoint))
         # A collective invalid window must preserve weights/counters and retain evidence.
         # Check before load(), which deliberately clears the simulator replay.
-        local_map = runner.heightfield.local
-
-        def invalid_local(*args, **kwargs):
-            heights, valid = local_map(*args, **kwargs)
-            return heights, torch.zeros_like(valid)
-
-        runner.heightfield.local = invalid_local
+        sample_actor = runner.sample_actor
+        invalid_data = sample_actor()
+        invalid_data = dict(invalid_data, state=invalid_data["state"].clone())
+        invalid_data["state"][:, 0, :2] = runner.heightfield.origin - 2.0
+        runner.sample_actor = lambda: invalid_data
         counters = (runner.actor_updates, runner.critic_updates, runner.wm_updates)
         try:
             runner.update_bptt()
@@ -241,12 +261,13 @@ def main():
         else:
             raise AssertionError("Invalid imagined window was accepted")
         finally:
-            runner.heightfield.local = local_map
+            runner.sample_actor = sample_actor
         assert counters == (runner.actor_updates, runner.critic_updates, runner.wm_updates)
         torch.testing.assert_close(runner.actor.state_dict(), saved_actor, rtol=0, atol=0)
         torch.testing.assert_close(runner.value.state_dict(), saved_value, rtol=0, atol=0)
         window_path = root / f"invalid-rollout-{runner.actor_updates}-rank-{runner.rank}.pt"
         window = torch.load(window_path, map_location="cpu", weights_only=True)
+        report["invalid_rejection_probe"] = "actual initial state outside raster; no geometry monkeypatch"
         assert not window["valid"].any() and len(window["states"]) == runner.bptt["horizon"] + 1
         assert (root / f"invalid-rollout-{runner.actor_updates}.pt").is_file()
         runner.load(str(checkpoint))
@@ -271,6 +292,7 @@ def main():
             wm_hidden=runner.options["hidden"],
             wm_amp=runner.options["amp"],
             checkpoint_activations=runner.bptt["checkpoint_activations"],
+            execution=runner.execution,
             observation_noise_rng_exact_reload=True,
             independent_mlp=True,
             invalid_window_capture=True,

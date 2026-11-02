@@ -10,6 +10,8 @@ from .cross_attention import CrossAttentionActor, CrossAttentionActorCritic, unp
 class TerrainActor(CrossAttentionActor):
     def __init__(self, num_joints=29):
         super().__init__(num_joints)
+        self.amp = False
+        self.amp_heads = True
         self.reference_widths = (*self.reference_widths, 3)
         self.command_embedding = nn.Linear(68, 256)
         self.terrain_selector = nn.Sequential(
@@ -26,27 +28,60 @@ class TerrainActor(CrossAttentionActor):
         self.register_buffer("patch_offsets", torch.stack((x, y), -1).float() * 0.1)
 
     def forward(self, obs):
+        action, self.intent = self.action_and_intent(obs)
+        return action
+
+    def action(self, obs):
+        # BPTT has an independent critic: no shared-intent side effect inside
+        # a compiled or activation-checkpointed policy forward.
+        return self.action_and_intent(obs)[0]
+
+    def action_and_intent(self, obs):
+        return self.action_and_intent_from_inputs(*self.inputs(obs))
+
+    def inputs(self, obs):
         history = unpack_terms(obs[:, :930], self.prop_widths, 10)
         reference = unpack_terms(obs[:, 930:1678], self.reference_widths, 11)
-        heights = obs[:, 1678:]
-        tokens = self.state_embedding(history)
-        state = self.history_attention(tokens[:, -1:], tokens)
-        centers = 0.8 * self.terrain_selector(
-            torch.cat((heights, state[:, 0], reference.flatten(1)), -1)
-        ).tanh().reshape(-1, 4, 2)
+        return history, reference, obs[:, 1678:]
+
+    def action_from_inputs(self, history, reference, heights):
+        return self.action_and_intent_from_inputs(history, reference, heights)[0]
+
+    def output_head(self, layers, features):
+        if not self.amp or self.amp_heads:
+            return layers(features)
+        for index in range(len(layers) - 1):
+            features = layers[index](features)
+        with torch.autocast(device_type=features.device.type, enabled=False):
+            return layers[-1](features.float())
+
+    def action_and_intent_from_inputs(self, history, reference, heights):
+        with torch.autocast(
+            device_type=heights.device.type, dtype=torch.bfloat16, enabled=self.amp and heights.is_cuda
+        ):
+            tokens = self.state_embedding(history)
+            state = self.history_attention(tokens[:, -1:], tokens)
+            centers = self.output_head(
+                self.terrain_selector, torch.cat((heights, state[:, 0], reference.flatten(1)), -1)
+            ).float()
+        # Sampling arithmetic remains FP32; amp_heads controls the final linear.
+        centers = 0.8 * centers.tanh().reshape(-1, 4, 2)
         grid = centers[:, :, None, None] + self.patch_offsets[None, None]
         patches = F.grid_sample(
             heights.reshape(-1, 1, 21, 21), grid.reshape(-1, 20, 5, 2), padding_mode="border", align_corners=True
         ).reshape(-1, 4, 25)
-        terrain_tokens = self.terrain_encoder(torch.cat((patches, centers), -1))
-        source = torch.cat((state, self.command_embedding(reference), terrain_tokens), 1)
-        bias = obs.new_zeros(1, 16)
+        bias = heights.new_zeros(1, 16)
         bias[:, -4:] = self.terrain_gate.log()
         positions = torch.cat((self.key_positions, self.key_positions.new_zeros(4)))
-        intent = self.intent_attention(state, source, self.query_positions, positions, attention_bias=bias)
-        # PPO calls the actor immediately before evaluate; the graph is shared, never detached.
-        self.intent = intent[:, 0]
-        return self.action_head(torch.cat((history[:, -1], self.intent), -1))
+        with torch.autocast(
+            device_type=heights.device.type, dtype=torch.bfloat16, enabled=self.amp and heights.is_cuda
+        ):
+            terrain_tokens = self.terrain_encoder(torch.cat((patches, centers), -1))
+            source = torch.cat((state, self.command_embedding(reference), terrain_tokens), 1)
+            intent = self.intent_attention(state, source, self.query_positions, positions, attention_bias=bias)
+            action = self.output_head(self.action_head, torch.cat((history[:, -1], intent[:, 0]), -1)).float()
+        # PPO shares this graph with evaluate; BPTT uses the pure action entry.
+        return action, intent[:, 0].float()
 
 
 class TerrainActorCritic(CrossAttentionActorCritic):

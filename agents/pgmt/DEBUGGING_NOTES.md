@@ -7,6 +7,7 @@
 | --- | --- | --- | --- |
 | 2026-11-02 | [BPTT 短时域与 critic 依赖](2026-11-02-bptt-horizon-and-critic.md) | 默认 actor H32，保留 real/imagined critic | 表现趋势已观察；critic 因果解释待验证 |
 | 2026-11-02 | [BPTT 训练吞吐与重复 FK](2026-11-02-bptt-throughput.md) | 保留 support 递归；原生批量奖励与软终止，拒绝未通过的编译路径 | 原实现瓶颈已实测；加速与正确性见外部验收报告 |
+| 2026-11-02 | [BPTT BF16 与整段编译](2026-11-02-bptt-bf16-and-compilation.md) | 精度/编译候选默认关闭，满尺寸与效果分开验收 | FP32 输出头仍有更新偏差；整段编译到达冷启动时限 |
 
 ## 记录约定
 

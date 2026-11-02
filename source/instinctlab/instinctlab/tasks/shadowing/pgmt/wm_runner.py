@@ -100,6 +100,7 @@ class SupervisedWMRunner(TerrainRunner):
         self.replay = WMReplay(capacity)
         self.frozen_validation = None
         self.wm_updates = 0
+        self._world_model_loss = self.world_model_loss
         self.latest_metrics = {}
         self.capture_terminal()
         for value in self.wm.state_dict().values():
@@ -312,13 +313,16 @@ class SupervisedWMRunner(TerrainRunner):
             torch.stack(losses, 1),
         )
 
+    def world_model_loss(self, data):
+        return self.predict(data, self.options["train_horizon"])[0]
+
     def fit_world_model(self, update_moments=True):
         if update_moments:
             self.update_moments()
         self.wm.train()
         for _ in range(self.options["updates"]):
             data = self.sample(self.options["train_horizon"])
-            loss = self.predict(data, self.options["train_horizon"])[0]
+            loss = self._world_model_loss(data)
             self.wm_optimizer.zero_grad(set_to_none=True)
             loss.backward()
             average_gradients(self.wm)
