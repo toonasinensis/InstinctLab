@@ -92,3 +92,29 @@ Python 3.12.13、Torch 2.11.0+cu126，并已通过原生 CUDA/Warp 推进。
 L0，且早于首次完整 500 步超时。开始 actor 更新后的学习瞬态是一种解释，
 但 WM、critic、actor 或其他因素的因果尚未隔离；本次没有修改学习率、
 warmup、模型更新次数或奖励去抹平它。
+
+## 5000 次 actor 更新完整实验（验收待完成）
+
+后续完整训练已提交为 TARS
+[26274](https://open.tars-ai.com/pai/distributed-training/detail/26274)，唯一 run ID
+为 `pgmt-reset-phase-2x4096-5000-25d4fce-20261102-r1`。运行代码复用已验证的
+`25d4fce` 不可变快照，从相同 PPO 初始化和新 WM 开始，不从短训 checkpoint
+续训。配置保持单节点双 RTX4090、每卡 4096 环境、H32、real critic、seed 42
+及 FP32，目标 5000 次 actor 更新。
+
+证据入口为仓库同级 `InstinctLab-local/reset-phase-5000-20261102/`，远端持久
+挂载为 `/mnt/data/JIN/PGMT/InstinctLab-local/reset-phase-5000-20261102/`。
+`launch-manifest.json` 固定配置及输入摘要；`job-identity.json`、提交回执和
+`observe.py` 用于定位及只读跟踪任务。每 100 轮保存 checkpoint，1000/2000/
+3000/4000/5000 里程碑检查张量有限性及 RNG。完整计数预期为每 rank
+5032 条记录（32 warmup + 5000 train）、actor/critic/WM 分别
+5000/100640/50320、collection 12612、PPO 0。
+
+同一前台任务在训练后自动比较历史 `57587f8` 与新模型的最终 5000 轮
+checkpoint。三个评估 seed（1001/1002/1003）各覆盖 10 难度 × 10 地形列
+× 4 重复，每模型合计 1200 个首 episode。评估禁用初始错峰终止、课程和
+观测/动作噪声，保持标准 500 控制步上限，并检查成对初始状态及归一化器。
+`training-verification.json`、`training-comparison.json` 与
+`quality-comparison.json` 分别记录执行完整性、在线尖峰变化及固定条件质量。
+单个训练 seed 的评估区间不能代表训练 seed 方差；脚本通过也不自动表示
+质量改善。完整训练及上述评估结束前，此实验不记为验收通过。
