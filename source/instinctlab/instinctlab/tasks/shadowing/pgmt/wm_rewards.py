@@ -205,6 +205,9 @@ class AnalyticRewards:
         blend = 1 - torch.exp(state.new_tensor(-self.dt / c.cfg.support_filter_seconds))
         return previous.lerp(target, blend), valid.all(-1) & root_valid
 
+    def support_from_state(self, state, previous, context, ids):
+        return self.support(state, previous, context, self.bodies(state, ids))
+
     def surface(self, xy, exact=False):
         offsets = xy.new_tensor([[0, 0], [-0.08, 0], [0.08, 0], [0, -0.04], [0, 0.04]])
         if exact:
@@ -243,10 +246,12 @@ class AnalyticRewards:
         derivative_valid,
         ids,
         exact_surface=False,
+        bodies=None,
+        previous_bodies=None,
     ):
         c = self.command
-        position, rotation, velocity, spin = self.bodies(state, ids)
-        previous_velocity = self.bodies(previous_state, ids)[2]
+        position, rotation, velocity, spin = self.bodies(state, ids) if bodies is None else bodies
+        previous_velocity = (self.bodies(previous_state, ids) if previous_bodies is None else previous_bodies)[2]
         delta = yaw_quat(quat_mul(state[:, 3:7], quat_inv(context["ref_rotation"])))
         target_root = torch.cat((state[:, :2], context["ref_position"][:, 2:3] + support[:, None]), -1)
         aligned = delta[:, None].expand(-1, position.shape[1], -1)

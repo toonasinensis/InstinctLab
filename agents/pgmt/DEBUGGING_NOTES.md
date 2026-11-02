@@ -6,6 +6,7 @@
 | 日期 | 经验 | 工程决策 | 解释的验证状态 |
 | --- | --- | --- | --- |
 | 2026-11-02 | [BPTT 短时域与 critic 依赖](2026-11-02-bptt-horizon-and-critic.md) | 默认 actor H32，保留 real/imagined critic | 表现趋势已观察；critic 因果解释待验证 |
+| 2026-11-02 | [BPTT 训练吞吐与重复 FK](2026-11-02-bptt-throughput.md) | 保留 support 递归；原生批量奖励与软终止，拒绝未通过的编译路径 | 原实现瓶颈已实测；加速与正确性见外部验收报告 |
 
 ## 记录约定
 

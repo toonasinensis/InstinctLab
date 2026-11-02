@@ -65,6 +65,17 @@ exception through scripted quaternion operations. Observation noise is drawn
 outside those deterministic forwards and is not resampled during backward.
 Direct/recomputed loss and gradient parity is part of acceptance validation.
 
+Execution keeps the recursive support-height filter in the rollout. Rewards and
+soft survival are evaluated over the complete B x H trajectory afterwards. One
+batched FK pass supplies both current and previous body states; acceleration
+rewards retain their cross-step derivatives. The discounted objective, lambda
+targets and noise draw order are unchanged. Critic loss logging transfers one
+aggregate to the CPU per round. Geometry uses the original native matrix
+operations and precision settings. Experimental compiled geometry kernels failed
+numerical acceptance and are not part of this execution path. Mathematical parity
+is checked separately with TF32 disabled; timing uses the original TF32 setting.
+TF32 batch/loop rounding differences are recorded rather than claimed bitwise equal.
+
 Replay stores **1000 control steps per environment** (20 seconds). One already
 noisy proprioceptive frame, an episode-step counter and a nine-frame prefix allow
 exact reconstruction of 10-frame histories through resets, overwrite and refill.

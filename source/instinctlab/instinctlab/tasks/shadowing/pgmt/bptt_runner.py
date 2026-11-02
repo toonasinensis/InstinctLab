@@ -229,30 +229,16 @@ class BPTTRunner(SupervisedWMRunner):
         )
         context = self.mdp.context(start)
         features, observation, valid = self.features(state, history, support, context, ids, self.noise_generator)
-        feature_rows, rewards, survival, states, actions = [features], [], [], [state], []
+        feature_rows, states, actions = [features], [state], []
+        contexts, supports, previous_actions = [], [], []
+        reference_velocities = [context["ref_body_velocity"]]
         for step in range(horizon):
             action = self.network_forward(self.actor, self.normalizers["policy"](observation))
             successor, _, _ = self.network_forward(
                 self.wm, state, action, previous_action, None, observation[:, 1678:], self.xi[ids]
             )
             next_context = self.mdp.context(start, step + 1)
-            bodies = self.rewards.bodies(successor, ids)
-            next_support, support_valid = self.rewards.support(successor, support, next_context, bodies)
-            reward, _ = self.rewards.evaluate(
-                successor,
-                state,
-                action,
-                previous_action,
-                None,
-                None,
-                None,
-                next_support,
-                next_context,
-                context["ref_body_velocity"],
-                data["derivative_valid"][:, 0] if step == 0 else state.new_ones(len(state)),
-                ids,
-            )
-            alive = self.mdp.soft_survival(successor, next_support, next_context, bodies)
+            next_support, support_valid = self.rewards.support_from_state(successor, support, next_context, ids)
             history = torch.cat(
                 (history[:, 1:], self.mdp.proprioception(successor, action, ids, self.noise_generator)[:, None]), 1
             )
@@ -260,13 +246,65 @@ class BPTTRunner(SupervisedWMRunner):
                 successor, history, next_support, next_context, ids, self.noise_generator
             )
             valid = valid & support_valid & next_valid & next_context["reference_valid"]
-            rewards.append(reward.sum(-1))
-            survival.append(alive)
             feature_rows.append(features)
             states.append(successor)
             actions.append(action)
+            previous_actions.append(previous_action)
+            supports.append(next_support)
+            contexts.append(next_context)
+            reference_velocities.append(next_context["ref_body_velocity"])
             state, previous_action, support, context = successor, action, next_support, next_context
-        rewards, survival, features = torch.stack(rewards, 1), torch.stack(survival, 1), torch.stack(feature_rows, 1)
+
+        # Rewards and survival do not feed the next policy observation. Evaluate
+        # all steps together, sharing one FK pass for current/previous bodies.
+        batch = len(ids)
+        all_states = torch.stack(states, 1)
+        all_ids = ids[:, None].expand(-1, horizon + 1).flatten()
+        all_bodies = self.rewards.bodies(all_states.flatten(0, 1), all_ids)
+        body_rows = [value.reshape(batch, horizon + 1, *value.shape[1:]) for value in all_bodies]
+        bodies = tuple(value[:, 1:].flatten(0, 1) for value in body_rows)
+        previous_bodies = tuple(value[:, :-1].flatten(0, 1) for value in body_rows)
+        reward_context = {
+            key: torch.stack([row[key] for row in contexts], 1).flatten(0, 1)
+            for key in (
+                "ref_position",
+                "ref_rotation",
+                "ref_body_position",
+                "ref_body_rotation",
+                "ref_body_velocity",
+                "ref_body_angular",
+                "ref_velocity",
+                "ref_q",
+                "ref_qd",
+                "ref_contact",
+                "ref_valid",
+                "level",
+                "family",
+            )
+        }
+        successor = all_states[:, 1:].flatten(0, 1)
+        supports = torch.stack(supports, 1).flatten()
+        derivative_valid = state.new_ones(batch, horizon)
+        derivative_valid[:, 0] = data["derivative_valid"][:, 0]
+        rewards, _ = self.rewards.evaluate(
+            successor,
+            all_states[:, :-1].flatten(0, 1),
+            torch.stack(actions, 1).flatten(0, 1),
+            torch.stack(previous_actions, 1).flatten(0, 1),
+            None,
+            None,
+            None,
+            supports,
+            reward_context,
+            torch.stack(reference_velocities[:-1], 1).flatten(0, 1),
+            derivative_valid.flatten(),
+            ids[:, None].expand(-1, horizon).flatten(),
+            bodies=bodies,
+            previous_bodies=previous_bodies,
+        )
+        rewards = rewards.sum(-1).reshape(batch, horizon)
+        survival = self.mdp.soft_survival(successor, supports, reward_context, bodies).reshape(batch, horizon)
+        features = torch.stack(feature_rows, 1)
         discount = (self.bptt["gamma"] * survival).cumprod(1)
         before = torch.cat((discount.new_ones(len(state), 1), discount[:, :-1]), 1)
         objective = (before * rewards).sum(1) + discount[:, -1] * self.value(features[:, -1])
@@ -342,7 +380,7 @@ class BPTTRunner(SupervisedWMRunner):
         features, targets = features.flatten(0, 1), targets.flatten()
         selected = mask.flatten().bool()
         features, targets = features[selected], targets[selected]
-        loss_sum = 0.0
+        loss_sum = features.new_zeros(())
         for _ in range(self.bptt["critic_epochs"]):
             order = torch.randperm(len(targets), device=self.device, generator=self.critic_generator)
             for ids in order.tensor_split(self.bptt["critic_minibatches"]):
@@ -353,8 +391,8 @@ class BPTTRunner(SupervisedWMRunner):
                 nn.utils.clip_grad_norm_(self.value.parameters(), 1.0, error_if_nonfinite=True)
                 self.value_optimizer.step()
                 self.critic_updates += 1
-                loss_sum += float(loss.detach())
-        return loss_sum / (self.bptt["critic_epochs"] * self.bptt["critic_minibatches"])
+                loss_sum += loss.detach()
+        return float(loss_sum / (self.bptt["critic_epochs"] * self.bptt["critic_minibatches"]))
 
     def update_bptt(self, actor=True):
         data = self.sample_actor()
