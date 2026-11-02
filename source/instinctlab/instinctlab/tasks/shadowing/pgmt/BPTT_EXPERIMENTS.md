@@ -23,6 +23,26 @@ control-dt scaling, form the complete imagined objective. There are no contact
 or force WM heads or dynamics inputs. Reference contact labels still determine
 the reference support-height filter used by the real task.
 
+For the collection-rate ablation, set `agent.bptt.train_collect_steps=8|16|24`.
+This overrides collection only during actual actor-training rounds. Prefill and
+the 32 actor-frozen warmup rounds still use the original UTD 0.4 schedule, so
+each case enters actor training after 112 real control steps. `None` retains the
+original 2/3-step schedule throughout. Actor imagination stays H32; changing the
+collection count does not change the imagination horizon or optimizer counts.
+Keep two RTX4090 GPUs, 4096 environments and actor batch 4096 per GPU, seed 42,
+real critic, PPO initialization, fresh WM and all other settings identical.
+At 5000 actor updates, the 8/16/24 cases collect 40112/80112/120112 steps per
+environment; all retain 5032 learner rounds, 50320 WM and 100640 critic updates.
+Compare both equal actor-update and equal real-step budgets, and wall time.
+
+The user has tested the current terrain/curriculum and uses a mean terrain level
+stable around 6 as the empirical all-terrain mastery criterion. The existing
+BPTT plateau around 5.7--5.8 and observed failures on L9 stairs do not meet that
+criterion. Record time/steps/updates to sustained level 6, retain the full curve,
+and check L9 stair success in fixed evaluations. The idealized mean-level
+resampling calculation does not replace this project-specific empirical check.
+Experiment artifacts belong in `InstinctLab-local/bptt-collect-sweep-20261102/`.
+
 The decision to use H32 and its limits are recorded in the
 [debugging experience index](../../../../../../agents/pgmt/DEBUGGING_NOTES.md).
 The completed six-condition horizon study is historical; its exact source,
