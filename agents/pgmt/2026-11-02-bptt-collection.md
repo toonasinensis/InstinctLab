@@ -58,6 +58,13 @@ critic、FP32、seed 42、同一 PPO2000 初始化、fresh WM、首轮独立超�
 采集分别为 152/192/232 步。完整训练应有每 rank 5032 行和上表最终计数，
 检查两 rank 计数、有限张量、checkpoint 及 RNG。
 
+后续现场检查确认三组原生双卡短验证全部通过：各 rank 37 行，warmup 末端
+均为 112 步，正式 5 轮分别固定采集 8/16/24 步，最终计数符合上述预期。
+三份 checkpoint 的张量/优化器有限，BPTT/WM/terrain 各保存两 rank RNG。
+证据见外部 `smoke-acceptance.json` 及每组 `smoke-verification.json`、
+`smoke-checkpoint.json`。各 worker 已自动转入 fresh 5000 轮流程，完整训练
+和质量验收仍待完成。
+
 ## 后续比较
 
 同时按 actor 更新、真实采集步数和墙钟时间比较 terrain level 曲线，保留
