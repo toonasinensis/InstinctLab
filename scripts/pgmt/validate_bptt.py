@@ -173,15 +173,26 @@ def main():
             torch.testing.assert_close(direct_gradient, recomputed_gradient, rtol=1e-4, atol=1e-6)
             report["checkpoint_gradient_parity"] = True
             del direct_loss, direct_gradient, recomputed_loss, recomputed_gradient
+        noise_state = runner.noise_generator.get_state()
         loss, _, _, _, valid, states, actions = runner.imagine(data)
         future_map = runner.heightfield.local(states[1][:, :3], yaw_angle(states[1][:, 3:7]))[0]
-        # AOTAutograd exposes returned states/actions as sibling outputs. Check
-        # the future-map path to a policy parameter across that compiled boundary.
-        gradient_input = runner.actor.action_head[-1].bias if runner.execution["compile"] else actions[0]
-        map_gradient = torch.autograd.grad(future_map.square().mean(), gradient_input, retain_graph=True)[0]
+        # The closed-loop transition is native even when the analytic objective
+        # is compiled. Test the first action directly across the complete horizon.
+        gradient_input = actions[0]
+        map_gradient = torch.autograd.grad(future_map.square().mean(), gradient_input)[0]
         assert torch.isfinite(map_gradient).all() and map_gradient.abs().sum() > 0
-        action_gradient = torch.autograd.grad(loss, gradient_input, retain_graph=True)[0]
+        # Compiled backward may donate saved buffers. Use one backward per fresh
+        # graph, with identical noise, rather than disabling production donation.
+        runner.noise_generator.set_state(noise_state)
+        loss, _, _, _, valid, states, actions = runner.imagine(data)
+        action_gradient = torch.autograd.grad(loss, actions[0])[0]
         assert valid.all() and torch.isfinite(action_gradient).all() and action_gradient.abs().sum() > 0
+        runner.noise_generator.set_state(noise_state)
+        loss, _, _, _, valid, states, actions = runner.imagine(data)
+        terminal_gradient = torch.autograd.grad(states[-1].square().mean(), actions[0])[0]
+        assert torch.isfinite(terminal_gradient).all() and terminal_gradient.abs().sum() > 0
+        runner.noise_generator.set_state(noise_state)
+        loss, _, _, _, valid, states, actions = runner.imagine(data)
         loss.backward()
         assert all(p.grad is None for p in runner.wm.parameters())
         assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in runner.actor.parameters())
@@ -189,10 +200,10 @@ def main():
             objective_gradient_norm=float(action_gradient.norm()),
             future_heightmap_gradient_norm=float(map_gradient.norm()),
             wm_parameters_frozen_in_actor_backward=True,
-            gradient_input="policy head bias" if runner.execution["compile"] else "first action",
+            gradient_input="first action",
+            first_action_gradient_norm=float(action_gradient.norm()),
+            terminal_state_first_action_gradient_norm=float(terminal_gradient.norm()),
         )
-        if not runner.execution["compile"]:
-            report["first_action_gradient_norm"] = float(action_gradient.norm())
         runner.actor_optimizer.zero_grad(set_to_none=True)
         runner.wm.requires_grad_(True)
         runner.value.requires_grad_(True)

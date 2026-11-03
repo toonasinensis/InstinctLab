@@ -71,16 +71,25 @@ Optional execution controls live in `agent.bptt_execution`:
   and loss reductions. Parameters, accumulated parameter gradients, optimizer
   states and normalization means/variances remain FP32; existing counter dtypes
   are unchanged. Casting a BF16 output to FP32 does not recover lost precision.
-- `compile=True` requests full-graph compilation of the WM H8 supervised loss, policy H32 rollout and
-  critic forward. Replay sampling, reference/noise preparation, optimizer steps,
+- `compile=True` compiles the batched reward/return objective, WM H8 supervised
+  loss and independent critic forward as separate full-graph regions. The outer
+  H32 loop, its closed-loop actor/WM transitions, FK and terminal value bootstrap
+  remain native. Their gradients
+  stay connected to the compiled objective across every step. Compiling the
+  repeated transition was rejected after FP32 numerical checks; it is not enabled
+  by this flag. Replay sampling, reference/noise preparation, optimizer steps,
   communication, counters and error-artifact handling remain outside compilation.
-  Compilation requires a complete graph and reports unsupported operations rather
-  than silently falling back. Compiler CUDA graphs are disabled; existing native
-  simulator execution is unchanged. Backward runs outside autocast and is declared
-  accordingly to AOTAutograd during lazy compilation.
-  This remains an experimental validation path: bounded H32 candidates have
-  reached their cold-compilation time limits without completing a compiled
-  forward/backward. It is not an accepted production speedup and defaults off.
+  Unsupported operations inside a selected region raise rather than silently
+  falling back. Compiler CUDA graphs are disabled. Backward runs outside autocast
+  and is declared accordingly to AOTAutograd during lazy compilation. This path
+  has passed full-size numerical/throughput checks, a fresh real-H32 5000-update
+  run and matched inference against the eager baseline. Ordinary compute time
+  decreased 27.9% (4460 full-replay rounds per version). Overall paired tracking
+  errors improved, with some local failure/tile-exit regressions. The user also
+  reported similar TensorBoard training trends. This is one training seed per
+  version, not proof of statistical non-inferiority; imagined critic has only
+  bounded regression coverage. This option remains explicitly enabled per run.
+  See the debugging experience index for evidence and limits.
 - `actor_checkpoint` and `wm_checkpoint` independently control activation
   recomputation during actor backward. Both default to `True`. The legacy
   `agent.bptt.checkpoint_activations=False` still disables both. Test full-size peak
@@ -93,7 +102,7 @@ Optional execution controls live in `agent.bptt_execution`:
 These controls default to FP32 eager with both recomputations enabled. For BPTT,
 the execution precision flag sets WM AMP as well; the standalone supervised-WM
 runner retains its own `world_model.amp` setting. Compiled callables do not replace
-the raw modules or alter their checkpoint keys. Execution options are recorded
+the raw modules or alter their checkpoint keys. Execution options and the exact compiled regions are recorded
 and checked on resume. Loading an old FP32 eager checkpoint under a different
 execution mode requires an explicit, recorded benchmark fork; normal resume does
 not silently change precision or recomputation.
@@ -193,9 +202,10 @@ returns, independent critic parameters, future heightmap gradients, frozen WM
 parameters, policy directional finite differences, exact optimizer/RNG reload,
 invalid-window capture and distributed consistency. Computational gradient
 agreement does not establish the accuracy of real dynamics Jacobians. Prepared
-noise is compared exactly with the original draw order. Under compilation, future
-heightmap gradients are checked through a policy parameter across the AOTAutograd
-boundary. Finite differences use a separate FP32 eager reference, since BF16
+noise is compared exactly with the original draw order. Under compilation, gradients to the first action are checked from both a future
+heightmap and the terminal H32 state. Each gradient probe uses a fresh forward
+with identical noise; retaining a compiled backward graph conflicts with donated
+buffers in PyTorch 2.11. Finite differences use a separate FP32 eager reference, since BF16
 rounding is not a smooth finite-difference oracle.
 
 Runs record warmup separately, update counts, critic validity, real tracking and

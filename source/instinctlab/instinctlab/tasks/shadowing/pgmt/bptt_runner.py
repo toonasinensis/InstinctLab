@@ -133,6 +133,7 @@ class BPTTRunner(SupervisedWMRunner):
                 contract["policy_horizon"] = self.bptt["horizon"]
                 contract["options"] = self.options
                 contract["bptt_execution"] = self.execution
+                contract["compiled_regions"] = self.compiled_regions
                 contract_path.write_text(json.dumps(contract, indent=2) + "\n")
             (self.log_root / f"bptt-rank-{self.rank}-contract.json").write_text(
                 json.dumps(
@@ -154,6 +155,7 @@ class BPTTRunner(SupervisedWMRunner):
                         replay_capacity=self.replay.capacity,
                         wm_initialization="checkpoint" if train_cfg.get("wm_checkpoint") else "fresh",
                         execution=self.execution,
+                        compiled_regions=self.compiled_regions,
                         precision=(
                             "BF16 networks"
                             + (" including heads" if self.execution["bf16_heads"] else ", FP32 output heads")
@@ -188,20 +190,16 @@ class BPTTRunner(SupervisedWMRunner):
         self.actor.amp_heads = self.value.amp_heads = self.wm.amp_heads = self.execution["bf16_heads"]
         self.options["amp"] = self.wm.amp
         self.cfg["bptt_execution"] = self.execution.copy()
-        self._imagine_step = self.imagine_step
-        self._policy_rollout = self.imagine_rollout
+        self.compiled_regions = ["rollout_objective", "world_model_loss", "value"] if self.execution["compile"] else []
+        self._rollout_objective = self.rollout_objective
         self._world_model_loss = self.world_model_loss
         self._value_forward = self.value.forward
         if self.execution["compile"]:
-            # Keep the outer H32 graph complete, but reuse its unchanged repeated
-            # transition. Eager execution has no compiler API dependency.
-            imagine_step = self.imagine_step
-
-            def native_step(*inputs):
-                return imagine_step(*inputs)
-
-            self._imagine_step = torch.compiler.nested_compile_region(native_step)
-            self._policy_rollout = compile_forward(self.imagine_rollout)
+            # Keep the closed-loop transition native: compiling it changed H32
+            # gradients beyond the numerical gate, even with FP32 networks.
+            # Rewards/returns and the independent learners compile separately;
+            # autograd still connects their backward graphs across all H32 steps.
+            self._rollout_objective = compile_forward(self.rollout_objective)
             self._world_model_loss = compile_forward(self.world_model_loss)
             self._value_forward = compile_forward(self.value.forward)
 
@@ -308,7 +306,7 @@ class BPTTRunner(SupervisedWMRunner):
         for _ in range(self.bptt["horizon"]):
             proprio_noise.append(self.mdp.draw_noise(batch, PROPRIO_WIDTHS, self.noise_generator))
             observation_noise.append(self.mdp.draw_noise(batch, OBSERVATION_WIDTHS, self.noise_generator))
-        return self._policy_rollout(data, contexts, proprio_noise, observation_noise)
+        return self.imagine_rollout(data, contexts, proprio_noise, observation_noise)
 
     def imagine_step(
         self, state, history, support, previous_action, observation, context, ids, proprio_noise, observation_noise
@@ -336,7 +334,7 @@ class BPTTRunner(SupervisedWMRunner):
         horizon = self.bptt["horizon"]
         ids = data["env_id"]
         state, history, support, previous_action = (
-            data[k][:, 0] for k in ("state", "history", "support", "previous_action")
+            data[k][:, 0].contiguous() for k in ("state", "history", "support", "previous_action")
         )
         context = contexts[0]
         features, observation, valid = self.features(state, history, support, context, ids, observation_noise[0])
@@ -345,7 +343,7 @@ class BPTTRunner(SupervisedWMRunner):
         reference_velocities = [context["ref_body_velocity"]]
         for step in range(horizon):
             next_context = contexts[step + 1]
-            successor, history, next_support, action, features, observation, next_valid = self._imagine_step(
+            successor, history, next_support, action, features, observation, next_valid = self.imagine_step(
                 state,
                 history,
                 support,
@@ -370,11 +368,6 @@ class BPTTRunner(SupervisedWMRunner):
         # all steps together, sharing one FK pass for current/previous bodies.
         batch = len(ids)
         all_states = torch.stack(states, 1)
-        all_ids = ids[:, None].expand(-1, horizon + 1).flatten()
-        all_bodies = self.rewards.bodies(all_states.flatten(0, 1), all_ids)
-        body_rows = [value.reshape(batch, horizon + 1, *value.shape[1:]) for value in all_bodies]
-        bodies = tuple(value[:, 1:].flatten(0, 1) for value in body_rows)
-        previous_bodies = tuple(value[:, :-1].flatten(0, 1) for value in body_rows)
         reward_context = {
             key: torch.stack([row[key] for row in reward_contexts], 1).flatten(0, 1)
             for key in (
@@ -393,34 +386,72 @@ class BPTTRunner(SupervisedWMRunner):
                 "family",
             )
         }
-        successor = all_states[:, 1:].flatten(0, 1)
         supports = torch.stack(supports, 1).flatten()
         derivative_valid = state.new_ones(batch, horizon)
         derivative_valid[:, 0] = data["derivative_valid"][:, 0]
+        all_bodies = self.rewards.bodies(all_states.flatten(0, 1), ids[:, None].expand(-1, horizon + 1).flatten())
+        features = torch.stack(feature_rows, 1)
+        terminal_value = self.value(features[:, -1])
+        with torch.no_grad():
+            values = self.value(features.detach())
+        loss, targets, alive = self._rollout_objective(
+            all_states,
+            torch.stack(actions, 1).flatten(0, 1),
+            torch.stack(previous_actions, 1).flatten(0, 1),
+            supports,
+            reward_context,
+            torch.stack(reference_velocities[:-1], 1).flatten(0, 1),
+            derivative_valid.flatten(),
+            ids,
+            all_bodies,
+            terminal_value,
+            values,
+        )
+        return loss, features[:, :-1].detach(), targets, alive, valid, states, actions
+
+    def rollout_objective(
+        self,
+        all_states,
+        actions,
+        previous_actions,
+        supports,
+        reward_context,
+        reference_velocities,
+        derivative_valid,
+        ids,
+        all_bodies,
+        terminal_value,
+        values,
+    ):
+        """Batched rewards and returns; keep gradients to every imagined step."""
+        batch, steps = all_states.shape[:2]
+        horizon = steps - 1
+        body_rows = [value.reshape(batch, steps, *value.shape[1:]) for value in all_bodies]
+        bodies = tuple(value[:, 1:].flatten(0, 1) for value in body_rows)
+        previous_bodies = tuple(value[:, :-1].flatten(0, 1) for value in body_rows)
+        successor = all_states[:, 1:].flatten(0, 1)
         rewards, _ = self.rewards.evaluate(
             successor,
             all_states[:, :-1].flatten(0, 1),
-            torch.stack(actions, 1).flatten(0, 1),
-            torch.stack(previous_actions, 1).flatten(0, 1),
+            actions,
+            previous_actions,
             None,
             None,
             None,
             supports,
             reward_context,
-            torch.stack(reference_velocities[:-1], 1).flatten(0, 1),
-            derivative_valid.flatten(),
+            reference_velocities,
+            derivative_valid,
             ids[:, None].expand(-1, horizon).flatten(),
             bodies=bodies,
             previous_bodies=previous_bodies,
         )
         rewards = rewards.sum(-1).reshape(batch, horizon)
         survival = self.mdp.soft_survival(successor, supports, reward_context, bodies).reshape(batch, horizon)
-        features = torch.stack(feature_rows, 1)
         discount = (self.bptt["gamma"] * survival).cumprod(1)
-        before = torch.cat((discount.new_ones(len(state), 1), discount[:, :-1]), 1)
-        objective = (before * rewards).sum(1) + discount[:, -1] * self.value(features[:, -1])
+        before = torch.cat((discount.new_ones(batch, 1), discount[:, :-1]), 1)
+        objective = (before * rewards).sum(1) + discount[:, -1] * terminal_value
         with torch.no_grad():
-            values = self.value(features.detach())
             targets = lambda_returns(
                 rewards.detach(),
                 survival.detach(),
@@ -431,12 +462,8 @@ class BPTTRunner(SupervisedWMRunner):
             )
         return (
             -objective.mean(),
-            features[:, :-1].detach(),
             targets,
             survival.prod(1).detach().mean(),
-            valid,
-            states,
-            actions,
         )
 
     @torch.no_grad()
@@ -678,6 +705,7 @@ class BPTTRunner(SupervisedWMRunner):
                 schema="pgmt-bptt-v2",
                 options=self.bptt,
                 execution=self.execution,
+                compiled_regions=self.compiled_regions,
                 value=self.value.state_dict(),
                 actor_optimizer=self.actor_optimizer.state_dict(),
                 value_optimizer=self.value_optimizer.state_dict(),
@@ -714,6 +742,8 @@ class BPTTRunner(SupervisedWMRunner):
         saved_execution.setdefault("bf16_heads", saved_execution["bf16"])
         if saved_execution != self.execution:
             raise ValueError("BPTT resume changed execution options; use an explicit benchmark fork instead")
+        if saved.get("compiled_regions", []) != self.compiled_regions:
+            raise ValueError("BPTT resume changed compilation boundaries; use an explicit benchmark fork instead")
         result = super().load(path)
         self.value.load_state_dict(saved["value"])
         self.actor_optimizer.load_state_dict(saved["actor_optimizer"])
