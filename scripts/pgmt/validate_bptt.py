@@ -15,14 +15,203 @@ from isaaclab.app import launch_simulation
 import instinctlab.tasks  # noqa: F401
 from instinctlab.tasks.shadowing.pgmt.bptt_mdp import OBSERVATION_WIDTHS, lambda_returns, raw_history
 from instinctlab.tasks.shadowing.pgmt.bptt_runner import BPTTRunner
-from instinctlab.tasks.shadowing.pgmt.wm_dynamics import yaw_angle
+from instinctlab.tasks.shadowing.pgmt.wm_dynamics import average_gradients, yaw_angle
 from instinctlab.utils import instinct_rl_cli as cli
+
+
+def cpu_state(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {key: cpu_state(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [cpu_state(item) for item in value]
+    return copy.deepcopy(value)
+
+
+def check_ddp_parity(runner, data, diagnostic=False):
+    """Compare the old native/manual reducer and DDP on identical local data."""
+    report = {}
+
+    def compare(name, network, optimizer, native, distributed):
+        weights, optimizer_state = cpu_state(network.state_dict()), cpu_state(optimizer.state_dict())
+        original_optimizer_state = copy.deepcopy(optimizer_state)
+        noise = runner.noise_generator.get_state().clone()
+        gradients, updates, losses, norms = [], [], [], []
+        calls = []
+        hook = distributed.register_forward_hook(lambda *args: calls.append(1))
+        try:
+            forwards = (native, native, distributed, distributed) if diagnostic else (native, distributed)
+            for forward in forwards:
+                network.load_state_dict(weights)
+                # load_state_dict retains CPU Adam step tensors. Each fork must
+                # own its state so the first update cannot advance the next fork.
+                optimizer.load_state_dict(copy.deepcopy(optimizer_state))
+                optimizer.zero_grad(set_to_none=True)
+                runner.noise_generator.set_state(noise)
+                output = forward()
+                loss = output[0] if isinstance(output, tuple) else output
+                if isinstance(output, tuple):
+                    assert output[4].all(), "Parity batch left the valid terrain/reference domain"
+                loss.backward()
+                if forward is native:
+                    # Reference only: the production BPTT path has no manual reducer.
+                    average_gradients(network)
+                else:
+                    for parameter in network.parameters():
+                        if parameter.grad is None:
+                            parameter.grad = torch.zeros_like(parameter)
+                gradients.append([p.grad.detach().cpu().clone() for p in network.parameters()])
+                losses.append(float(loss.detach()))
+                norms.append(float(torch.nn.utils.clip_grad_norm_(network.parameters(), 1.0, error_if_nonfinite=True)))
+                if name == "actor":
+                    torch.nn.utils.clip_grad_value_(network.parameters(), 0.1)
+                optimizer.step()
+                updates.append(cpu_state(network.state_dict()))
+                torch.testing.assert_close(optimizer_state, original_optimizer_state, rtol=0, atol=0)
+                del output, loss
+            if diagnostic:
+                comparisons = {}
+                for label, left, right in (("native_repeat", 0, 1), ("native_ddp", 0, 2), ("ddp_repeat", 2, 3)):
+                    a = torch.cat([value.flatten().double() for value in gradients[left]])
+                    b = torch.cat([value.flatten().double() for value in gradients[right]])
+                    mismatches = {}
+                    for index, (key, _) in enumerate(network.named_parameters()):
+                        difference = (updates[left][key] - updates[right][key]).abs()
+                        bad = difference > 2e-7 + 1e-5 * updates[right][key].abs()
+                        if bad.any():
+                            maximum = int(difference.flatten().argmax())
+                            mismatches[key] = dict(
+                                count=int(bad.sum()),
+                                elements=bad.numel(),
+                                max_update_error=float(difference.flatten()[maximum]),
+                                reference_gradient=float(gradients[left][index].flatten()[maximum]),
+                                actual_gradient=float(gradients[right][index].flatten()[maximum]),
+                                reference_update=float((updates[left][key] - weights[key]).flatten()[maximum]),
+                                actual_update=float((updates[right][key] - weights[key]).flatten()[maximum]),
+                            )
+                    comparisons[label] = dict(
+                        gradient_relative_l2_error=float((a - b).norm() / a.norm().clamp_min(1e-20)),
+                        gradient_cosine=float(torch.nn.functional.cosine_similarity(a, b, dim=0)),
+                        parameter_update_gate_passed=not mismatches,
+                        mismatches=mismatches,
+                    )
+                report[name] = dict(
+                    purpose="Diagnostic only; original acceptance thresholds unchanged",
+                    acceptance_passed=False,
+                    passes=["native", "native", "ddp", "ddp"],
+                    losses=losses,
+                    gradient_norms=norms,
+                    comparisons=comparisons,
+                    optimizer_reference_immutable=True,
+                )
+                torch.save(
+                    dict(
+                        report=report[name],
+                        weights=weights,
+                        optimizer=optimizer_state,
+                        gradients=gradients,
+                        updates=updates,
+                        noise=noise,
+                        data=cpu_state(data),
+                        wm=cpu_state(runner.wm.state_dict()),
+                        value=cpu_state(runner.value.state_dict()),
+                        xi=runner.xi.cpu(),
+                        execution=runner.execution,
+                        learning_rates=runner.learning_rates,
+                    ),
+                    runner.log_root / f"{name}-diagnostic-rank-{runner.rank}.pt",
+                )
+                return
+            reference = torch.cat([value.flatten().double() for value in gradients[0]])
+            actual = torch.cat([value.flatten().double() for value in gradients[1]])
+            relative = float((actual - reference).norm() / reference.norm().clamp_min(1e-20))
+            cosine = float(torch.nn.functional.cosine_similarity(actual, reference, dim=0))
+            assert relative < 1e-4 and cosine > 0.999999, (name, relative, cosine)
+            torch.testing.assert_close(updates[0], updates[1], rtol=1e-5, atol=2e-7)
+            assert losses[0] == losses[1] and len(calls) == 1, (name, losses, calls)
+            for parameter in network.parameters():
+                expected = parameter.detach().clone()
+                dist.broadcast(expected, src=0)
+                torch.testing.assert_close(parameter, expected, rtol=0, atol=0)
+            report[name] = dict(
+                gradient_relative_l2_error=relative,
+                gradient_cosine=cosine,
+                identical_local_loss=True,
+                optimizer_update_close=True,
+                rank_parameters_identical=True,
+                ddp_forward_calls=len(calls),
+                optimizer_reference_immutable=True,
+            )
+        finally:
+            hook.remove()
+            network.load_state_dict(weights)
+            optimizer.load_state_dict(copy.deepcopy(optimizer_state))
+            optimizer.zero_grad(set_to_none=True)
+            runner.noise_generator.set_state(noise)
+
+    # Register hooks on the actual DDP entries, while presenting zero-argument
+    # calls to the comparison so every path receives the same tensors.
+    class Call:
+        def __init__(self, entry, *inputs):
+            self.entry, self.inputs = entry, inputs
+
+        def __call__(self):
+            return self.entry(*self.inputs)
+
+        def register_forward_hook(self, hook):
+            return self.entry.register_forward_hook(hook)
+
+    assert dist.is_initialized() and runner.world in (2, 4)
+    runner.wm_optimizer.zero_grad(set_to_none=True)
+    runner.value_optimizer.zero_grad(set_to_none=True)
+    runner.wm.requires_grad_(False)
+    runner.value.requires_grad_(False)
+    try:
+        compare(
+            "actor",
+            runner.actor,
+            runner.actor_optimizer,
+            lambda: runner.imagine(data),
+            Call(runner.actor_objective, data),
+        )
+        assert all(p.grad is None for module in (runner.wm, runner.value) for p in module.parameters())
+    finally:
+        runner.wm.requires_grad_(True)
+        runner.value.requires_grad_(True)
+    if diagnostic:
+        report["learning_rates"] = runner.learning_rates
+        return report
+    wm_data = runner.sample(runner.options["train_horizon"])
+    compare(
+        "world_model",
+        runner.wm,
+        runner.wm_optimizer,
+        lambda: runner._world_model_loss(wm_data),
+        Call(runner.wm_objective, wm_data),
+    )
+    features, targets, mask = runner.real_critic_data(data)
+    valid = mask.flatten().bool()
+    features, targets = features.flatten(0, 1)[valid], targets.flatten()[valid]
+    batch = max(1, len(targets) // runner.bptt["critic_minibatches"])
+    features, targets = features[:batch], targets[:batch].detach()
+    compare(
+        "critic",
+        runner.value,
+        runner.value_optimizer,
+        lambda: runner.value_loss(features, targets),
+        Call(runner.value_objective, features, targets),
+    )
+    report["learning_rates"] = runner.learning_rates
+    return report
 
 
 def main():
     parser = cli.build_train_parser()
     parser.add_argument("--report-dir", required=True)
     parser.add_argument("--prefill-steps", type=int, default=32)
+    parser.add_argument("--check-ddp-parity", action="store_true")
+    parser.add_argument("--ddp-diagnostic", action="store_true")
     args, overrides = cli.parse_cli(parser, require_run_name=True)
     args.distributed = "LOCAL_RANK" in os.environ
     cfg, agent = cli.resolve_train_cfg(args.task, overrides)
@@ -143,6 +332,15 @@ def main():
         runner.replay.add = replay_add
         report["native_noisy_history_reconstruction_exact"] = True
         data = runner.sample_actor()
+        if args.ddp_diagnostic:
+            report["ddp_diagnostic"] = check_ddp_parity(runner, data, diagnostic=True)
+            (root / f"diagnostic-rank-{runner.rank}.json").write_text(json.dumps(report, indent=2) + "\n")
+            env.close()
+            if dist.is_initialized():
+                dist.destroy_process_group()
+            return
+        if args.check_ddp_parity:
+            report["ddp_parity"] = check_ddp_parity(runner, data)
         # Recorded real exploration must have no effect on imagined actions/objective.
         noise_state = runner.noise_generator.get_state()
         with torch.no_grad():
@@ -306,6 +504,8 @@ def main():
             execution=runner.execution,
             observation_noise_rng_exact_reload=True,
             independent_mlp=True,
+            distributed=runner.distributed,
+            learning_rates=runner.learning_rates,
             invalid_window_capture=True,
             parameters_finite=all(
                 torch.isfinite(p).all().item()

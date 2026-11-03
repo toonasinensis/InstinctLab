@@ -59,6 +59,50 @@ Adam uses lr 1e-5, betas (0.9, 0.95), global gradient norm 1 and elementwise cli
 round. Gamma/lambda are 0.99/0.95. The independent value head starts at zero.
 **FP32 remains in use and WM AMP is disabled.**
 
+Distributed BPTT uses three PyTorch `DistributedDataParallel` training entries:
+the actor's complete H32 objective, supervised WM loss and independent critic
+loss. Only the network being optimized is registered in each entry. Frozen WM
+and critic forwards in the actor objective retain input derivatives without
+registering their parameters in the actor reducer. Raw modules own optimizers
+and checkpoint keys; inference and diagnostic gradient probes use those modules
+directly. Non-reentrant activation recomputation and the existing selective
+compilation boundaries remain unchanged. Normalizer/statistic collectives and
+collective invalid-window rejection are retained. DDP buffer broadcasting is
+disabled because the existing moment updates already synchronize their statistics.
+
+Each rank retains its original local loss mean, including its own valid-sample
+mask. DDP averages these rank gradients equally; this is not a mean weighted by
+the total valid count across ranks. Globally unused parameters receive explicit
+zero gradients after backward to preserve the previous Adam/AdamW moment and
+weight-decay behavior. No manual parameter-gradient reducer remains in BPTT;
+the standalone supervised-WM path retains its existing implementation.
+
+`agent.bptt.lr_scaling=none|sqrt` controls learning rates explicitly. The actor
+and critic settings above and `world_model.learning_rate` are always **base**
+rates. `none` uses those rates; `sqrt` multiplies them once by
+`sqrt(world_size)`. Base/effective rates, scaling mode and world size are recorded
+in contracts and checkpoints. Resume loads effective optimizer rates and checks
+them against the contract; it does not scale them again. No schedule is added.
+For a CLI override, pass `"agent.bptt.lr_scaling='none'"` as one shell argument
+so the inner quotes reach the configuration parser. Bare `none` is parsed as
+Python `None`; omitting the override keeps the configured string default.
+Per-GPU environment and training batch sizes stay fixed when GPU count changes,
+so four GPUs process twice the samples per round of two GPUs. Compare total
+throughput and learning versus samples as well as time per round and actor count.
+The DDP/rate-scaling experiment artifacts belong in
+`InstinctLab-local/bptt-ddp-lr-20261103/`; implementation alone does not establish
+numerical parity, speedup or policy quality.
+
+The 2026-11-03 two/four-GPU runs with `none`/`sqrt` each completed 5000 actual
+actor updates and passed final count, contract and checkpoint checks. The
+original elementwise first-Adam parity gate remained failed; the user explicitly
+approved formal training after the R4 diagnostics without changing that gate.
+Completion does not establish bitwise equivalence or statistical noninferiority:
+each condition used one training seed. The frozen runtime was `f9ea573` plus the
+working-tree overlay recorded in `source-identity.json`; exact hashes and final
+results are in `final-log-provenance.json` and `final-training-summary.json` in
+the artifact directory above.
+
 Optional execution controls live in `agent.bptt_execution`:
 
 - `bf16=True` enables local BF16 autocast in the actor, WM and independent
@@ -207,6 +251,16 @@ heightmap and the terminal H32 state. Each gradient probe uses a fresh forward
 with identical noise; retaining a compiled backward graph conflicts with donated
 buffers in PyTorch 2.11. Finite differences use a separate FP32 eager reference, since BF16
 rounding is not a smooth finite-difference oracle.
+
+`--check-ddp-parity` additionally compares native/manual-averaged gradients and
+one clipped optimizer update against DDP with identical per-rank data, noise
+and effective learning rates for actor, WM and critic. It checks one DDP forward
+for the entire actor horizon and exact cross-rank parameter agreement. The
+standalone `test_pgmt_bptt_distributed.py` torchrun test covers unequal local
+valid counts, rank-dependent unused parameters, globally unused parameters with
+existing optimizer state and repeated non-reentrant checkpoint forwards. Run
+these on the verified computation runtime, followed by actual full-size 2/4-GPU
+acceptance; test weights are never formal training initialization.
 
 Runs record warmup separately, update counts, critic validity, real tracking and
 failure/completion metrics, imagined survival, WM fixed/current holdouts,

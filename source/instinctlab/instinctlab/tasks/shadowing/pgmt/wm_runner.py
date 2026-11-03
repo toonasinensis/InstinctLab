@@ -316,16 +316,22 @@ class SupervisedWMRunner(TerrainRunner):
     def world_model_loss(self, data):
         return self.predict(data, self.options["train_horizon"])[0]
 
+    def world_model_update_loss(self, data):
+        return self._world_model_loss(data)
+
+    def world_model_backward(self, loss):
+        loss.backward()
+        average_gradients(self.wm)
+
     def fit_world_model(self, update_moments=True):
         if update_moments:
             self.update_moments()
         self.wm.train()
         for _ in range(self.options["updates"]):
             data = self.sample(self.options["train_horizon"])
-            loss = self._world_model_loss(data)
+            loss = self.world_model_update_loss(data)
             self.wm_optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            average_gradients(self.wm)
+            self.world_model_backward(loss)
             torch.nn.utils.clip_grad_norm_(self.wm.parameters(), 1.0, error_if_nonfinite=True)
             self.wm_optimizer.step()
             self.wm_updates += 1

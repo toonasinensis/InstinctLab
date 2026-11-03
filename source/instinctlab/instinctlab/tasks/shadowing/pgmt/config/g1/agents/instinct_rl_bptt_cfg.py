@@ -26,6 +26,7 @@ class G1PGMTBPTTRunnerCfg(G1PGMTSupervisedWMRunnerCfg):
         "actor_batch": 4096,
         "actor_lr": 1e-5,
         "critic_lr": 3e-4,
+        "lr_scaling": "none",
         "critic_epochs": 5,
         "critic_minibatches": 4,
         "gamma": 0.99,

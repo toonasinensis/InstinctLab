@@ -10,12 +10,13 @@ from torch.utils.checkpoint import checkpoint
 
 from tensorboardX import SummaryWriter
 
+from .bptt_distributed import backward, distributed_objective, learning_rates
 from .bptt_mdp import BPTTMDP, OBSERVATION_WIDTHS, PROPRIO_WIDTHS, lambda_returns, raw_history
-from .wm_dynamics import average_gradients
 from .wm_runner import SupervisedWMRunner, ordinary
 
 
 def compile_forward(forward):
+    from torch._dynamo import config as dynamo_config
     from torch._functorch import config as functorch_config
 
     compiled = torch.compile(forward, fullgraph=True, options={"triton.cudagraphs": False})
@@ -23,7 +24,12 @@ def compile_forward(forward):
     def call(*args):
         # AOTAutograd captures the backward assumption during the lazy first
         # invocation. All backward calls run outside the network autocast scopes.
-        with functorch_config.patch(backward_pass_autocast="off"):
+        # DDP wraps the native horizon outside these accepted compile regions.
+        # Keep its active-forward context from repartitioning their graphs.
+        with (
+            dynamo_config.patch(optimize_ddp=False),
+            functorch_config.patch(backward_pass_autocast="off"),
+        ):
             return compiled(*args)
 
     return call
@@ -64,6 +70,7 @@ class BPTTRunner(SupervisedWMRunner):
     def __init__(self, env, train_cfg, log_dir=None, device="cpu"):
         super().__init__(env, train_cfg, log_dir, device)
         self.bptt = train_cfg["bptt"]
+        self.bptt.setdefault("lr_scaling", "none")
         if self.bptt["critic_source"] not in ("real", "imagined"):
             raise ValueError("BPTT critic source must be real or imagined")
         horizon = self.bptt["horizon"]
@@ -115,9 +122,25 @@ class BPTTRunner(SupervisedWMRunner):
         for value in self.value.state_dict().values():
             if dist.is_initialized():
                 dist.broadcast(value, src=0)
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=self.bptt["actor_lr"], betas=(0.9, 0.95))
-        self.value_optimizer = torch.optim.Adam(self.value.parameters(), lr=self.bptt["critic_lr"])
+        self.learning_rates = learning_rates(self.bptt, self.options, self.world)
+        rates = self.learning_rates["effective"]
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=rates["actor"], betas=(0.9, 0.95))
+        self.value_optimizer = torch.optim.Adam(self.value.parameters(), lr=rates["critic"])
+        for group in self.wm_optimizer.param_groups:
+            group["lr"] = rates["world_model"]
         self.configure_execution(train_cfg.get("bptt_execution", {}))
+        self.actor_objective = distributed_objective(self.actor, self.actor_loss, self.device)
+        self.wm_objective = distributed_objective(self.wm, self.world_model_training_loss, self.device)
+        self.value_objective = distributed_objective(self.value, self.value_loss, self.device)
+        self.distributed = dict(
+            method="DistributedDataParallel" if dist.is_initialized() else "single_process",
+            objectives=["actor_horizon", "world_model_loss", "value_loss"],
+            broadcast_buffers=False,
+            find_unused_parameters=True,
+            gradient_as_bucket_view=True,
+            loss_reduction="local mean, equal rank average",
+            compile_ddp_optimizer=False,
+        )
         self.actor_updates = self.critic_updates = self.collection_steps = 0
         self.warmup_complete = False
         self.observation, _ = self.env.get_observations()
@@ -134,6 +157,8 @@ class BPTTRunner(SupervisedWMRunner):
                 contract["options"] = self.options
                 contract["bptt_execution"] = self.execution
                 contract["compiled_regions"] = self.compiled_regions
+                contract["distributed"] = self.distributed
+                contract["learning_rates"] = self.learning_rates
                 contract_path.write_text(json.dumps(contract, indent=2) + "\n")
             (self.log_root / f"bptt-rank-{self.rank}-contract.json").write_text(
                 json.dumps(
@@ -156,6 +181,8 @@ class BPTTRunner(SupervisedWMRunner):
                         wm_initialization="checkpoint" if train_cfg.get("wm_checkpoint") else "fresh",
                         execution=self.execution,
                         compiled_regions=self.compiled_regions,
+                        distributed=self.distributed,
+                        learning_rates=self.learning_rates,
                         precision=(
                             "BF16 networks"
                             + (" including heads" if self.execution["bf16_heads"] else ", FP32 output heads")
@@ -202,6 +229,24 @@ class BPTTRunner(SupervisedWMRunner):
             self._rollout_objective = compile_forward(self.rollout_objective)
             self._world_model_loss = compile_forward(self.world_model_loss)
             self._value_forward = compile_forward(self.value.forward)
+
+    def actor_loss(self, data):
+        loss, features, targets, alive, valid, states, actions = self.imagine(data)
+        # Only the scalar objective participates in DDP's output graph. Keep
+        # detached evidence for invalid-window reporting without a second root.
+        return loss, features, targets, alive, valid, [x.detach() for x in states], [x.detach() for x in actions]
+
+    def world_model_training_loss(self, data):
+        return self._world_model_loss(data)
+
+    def world_model_update_loss(self, data):
+        return self.wm_objective(data)
+
+    def world_model_backward(self, loss):
+        backward(loss, self.wm)
+
+    def value_loss(self, features, targets):
+        return (self._value_forward(features) - targets).square().mean()
 
     @torch.inference_mode()
     def collect(self, steps=None):
@@ -522,10 +567,9 @@ class BPTTRunner(SupervisedWMRunner):
         for _ in range(self.bptt["critic_epochs"]):
             order = torch.randperm(len(targets), device=self.device, generator=self.critic_generator)
             for ids in order.tensor_split(self.bptt["critic_minibatches"]):
-                loss = (self._value_forward(features[ids]) - targets[ids]).square().mean()
+                loss = self.value_objective(features[ids], targets[ids])
                 self.value_optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                average_gradients(self.value)
+                backward(loss, self.value)
                 nn.utils.clip_grad_norm_(self.value.parameters(), 1.0, error_if_nonfinite=True)
                 self.value_optimizer.step()
                 self.critic_updates += 1
@@ -541,7 +585,8 @@ class BPTTRunner(SupervisedWMRunner):
         self.value.requires_grad_(False)
         try:
             with torch.set_grad_enabled(actor):
-                loss, features, targets, alive, valid, states, actions = self.imagine(data)
+                objective = self.actor_objective if actor else self.imagine
+                loss, features, targets, alive, valid, states, actions = objective(data)
             bad = (~valid).any().float()
             if dist.is_initialized():
                 dist.all_reduce(bad, op=dist.ReduceOp.MAX)
@@ -568,8 +613,7 @@ class BPTTRunner(SupervisedWMRunner):
                 )
             norm = 0.0
             if actor:
-                loss.backward()
-                average_gradients(self.actor)
+                backward(loss, self.actor)
                 norm = float(nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0, error_if_nonfinite=True))
                 nn.utils.clip_grad_value_(self.actor.parameters(), 0.1)
                 self.actor_optimizer.step()
@@ -640,6 +684,9 @@ class BPTTRunner(SupervisedWMRunner):
                         policy_critic_seconds=updated - fitted,
                         validation_ran=validating,
                         wm_train_loss=self.training_loss,
+                        actor_learning_rate=self.actor_optimizer.param_groups[0]["lr"],
+                        critic_learning_rate=self.value_optimizer.param_groups[0]["lr"],
+                        wm_learning_rate=self.wm_optimizer.param_groups[0]["lr"],
                         **stats,
                         **{key: float(value) for key, value in metrics.items()},
                     )
@@ -706,6 +753,8 @@ class BPTTRunner(SupervisedWMRunner):
                 options=self.bptt,
                 execution=self.execution,
                 compiled_regions=self.compiled_regions,
+                distributed=self.distributed,
+                learning_rates=self.learning_rates,
                 value=self.value.state_dict(),
                 actor_optimizer=self.actor_optimizer.state_dict(),
                 value_optimizer=self.value_optimizer.state_dict(),
@@ -728,8 +777,13 @@ class BPTTRunner(SupervisedWMRunner):
 
     def load(self, path):
         saved = torch.load(path, map_location="cpu", weights_only=True)["bptt"]
-        if saved["schema"] != "pgmt-bptt-v2" or saved["options"] != self.bptt:
+        saved_options = dict(saved["options"])
+        saved_options.setdefault("lr_scaling", "none")
+        if saved["schema"] != "pgmt-bptt-v2" or saved_options != self.bptt:
             raise ValueError("BPTT resume changed critic source or training options")
+        saved_rates = saved.get("learning_rates")
+        if saved_rates != self.learning_rates and not (saved_rates is None and self.bptt["lr_scaling"] == "none"):
+            raise ValueError("BPTT resume changed base/effective learning rates or world size")
         legacy_execution = dict(
             bf16=False,
             compile=False,
@@ -748,6 +802,13 @@ class BPTTRunner(SupervisedWMRunner):
         self.value.load_state_dict(saved["value"])
         self.actor_optimizer.load_state_dict(saved["actor_optimizer"])
         self.value_optimizer.load_state_dict(saved["value_optimizer"])
+        for name, optimizer in (
+            ("actor", self.actor_optimizer),
+            ("critic", self.value_optimizer),
+            ("world_model", self.wm_optimizer),
+        ):
+            if any(group["lr"] != self.learning_rates["effective"][name] for group in optimizer.param_groups):
+                raise ValueError(f"Checkpoint optimizer learning rate differs for {name}")
         for name in ("actor_updates", "critic_updates", "collection_steps", "pretrained_wm_updates", "warmup_complete"):
             setattr(self, name, saved[name])
         self.step_accumulator = saved["step_accumulator"]
