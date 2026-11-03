@@ -71,6 +71,9 @@ class BPTTRunner(SupervisedWMRunner):
         super().__init__(env, train_cfg, log_dir, device)
         self.bptt = train_cfg["bptt"]
         self.bptt.setdefault("lr_scaling", "none")
+        train_collect_steps = self.bptt.setdefault("train_collect_steps", None)
+        if train_collect_steps is not None and (type(train_collect_steps) is not int or train_collect_steps <= 0):
+            raise ValueError("BPTT train_collect_steps must be a positive integer or None")
         if self.bptt["critic_source"] not in ("real", "imagined"):
             raise ValueError("BPTT critic source must be real or imagined")
         horizon = self.bptt["horizon"]
@@ -650,7 +653,7 @@ class BPTTRunner(SupervisedWMRunner):
             for phase, iterations in phases:
                 for iteration in range(iterations):
                     started = time.perf_counter()
-                    metrics = self.collect()
+                    metrics = self.collect(self.bptt["train_collect_steps"] if phase == "train" else None)
                     collected = time.perf_counter()
                     self.fit_world_model()
                     fitted = time.perf_counter()
@@ -779,6 +782,7 @@ class BPTTRunner(SupervisedWMRunner):
         saved = torch.load(path, map_location="cpu", weights_only=True)["bptt"]
         saved_options = dict(saved["options"])
         saved_options.setdefault("lr_scaling", "none")
+        saved_options.setdefault("train_collect_steps", None)
         if saved["schema"] != "pgmt-bptt-v2" or saved_options != self.bptt:
             raise ValueError("BPTT resume changed critic source or training options")
         saved_rates = saved.get("learning_rates")

@@ -39,6 +39,10 @@ class PGMTTerrainEnv(InstinctRlEnv):
                 ),
                 "PGMT/episodes": self.reset_buf.float().sum(),
             }
+            if "initial_time_out" in self.termination_manager.active_terms:
+                self.extras["step"]["PGMT/initial_truncations"] = (
+                    (self.termination_manager.get_term("initial_time_out") & ~self.reset_terminated).float().sum()
+                )
             for key, (raw, effective) in c.reward_errors.items():
                 self.extras["step"]["PGMT/raw/" + key] = raw.mean()
                 self.extras["step"]["PGMT/effective/" + key] = effective.mean()

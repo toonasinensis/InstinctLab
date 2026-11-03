@@ -2,7 +2,31 @@
 
 import torch
 
+from isaaclab.managers import ManagerTermBase
 from isaaclab.utils.math import quat_apply_inverse
+
+
+class InitialTimeOut(ManagerTermBase):
+    """Stagger the first episode without changing its real age or later time limits."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        generator = torch.Generator(device=self.device).manual_seed(env.cfg.seed + 15013)
+        self.limits = torch.randint(
+            1, env.max_episode_length + 1, (self.num_envs,), device=self.device, generator=generator
+        )
+
+    def __call__(self, env):
+        return (self.limits < env.max_episode_length) & (env.episode_length_buf >= self.limits)
+
+    def reset(self, env_ids=None):
+        if env_ids is None:
+            env_ids = slice(None)
+        ids = torch.arange(self.num_envs, device=self.device)[env_ids]
+        # The wrapper and runner both reset before stepping. Preserve the first
+        # deadline across those calls; any actual episode ending consumes it.
+        ids = ids[self._env.episode_length_buf[ids] > 0]
+        self.limits[ids] = self._env.max_episode_length
 
 
 def motion_end(env):

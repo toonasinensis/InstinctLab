@@ -14,14 +14,45 @@ The default remains `imagined`; both modes use the same actor/WM training path.
 `agent.bptt.horizon` remains one recorded length parameter, rather than a set of
 H8/H16/H32 experiment presets.
 
-Use two GPUs with 4096 real environments and actor batch 4096 per GPU. Collection
-alternates 2/3 real control steps per learner round (UTD 0.4). The default run has
+Use two GPUs with 4096 real environments and actor batch 4096 per GPU. Formal
+actor training defaults to 16 real control steps per learner round
+(`agent.bptt.train_collect_steps=16`). Prefill remains 32 steps, and warmup
+alternates 2/3 steps per round (UTD 0.4). The default run has
 5000 actual actor updates, seed 42 and motion `dance1_subject2`. Terrain
 proportions, L0--L9 geometry and highest-level resampling follow the PPO validation
 preset. Nineteen native noncontact reward terms, including their weights and
 control-dt scaling, form the complete imagined objective. There are no contact
 or force WM heads or dynamics inputs. Reference contact labels still determine
 the reference support-height filter used by the real task.
+
+For the collection-rate ablation, set `agent.bptt.train_collect_steps=8|16|24`.
+This overrides collection only during actual actor-training rounds. Prefill and
+the 32 actor-frozen warmup rounds still use the original UTD 0.4 schedule, so
+each case enters actor training after 112 real control steps. `None` retains the
+original 2/3-step schedule throughout. Actor imagination stays H32; changing the
+collection count does not change the imagination horizon or optimizer counts.
+Keep two RTX4090 GPUs, 4096 environments and actor batch 4096 per GPU, seed 42,
+real critic, PPO initialization, fresh WM and all other settings identical.
+At 5000 actor updates, the 8/16/24 cases collect 40112/80112/120112 steps per
+environment; all retain 5032 learner rounds, 50320 WM and 100640 critic updates.
+Compare both equal actor-update and equal real-step budgets, and wall time.
+
+The completed two-GPU 5000-update sweep did not reach the project's stable
+terrain-level6 target in any case. Collect16 had the best overall BPTT quality
+in this single-training-seed sweep, while all cases trailed the fixed PPO2000
+reference overall. On 2026-11-03 the user selected collect16 as the working
+default and deferred terrain-sampling redesign. This choice does not establish
+all-terrain mastery or transfer the real-critic sweep's quality result to the
+default imagined critic, DDP or compiled combinations. Full matched episode
+results and limitations are recorded in the linked experience index.
+
+The user has tested the current terrain/curriculum and uses a mean terrain level
+stable around 6 as the empirical all-terrain mastery criterion. The existing
+BPTT plateau around 5.7--5.8 and observed failures on L9 stairs do not meet that
+criterion. Record time/steps/updates to sustained level 6, retain the full curve,
+and check L9 stair success in fixed evaluations. The idealized mean-level
+resampling calculation does not replace this project-specific empirical check.
+Experiment artifacts belong in `InstinctLab-local/bptt-collect-sweep-20261102/`.
 
 The decision to use H32 and its limits are recorded in the
 [debugging experience index](../../../../../../agents/pgmt/DEBUGGING_NOTES.md).
@@ -43,6 +74,18 @@ The WM uses 2048/2048/2048 Linear/LayerNorm/SiLU layers. By default,
 must have matching width and no contact/force heads; incompatible widths are not
 partially loaded. Simulator episodes, failure sampling and curriculum start
 fresh at L0. Critic architecture and normalization are identical in both modes.
+
+BPTT training staggers the first episode with an independent seeded per-environment
+time limit, uniform from 1 to 500 control steps at the default 10-second limit.
+The separate `initial_time_out` term truncates only that first episode; later
+episodes retain the full limit. It does not change the real episode-step counter,
+reference timestamps or noisy history. Initial truncations bootstrap the pre-reset
+terminal value and stop replay recursion, like other timeouts. They are logged as
+`PGMT/initial_truncations`, not completions, and cannot promote terrain difficulty.
+Failures still take precedence. Repeated startup resets before stepping preserve
+the sampled deadlines. Play presets disable the term; use
+`env.terminations.initial_time_out=null` for the synchronized historical baseline.
+This changes the collection protocol; comparisons must record whether it is enabled.
 
 The replay window covers the maximum of the actor rollout, WM training and WM
 validation lengths: **32 steps with the current defaults**. The configured initial
@@ -181,12 +224,19 @@ actor-horizon sweep. Local `env_id % 8 == 0` is excluded from fitting, WM moment
 and actor/value training.
 
 Without interruption, expected per-rank totals are 5032 learner rows, 5000 actor,
-100640 critic, 50320 new WM updates, 12612 collected vectorized control steps
+100640 critic, 50320 new WM updates, 80112 collected vectorized control steps
 and zero PPO updates when the WM starts fresh. The collection total includes the
-initial 32 steps. The alternating 2/3 cadence and separate RNGs are checkpointed.
+initial 32 steps and 80 warmup steps. With `train_collect_steps=None`, the
+historical 2/3 cadence throughout instead totals 12612 steps. The fractional
+UTD accumulator and separate RNGs are checkpointed.
 A resume starts fresh simulator episodes and refills replay, legitimately adding
 collection steps. It is not bitwise physics continuation. Checkpoint option and
 schema validation still reject mismatched training settings.
+Legacy checkpoints without `train_collect_steps` retain the meaning `None`;
+resume them with an explicit `agent.bptt.train_collect_steps=null`. Loading one
+with the new default 16 is rejected rather than silently changing its schedule.
+Legacy missing `lr_scaling` still means `none`; learning-rate, execution and
+compiled-region compatibility checks remain independent and mandatory.
 
 ## Critic supervision
 

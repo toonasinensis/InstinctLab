@@ -33,6 +33,7 @@ class TerrainRewardsCfg(MultiRewardCfg):
 @configclass
 class TerrainTerminationsCfg:
     time_out = TerminationTermCfg(func=mdp.time_out, time_out=True)
+    initial_time_out: TerminationTermCfg | None = None
     motion_end = TerminationTermCfg(func=done.motion_end, time_out=True)
     tile_exit = TerminationTermCfg(func=done.tile_exit, time_out=True)
     root_height = TerminationTermCfg(func=done.height_failure, params={"threshold": 0.4})
@@ -213,6 +214,7 @@ class G1PGMTTerrainBPTTEnvCfg(G1PGMTTerrainPPONoContactForceEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.observations.policy.enable_corruption = True
+        self.terminations.initial_time_out = TerminationTermCfg(func=done.InitialTimeOut, time_out=True)
         self.run_name = "G1PGMTDance1Subject2BPTT"
 
 
@@ -222,6 +224,7 @@ class G1PGMTTerrainBPTTEnvCfg_PLAY(G1PGMTTerrainBPTTEnvCfg):
         super().__post_init__()
         self.scene.num_envs = 32
         self.commands.motion.enable_terrain_curriculum = False
+        self.terminations.initial_time_out = None
 
 
 @configclass

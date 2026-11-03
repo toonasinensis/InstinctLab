@@ -35,6 +35,7 @@ class G1PGMTBPTTRunnerCfg(G1PGMTSupervisedWMRunnerCfg):
         "warmup_iterations": 32,
         "initial_collect_steps": 32,
         "utd": 0.4,
+        "train_collect_steps": 16,
         "checkpoint_activations": True,
     }
     bptt_execution: dict = {
