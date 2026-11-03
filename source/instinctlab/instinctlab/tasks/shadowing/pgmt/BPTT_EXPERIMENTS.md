@@ -35,6 +35,12 @@ At 5000 actor updates, the 8/16/24 cases collect 40112/80112/120112 steps per
 environment; all retain 5032 learner rounds, 50320 WM and 100640 critic updates.
 Compare both equal actor-update and equal real-step budgets, and wall time.
 
+The completed two-GPU 5000-update sweep did not reach the project's stable
+terrain-level6 target in any case. Collect16 had the best overall BPTT quality
+in this single-training-seed sweep, while all cases trailed the fixed PPO2000
+reference overall. Keep the optional setting and existing default; full matched
+episode results and limitations are recorded in the linked experience index.
+
 The user has tested the current terrain/curriculum and uses a mean terrain level
 stable around 6 as the empirical all-terrain mastery criterion. The existing
 BPTT plateau around 5.7--5.8 and observed failures on L9 stairs do not meet that
