@@ -13,6 +13,26 @@ from .terrain_context import TerrainContext
 from .terrain_math import corrected_planar_velocity
 
 
+def set_newton_terrain_margin(env, env_ids, margin: float):
+    """Set only ground margins once the Newton model and solver exist."""
+    from newton import ModelFlags
+
+    manager = env.sim.backend_manager
+
+    def apply_margin():
+        model = manager.get_model()
+        prefix = env.scene.terrain.cfg.prim_path + "/"
+        shapes = [i for i, label in enumerate(model.shape_label) if label.startswith(prefix)]
+        if not shapes:
+            raise RuntimeError("No Newton terrain shapes found for the contact margin")
+        values = model.shape_margin.numpy()
+        values[shapes] = margin
+        model.shape_margin.assign(values)
+        manager._solver.notify_model_changed(ModelFlags.SHAPE_PROPERTIES)
+
+    manager.register_solver_init_callback(apply_margin)
+
+
 class TerrainMotion(CommandTerm):
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
