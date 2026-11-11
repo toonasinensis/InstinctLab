@@ -8,9 +8,30 @@ from isaaclab.managers import CommandTerm, CommandTermCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_from_euler_xyz, quat_inv, quat_mul, yaw_quat
 
+from .platform_spawn import platform_half_extents, sample_platform_offsets
 from .terrain_contacts import TerrainContacts
 from .terrain_context import TerrainContext
 from .terrain_math import corrected_planar_velocity
+
+
+def set_newton_terrain_margin(env, env_ids, margin: float):
+    """Set only ground margins once the Newton model and solver exist."""
+    from newton import ModelFlags
+
+    manager = env.sim.backend_manager
+
+    def apply_margin():
+        model = manager.get_model()
+        prefix = env.scene.terrain.cfg.prim_path + "/"
+        shapes = [i for i, label in enumerate(model.shape_label) if label.startswith(prefix)]
+        if not shapes:
+            raise RuntimeError("No Newton terrain shapes found for the contact margin")
+        values = model.shape_margin.numpy()
+        values[shapes] = margin
+        model.shape_margin.assign(values)
+        manager._solver.notify_model_changed(ModelFlags.SHAPE_PROPERTIES)
+
+    manager.register_solver_init_callback(apply_margin)
 
 
 class TerrainMotion(CommandTerm):
@@ -52,6 +73,19 @@ class TerrainMotion(CommandTerm):
         self._load_contacts()
         self.terrain = TerrainContext(self)
         self.contacts = TerrainContacts(self)
+        if cfg.randomize_platform_spawn:
+            if env.scene.terrain.cfg.terrain_type != "generator" or cfg.spawn_platform_margin <= 0:
+                raise ValueError("Random platform spawning requires generated terrain and positive edge margin")
+            self.spawn_half_extents = torch.tensor(
+                platform_half_extents(
+                    env.scene.terrain.cfg.terrain_generator,
+                    self.terrain.column_names,
+                    cfg.spawn_center_region_width,
+                ),
+                device=self.device,
+            )
+            self.spawn_offsets = torch.zeros(self.num_envs, 2, device=self.device)
+            self.spawn_lift = torch.zeros(self.num_envs, device=self.device)
         self.sampling_contract = dict(
             motion_files=[Path(path).name for path in self.motion._all_motion_files],
             terrain_columns=self.terrain.column_names,
@@ -61,6 +95,19 @@ class TerrainMotion(CommandTerm):
             enable_terrain_curriculum=cfg.enable_terrain_curriculum,
             terrain_curriculum_version="max_level_resample_v1",
         )
+        self.sampling_contract["platform_spawn"] = dict(
+            enabled=cfg.randomize_platform_spawn,
+            margin=cfg.spawn_platform_margin,
+            center_region_width=cfg.spawn_center_region_width,
+            terrain_size=(
+                list(env.scene.terrain.cfg.terrain_generator.size)
+                if env.scene.terrain.cfg.terrain_type == "generator"
+                else None
+            ),
+        )
+        if cfg.spawn_root_only or cfg.off_platform_half_width != 1.1:
+            self.sampling_contract["platform_spawn"]["root_only"] = cfg.spawn_root_only
+            self.sampling_contract["off_platform_half_width"] = cfg.off_platform_half_width
         print(f"[PGMT] Sampling contract: {self.sampling_contract}")
         for name in ("error_body_pos", "error_joint_pos", "terrain_level", "terrain_gate"):
             self.metrics[name] = torch.zeros(self.num_envs, device=self.device)
@@ -266,6 +313,12 @@ class TerrainMotion(CommandTerm):
                     family == 0
                 )
                 t.update_env_origins(old, success, failed)
+        if self.cfg.randomize_terrain_on_reset:
+            # Sample every terrain column and difficulty independently on each reset.
+            # Account for the previous episode above before changing its assignment.
+            t.terrain_types[ids] = torch.randint(t.terrain_origins.shape[1], (len(ids),), device=self.device)
+            t.terrain_levels[ids] = torch.randint(t.terrain_origins.shape[0], (len(ids),), device=self.device)
+            t.env_origins[ids] = t.terrain_origins[t.terrain_levels[ids], t.terrain_types[ids]]
         if t.cfg.terrain_type == "generator":
             family, level = self.terrain.column_families[t.terrain_types[ids]], t.terrain_levels[ids]
         else:
@@ -293,10 +346,43 @@ class TerrainMotion(CommandTerm):
         # 出生先以地形原点高度为基准，之后由 TerrainContext 查询局部地面并更新参考支撑高度。
         self.terrain.support_z[ids] = self.env.scene.env_origins[ids, 2]
         bottom = self.label_bottom[self.frame_ids[ids]].nan_to_num(nan=0).amin(-1)
+        spawn_lift = (0.075 - bottom).clamp_min(0)
+        if self.cfg.randomize_platform_spawn:
+            relative_xy = self.body_pos_w[ids, :, :2] - self.env.scene.env_origins[ids, None, :2]
+            delta = sample_platform_offsets(
+                relative_xy[:, :0] if self.cfg.spawn_root_only else relative_xy,
+                self.spawn_half_extents[t.terrain_types[ids]],
+                self.cfg.spawn_platform_margin,
+            )
+            self.spawn_offsets[ids] = delta
+            self.offset[ids, :2] += delta
+            body_xy = self.body_pos_w[ids, :, :2]
+            root_xy = self.anchor_pos_w[ids, :2]
+            root_height, _, root_valid = self.terrain.query(root_xy)
+            foot_height, _, foot_valid = self.terrain.query(body_xy[:, self.foot_ids])
+            labels = (
+                self.reference_contacts[ids][:, self.foot_ids] & self.reference_contact_valid[ids][:, self.foot_ids]
+            )
+            support = torch.where(
+                labels.any(-1), (foot_height * labels).sum(-1) / labels.sum(-1).clamp_min(1), root_height
+            )
+            self.terrain.support_z[ids] = support
+            # Probe each body center and a 20 cm square around it. These samples
+            # preserve the old flat-ground clearance while accounting for roughness.
+            margin = self.cfg.spawn_platform_margin
+            offsets = body_xy.new_tensor(
+                [[0, 0], [-margin, -margin], [-margin, margin], [margin, -margin], [margin, margin]]
+            )
+            heights, _, valid = self.terrain.query(body_xy[:, :, None, :] + offsets)
+            if not (root_valid.all() and foot_valid.all() and valid.all()):
+                raise FloatingPointError("Random platform spawn produced an invalid terrain height query")
+            body_bottom = self.label_bottom[self.frame_ids[ids]].nan_to_num(nan=0)
+            spawn_lift = (0.075 + heights.amax(-1) - support[:, None] - body_bottom).amax(-1).clamp_min(0)
+            self.spawn_lift[ids] = spawn_lift
         state_pos = self.anchor_pos_w[ids].clone()
         # 按源帧所有部位的最低碰撞点，仅向上抬高实际机器人，争取相对基准面 7.5 cm 的净空。
         # 此额外出生抬升不写入参考轨迹，也不是对局部地形逐个碰撞点做避障。
-        state_pos[:, 2] += (0.075 - bottom).clamp_min(0)
+        state_pos[:, 2] += spawn_lift
         self.robot.write_root_pose_to_sim(torch.cat((state_pos, self.anchor_quat_w[ids]), -1), env_ids=ids)
         # 根部速度随出生 yaw 旋转；关节位置和速度直接使用所选参考帧。
         self.robot.write_root_velocity_to_sim(
@@ -322,6 +408,12 @@ class TerrainMotionCfg(CommandTermCfg):
     resampling_time_range: tuple = (1e9, 1e9)
     contact_labels_dir: str = ""
     enable_terrain_curriculum: bool = True
+    randomize_terrain_on_reset: bool = False
+    randomize_platform_spawn: bool = False
+    spawn_root_only: bool = False
+    off_platform_half_width: float = 1.1
+    spawn_platform_margin: float = 0.2
+    spawn_center_region_width: float = 2.0
     curriculum_off_platform_steps: int = 50
     motion_uniform_fraction: float = 0.2
     motion_failure_decay: float = 0.99

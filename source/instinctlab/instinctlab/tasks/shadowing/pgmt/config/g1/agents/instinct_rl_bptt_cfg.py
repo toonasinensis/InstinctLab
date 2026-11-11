@@ -9,6 +9,7 @@ from .instinct_rl_wm_cfg import G1PGMTSupervisedWMRunnerCfg
 class G1PGMTBPTTRunnerCfg(G1PGMTSupervisedWMRunnerCfg):
     runner_class_name: str = "instinctlab.tasks.shadowing.pgmt.bptt_runner:BPTTRunner"
     wm_checkpoint: str | None = None
+    foot_contact: dict | None = None
     max_iterations: int = 5000
     world_model: dict = {
         **G1PGMTSupervisedWMRunnerCfg().world_model,
@@ -27,6 +28,7 @@ class G1PGMTBPTTRunnerCfg(G1PGMTSupervisedWMRunnerCfg):
         "actor_lr": 1e-5,
         "critic_lr": 3e-4,
         "lr_scaling": "none",
+        "lr_schedule": None,
         "critic_epochs": 5,
         "critic_minibatches": 4,
         "gamma": 0.99,

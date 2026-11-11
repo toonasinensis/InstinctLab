@@ -10,7 +10,7 @@ from torch.nn import functional as F
 
 
 class HeightField(nn.Module):
-    def __init__(self, heights, origin_xy, resolution):
+    def __init__(self, heights, origin_xy, resolution, scan=None):
         super().__init__()
         if heights.ndim != 2 or min(heights.shape) < 2 or not torch.isfinite(heights).all():
             raise ValueError("Height field must be a finite [y,x] raster with at least two samples per axis")
@@ -22,12 +22,19 @@ class HeightField(nn.Module):
         self.register_buffer("extent", heights.new_tensor([heights.shape[1] - 1, heights.shape[0] - 1]) * resolution)
         # Native GridPatternCfg(ordering="yx") uses meshgrid(x,y,indexing="ij"):
         # X is the slow index. Keep checkpoint ordering, even though raster rows are Y.
+        scan = scan or dict(size=(2.0, 2.0), spacing=0.1, offset=(0.0, 0.0))
+        axes = [
+            torch.linspace(
+                -size / 2, size / 2, round(size / scan["spacing"]) + 1, device=heights.device, dtype=heights.dtype
+            )
+            + offset
+            for size, offset in zip(scan["size"], scan["offset"])
+        ]
         x, y = torch.meshgrid(
-            torch.linspace(-1, 1, 21, device=heights.device, dtype=heights.dtype),
-            torch.linspace(-1, 1, 21, device=heights.device, dtype=heights.dtype),
+            *axes,
             indexing="ij",
         )
-        self.register_buffer("local_xy", torch.stack((x, y), -1).reshape(441, 2))
+        self.register_buffer("local_xy", torch.stack((x, y), -1).reshape(-1, 2))
 
     def query(self, xy):
         coordinates = 2 * (xy - self.origin) / self.extent - 1
@@ -63,12 +70,14 @@ class HeightField(nn.Module):
         counts = ((hi - lo) / resolution).ceil().long() + 1
         x = torch.arange(int(counts[0]), device=lo.device) * resolution + lo[0]
         y = torch.arange(int(counts[1]), device=lo.device) * resolution + lo[1]
-        yy, xx = torch.meshgrid(y, x, indexing="ij")
-        points = torch.stack((xx, yy), -1).reshape(-1, 2)
-        values = []
-        for chunk in points.split(65536):
+        # Bound temporary memory independently of raster resolution (1 cm maps
+        # have 25 times as many samples as 5 cm maps).
+        values = torch.empty(len(y) * len(x), device=lo.device)
+        for begin in range(0, values.numel(), 65536):
+            indices = torch.arange(begin, min(begin + 65536, values.numel()), device=lo.device)
+            chunk = torch.stack((x[indices % len(x)], y[indices // len(x)]), -1)
             height, _, valid = context.query(chunk)
             if not valid.all():
                 raise ValueError("Terrain bake contains ray misses; refusing to invent a floor")
-            values.append(height)
-        return cls(torch.cat(values).reshape(len(y), len(x)), lo, resolution)
+            values[begin : begin + len(indices)] = height
+        return cls(values.reshape(len(y), len(x)), lo, resolution, getattr(context.env.cfg, "height_scan", None))

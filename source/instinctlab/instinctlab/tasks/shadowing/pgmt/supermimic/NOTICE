@@ -1,0 +1,10 @@
+Algorithm organization, CUDA Graph capture, optimizer grouping, gradient clipping,
+and actor-critic learning flow are adapted from HybridRobotics SuperMimic,
+Apache License 2.0; see LICENSE-SuperMimic.
+Reference: /home/thl/Desktop/实验/supermimic, commit
+5efbf114e11f725c31d83e217be987c13c0e4ce2.
+
+PGMT-specific modifications: named state layout, terrain-aware dynamics,
+terminal-inclusive replay, reference placement/support recursion, contact BCE,
+contact and analytic foot rewards, device Muon LR scheduling, passive actor EMA,
+configurable compilation, and existing PGMT logging semantics.

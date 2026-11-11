@@ -1,0 +1,3 @@
+CapturedUpdate and graph_state in learner_utils.py are adapted from HybridRobotics SuperMimic, src/supermimic/learners/learner_utils.py (Apache-2.0).
+Local reference: /home/thl/Desktop/实验/supermimic.
+PGMT adaptations separate world-model and policy learners, preserve the PGMT MDP and rewards, support variable tensor learning rates for Muon, and validate captured state identities.

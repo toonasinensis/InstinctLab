@@ -7,17 +7,10 @@ The BPTT task uses only the 19 analytic terms, without contact/force events.
 import torch
 import xml.etree.ElementTree as ET
 
-from isaaclab.utils.math import (
-    matrix_from_quat,
-    quat_apply,
-    quat_apply_inverse,
-    quat_from_euler_xyz,
-    quat_inv,
-    quat_mul,
-    yaw_quat,
-)
+from isaaclab.utils.math import matrix_from_quat, quat_from_euler_xyz, quat_inv, quat_mul, yaw_quat
 
 from .mdp.terrain_math import corrected_planar_velocity, tangent_velocity, tolerance_error
+from .tensor_math import cross, quat_apply, quat_apply_inverse
 from .wm_dynamics import rotation_increment
 
 
@@ -81,7 +74,7 @@ class RobotKinematics:
         # Native state pairs a link-origin position with a COM linear velocity.
         if velocities:
             root_offset = (rotations[0] @ root_com[..., None]).squeeze(-1)
-            linear = [state[:, 7:10] - torch.cross(state[:, 10:13], root_offset, dim=-1)]
+            linear = [state[:, 7:10] - cross(state[:, 10:13], root_offset, dim=-1)]
             angular = [state[:, 10:13]]
         q, qd = state[:, 13:42], state[:, 42:71]
         for index in range(1, len(self.names)):
@@ -90,7 +83,7 @@ class RobotKinematics:
             position = positions[parent] + offset
             rotation = rotations[parent] @ self.rotation[index]
             if velocities:
-                velocity = linear[parent] + torch.cross(angular[parent], offset, dim=-1)
+                velocity = linear[parent] + cross(angular[parent], offset, dim=-1)
                 spin = angular[parent]
             if joint >= 0:
                 if velocities:
@@ -114,7 +107,7 @@ class RobotKinematics:
             for values in (positions, rotations, linear, angular)
         )
         com_offset = (rotation @ tracked_com[..., None]).squeeze(-1)
-        return position, rotation, velocity + torch.cross(spin, com_offset, dim=-1), spin
+        return position, rotation, velocity + cross(spin, com_offset, dim=-1), spin
 
 
 def rotation_error(left, right):
@@ -152,6 +145,15 @@ class AnalyticRewards:
         self.env, self.heightfield = env, heightfield
         self.command = c = env.command_manager.get_term("motion")
         self.dt = env.step_dt
+        self.foot_ids = torch.tensor(c.foot_ids, device=env.device)
+        self.upper_ids = torch.tensor(c.upper_ids, device=env.device)
+        self.lower_ids = torch.tensor(c.lower_ids, device=env.device)
+        self.upper_joint_ids = torch.tensor(c.upper_joint_ids, device=env.device)
+        self.lower_joint_ids = torch.tensor(c.lower_joint_ids, device=env.device)
+        self.support_blend = 1 - torch.exp(torch.tensor(-self.dt / c.cfg.support_filter_seconds, device=env.device))
+        self.surface_offsets = torch.tensor([[0, 0], [-0.08, 0], [0.08, 0], [0, -0.04], [0, 0.04]], device=env.device)
+        eps = heightfield.resolution
+        self.surface_differences = torch.tensor([[eps, 0], [-eps, 0], [0, eps], [0, -eps]], device=env.device)
         robot = env.scene["robot"]
         self.kinematics = RobotKinematics(
             c.reference.cfg.robot_model_path, robot.joint_names, c.reference.cfg.link_of_interests, env.device
@@ -230,15 +232,15 @@ class AnalyticRewards:
         return self.kinematics.forward(state, self.root_com[ids], self.body_com[ids])
 
     def support(self, state, previous, context, bodies):
-        return self.support_from_feet(state, previous, context, bodies[0][:, self.command.foot_ids, :2])
+        return self.support_from_feet(state, previous, context, bodies[0][:, self.foot_ids, :2])
 
     def support_from_feet(self, state, previous, context, feet_xy):
         c = self.command
         h, valid = self.heightfield.query(feet_xy)
         root, root_valid = self.heightfield.query(state[:, :2])
-        labels = context["ref_contact"][:, c.foot_ids] * context["ref_valid"][:, c.foot_ids]
+        labels = context["ref_contact"][:, self.foot_ids] * context["ref_valid"][:, self.foot_ids]
         target = torch.where(labels.sum(-1) > 0, (h * labels).sum(-1) / labels.sum(-1).clamp_min(1), root)
-        blend = 1 - torch.exp(state.new_tensor(-self.dt / c.cfg.support_filter_seconds))
+        blend = self.support_blend
         return previous.lerp(target, blend), valid.all(-1) & root_valid
 
     def support_from_state(self, state, previous, context, ids):
@@ -248,13 +250,13 @@ class AnalyticRewards:
         return self.support_from_feet(state, previous, context, feet[..., :2])
 
     def surface(self, xy, exact=False):
-        offsets = xy.new_tensor([[0, 0], [-0.08, 0], [0.08, 0], [0, -0.04], [0, 0.04]])
+        offsets = self.surface_offsets
         if exact:
             _, normal, valid = self.command.terrain.query(xy)
             h, _, valid_h = self.command.terrain.query(xy[..., None, :] + offsets)
         else:
             eps = self.heightfield.resolution
-            d = xy.new_tensor([[eps, 0], [-eps, 0], [0, eps], [0, -eps]])
+            d = self.surface_differences
             hn, vn = self.heightfield.query(xy[..., None, :] + d)
             normal = torch.stack(
                 (
@@ -311,8 +313,8 @@ class AnalyticRewards:
         )
         terms = {}
         for group, bodies, joints in (
-            ("upper", c.upper_ids, c.upper_joint_ids),
-            ("lower", c.lower_ids, c.lower_joint_ids),
+            ("upper", self.upper_ids, self.upper_joint_ids),
+            ("lower", self.lower_ids, self.lower_joint_ids),
         ):
             for name, error in errors.items():
                 error = error[:, joints if name.startswith("joint_") else bodies]

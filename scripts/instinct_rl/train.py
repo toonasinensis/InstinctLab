@@ -87,7 +87,8 @@ def main():
             print(f"[INFO] Resuming experiment from checkpoint: {resume_path}")
         log_dir = os.path.join(
             log_root_path,
-            cli.train_log_dir_name(getattr(env_cfg, "run_name", None), agent_cfg.run_name, resume_path),
+            args_cli.log_dir_name
+            or cli.train_log_dir_name(getattr(env_cfg, "run_name", None), agent_cfg.run_name, resume_path),
         )
 
         env_cfg.log_dir = log_dir

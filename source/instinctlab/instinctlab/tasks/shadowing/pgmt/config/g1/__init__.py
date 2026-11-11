@@ -60,3 +60,46 @@ register_backend_tasks(
     entry_point="instinctlab.tasks.shadowing.pgmt.terrain_env:PGMTTerrainEnv",
     instinct_rl_cfg_entry_point=f"{agents.__name__}.instinct_rl_bptt_cfg:G1PGMTBPTTRunnerCfg",
 )
+
+
+register_backend_tasks(
+    "Instinct-PGMT-GlimpseSM-G1",
+    env_cfg_entry_point=f"{task_entry}.pgmt_glimpse_cfg:G1PGMTGlimpseSMEnvCfg",
+    play_env_cfg_entry_point=f"{task_entry}.pgmt_glimpse_cfg:G1PGMTGlimpseSMEnvCfg",
+    entry_point="instinctlab.tasks.shadowing.pgmt.terrain_env:PGMTTerrainEnv",
+    instinct_rl_cfg_entry_point=f"{agents.__name__}.instinct_rl_glimpse_cfg:G1PGMTGlimpseSMRunnerCfg",
+)
+
+register_backend_tasks(
+    "Instinct-PGMT-CNNWarmup-G1",
+    env_cfg_entry_point=f"{task_entry}.pgmt_cnn_warmup_cfg:G1PGMTCNNWarmupEnvCfg",
+    play_env_cfg_entry_point=f"{task_entry}.pgmt_cnn_warmup_cfg:G1PGMTCNNWarmupEnvCfg",
+    entry_point="instinctlab.tasks.shadowing.pgmt.terrain_env:PGMTTerrainEnv",
+    instinct_rl_cfg_entry_point=f"{task_entry}.pgmt_cnn_warmup_cfg:G1PGMTCNNWarmupRunnerCfg",
+)
+
+register_backend_tasks(
+    "Instinct-PGMT-Scan187-G1",
+    env_cfg_entry_point=f"{task_entry}.pgmt_scan187_cfg:G1PGMTScan187EnvCfg",
+    play_env_cfg_entry_point=f"{task_entry}.pgmt_scan187_cfg:G1PGMTScan187EnvCfg",
+    entry_point="instinctlab.tasks.shadowing.pgmt.terrain_env:PGMTTerrainEnv",
+    instinct_rl_cfg_entry_point=f"{task_entry}.pgmt_scan187_cfg:G1PGMTScan187RunnerCfg",
+)
+
+for suffix, agent_class in (("", "G1PGMTSuperMimicCfg"), ("Baseline", "G1PGMTSuperMimicBaselineCfg")):
+    register_backend_tasks(
+        f"Instinct-PGMT-SuperMimic{suffix}-G1",
+        env_cfg_entry_point=f"{task_entry}.pgmt_scan187_cfg:G1PGMTScan187EnvCfg",
+        play_env_cfg_entry_point=f"{task_entry}.pgmt_scan187_cfg:G1PGMTScan187EnvCfg",
+        entry_point="instinctlab.tasks.shadowing.pgmt.terrain_env:PGMTTerrainEnv",
+        instinct_rl_cfg_entry_point=f"{task_entry}.pgmt_supermimic_cfg:{agent_class}",
+    )
+
+
+register_backend_tasks(
+    "Instinct-PGMT-SuperMimicTF-G1",
+    env_cfg_entry_point=f"{task_entry}.pgmt_supermimic_cfg:G1PGMTSuperMimicTFEnvCfg",
+    play_env_cfg_entry_point=f"{task_entry}.pgmt_supermimic_cfg:G1PGMTSuperMimicTFEnvCfg",
+    entry_point="instinctlab.tasks.shadowing.pgmt.terrain_env:PGMTTerrainEnv",
+    instinct_rl_cfg_entry_point=f"{task_entry}.pgmt_supermimic_cfg:G1PGMTSuperMimicTFCfg",
+)

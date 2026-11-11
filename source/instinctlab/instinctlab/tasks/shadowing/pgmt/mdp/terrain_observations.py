@@ -37,3 +37,19 @@ def critic_state(env):
     state[:, 68:71] = quat_apply_inverse(c.robot_anchor_quat_w, c.anchor_pos_w - c.robot_anchor_pos_w)
     state[:, 71:77] = matrix_from_quat(quat_mul(quat_inv(c.robot_anchor_quat_w), c.anchor_quat_w))[..., :2].flatten(1)
     return state
+
+
+def bilinear_elevation(env):
+    """Query the same immutable 5 cm terrain used by imagined observations."""
+    from ..heightfield import HeightField
+    from ..wm_dynamics import yaw_angle
+
+    if not hasattr(env, "pgmt_heightfield"):
+        env.pgmt_heightfield = HeightField.from_context(
+            env.command_manager.get_term("motion").terrain, getattr(env.cfg, "heightfield_resolution", 0.05)
+        )
+    robot = env.scene["robot"].data
+    heights, valid = env.pgmt_heightfield.local(robot.root_pos_w.torch, yaw_angle(robot.root_quat_w.torch))
+    if not valid.all():
+        raise ValueError("Real heightscan left the terrain height field")
+    return heights

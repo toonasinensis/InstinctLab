@@ -1,6 +1,5 @@
 """PPO policy updates plus an independent, supervised Scheme A world model."""
 
-import hashlib
 import json
 import time
 import torch
@@ -15,7 +14,7 @@ from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_mul
 
 from .heightfield import HeightField
 from .terrain_runner import TerrainRunner
-from .wm_dynamics import TerrainDynamics, average_gradients, rotation_increment, yaw_angle
+from .wm_dynamics import TerrainDynamics, average_gradients, rotation_increment, state_delta, yaw_angle
 from .wm_replay import WMReplay
 from .wm_rewards import AnalyticRewards
 
@@ -58,8 +57,12 @@ class SupervisedWMRunner(TerrainRunner):
         # WM initialization/sampling must not consume the policy/reset RNG stream.
         with torch.random.fork_rng(devices=[self.device]):
             torch.manual_seed(train_cfg["seed"] + 1741)
-            self.heightfield = HeightField.from_context(
-                self.native.command_manager.get_term("motion").terrain, self.options["resolution"]
+            self.heightfield = (
+                self.native.pgmt_heightfield
+                if hasattr(self.native, "pgmt_heightfield")
+                else HeightField.from_context(
+                    self.native.command_manager.get_term("motion").terrain, self.options["resolution"]
+                )
             ).to(self.device)
             self.rewards = AnalyticRewards(self.native, self.heightfield)
             c = self.rewards.command
@@ -93,8 +96,19 @@ class SupervisedWMRunner(TerrainRunner):
                 self.options["amp"],
                 self.options["predict_contact"],
                 self.options["predict_force"],
+                contact_indices=c.foot_ids if self.options.get("feet_only") else None,
+                scan_points=len(self.heightfield.local_xy),
+                ground_query=self.heightfield.query if getattr(self.native.cfg, "height_scan", None) else None,
+                structured=self.options.get("structured", False),
+                root_com=self.rewards.root_com[0],
+                dt=self.native.step_dt,
+                prediction_mode=self.options.get("prediction_mode", "delta"),
             ).to(self.device)
-        self.terrain_digest = hashlib.sha256(self.heightfield.heights.cpu().numpy().tobytes()).hexdigest()
+        self.terrain_raster = dict(
+            shape=list(self.heightfield.heights.shape),
+            origin=self.heightfield.origin.tolist(),
+            resolution=self.heightfield.resolution,
+        )
         self.wm_optimizer = torch.optim.AdamW(self.wm.parameters(), lr=self.options["learning_rate"], weight_decay=1e-5)
         self.generator = torch.Generator(device=self.device).manual_seed(train_cfg["seed"] + 2909)
         self.replay = WMReplay(capacity)
@@ -155,7 +169,7 @@ class SupervisedWMRunner(TerrainRunner):
                         state="p3, quaternion_xyzw4, world_COM_v3, world_w3, q29, qd29",
                         context_width=self.xi.shape[-1],
                         context_modes=self.context_modes,
-                        terrain_sha256=self.terrain_digest,
+                        terrain_raster=self.terrain_raster,
                         actor_update="PPO only; detached WM data",
                         holdout="local env_id % 8 == 0; excluded from fitting AND WM moments",
                         resume="optimizer continuation, fresh simulator episodes and replay",
@@ -242,7 +256,7 @@ class SupervisedWMRunner(TerrainRunner):
         ids = torch.arange(self.env.num_envs, device=self.device)
         ids = ids[ids % 8 != 0]
         # Bound the heightmap temporary allocation at 4096 environments/GPU.
-        inputs, deltas, forces = [], [], []
+        inputs, deltas, forces, increments = [], [], [], []
         rows = self.replay.rows(
             torch.arange(len(self.replay) - self.replay.added, len(self.replay), device=self.device)
         )
@@ -258,11 +272,15 @@ class SupervisedWMRunner(TerrainRunner):
                 )[valid]
             )
             deltas.append(self.wm.target(data["state"], data["next_state"])[valid])
+            if self.wm.error_norm is not None:
+                increments.append(state_delta(data["state"], data["next_state"])[valid])
             if self.wm.predict_force:
                 rotation = data["next_state"][:, None, 3:7].expand(-1, 14, -1)
                 forces.append(quat_apply_inverse(rotation, data["next_force"]).flatten(1)[valid])
         self.wm.input_norm.update(torch.cat(inputs))
         self.wm.delta_norm.update(torch.cat(deltas))
+        if self.wm.error_norm is not None:
+            self.wm.error_norm.update(torch.cat(increments))
         if self.wm.predict_force:
             self.wm.force_norm.update(torch.cat(forces))
         self.replay.added = 0
@@ -272,7 +290,10 @@ class SupervisedWMRunner(TerrainRunner):
         contact = data["contact"][:, 0] if self.wm.predict_contact else None
         states, contacts, forces, errors, losses, masks = [], [], [], [], [], []
         valid_prefix = torch.ones(len(state), device=self.device)
-        scale = torch.maximum(self.wm.delta_norm.std(), self.wm.error_floor)
+        error_norm = self.wm.delta_norm if self.wm.error_norm is None else self.wm.error_norm
+        scale = torch.maximum(error_norm.std(), self.wm.error_floor)
+        if self.options.get("loss_scale", "running") == "bryson":
+            scale = self.wm.nominal_error
         for step in range(horizon):
             heights, valid = self.heightfield.local(state[:, :3], yaw_angle(state[:, 3:7]))
             state, logits, force = self.wm(
@@ -288,7 +309,7 @@ class SupervisedWMRunner(TerrainRunner):
             loss = (error / scale).square().mean(-1)
             if self.wm.predict_contact:
                 loss = loss + 0.1 * F.binary_cross_entropy_with_logits(
-                    logits, data["next_contact"][:, step], reduction="none"
+                    logits, self.contact_target(data["next_contact"][:, step]), reduction="none"
                 ).mean(-1)
                 contacts.append(contact)
             if self.wm.predict_force:
@@ -312,6 +333,10 @@ class SupervisedWMRunner(TerrainRunner):
             torch.stack(forces, 1) if forces else None,
             torch.stack(losses, 1),
         )
+
+    def contact_target(self, contact):
+        indices = self.wm.contact_indices
+        return contact if indices is None else contact[..., indices]
 
     def world_model_loss(self, data):
         return self.predict(data, self.options["train_horizon"])[0]
@@ -423,7 +448,7 @@ class SupervisedWMRunner(TerrainRunner):
         previous = states[:, -2] if h > 1 else data["state"][:, 0]
         context = {key[4:]: value[:, h - 1] for key, value in data.items() if key.startswith("ref_")}
         contact, previous_contact = None, None
-        if contacts is not None:
+        if contacts is not None and self.wm.contact_indices is None:
             contact = (contacts[:, -1] > 0.5).float()
             previous_contact = (contacts[:, -2] > 0.5).float() if h > 1 else data["contact"][:, 0]
         force = (
@@ -470,17 +495,20 @@ class SupervisedWMRunner(TerrainRunner):
         metrics[prefix + "/reward_native_abs_mean"] = self.reduce_mean(target.sum(-1).abs(), weight)
         if contacts is not None:
             metrics[prefix + "/contact_brier"] = self.reduce_mean(
-                (contacts[:, -1] - data["next_contact"][:, h - 1]).square().mean(-1), weight
+                (contacts[:, -1] - self.contact_target(data["next_contact"][:, h - 1])).square().mean(-1), weight
             )
-            feet = self.rewards.command.foot_ids
+            feet = self.rewards.command.foot_ids if self.wm.contact_indices is None else [0, 1]
             pc = (contacts[:, -1, feet] > 0.5).float()
-            rc = data["next_contact"][:, h - 1, feet]
+            rc = data["next_contact"][:, h - 1, self.rewards.command.foot_ids]
             tp = self.reduce_mean((pc * rc).sum(-1), weight)
             pp = self.reduce_mean(pc.sum(-1), weight)
             rp = self.reduce_mean(rc.sum(-1), weight)
             metrics[prefix + "/foot_contact_f1"] = 2 * tp / max(pp + rp, 1e-8)
             metrics[prefix + "/contact_accuracy"] = self.reduce_mean(
-                ((contacts[:, -1] > 0.5) == data["next_contact"][:, h - 1].bool()).float().mean(-1), weight
+                ((contacts[:, -1] > 0.5) == self.contact_target(data["next_contact"][:, h - 1]).bool())
+                .float()
+                .mean(-1),
+                weight,
             )
         if forces is not None:
             metrics[prefix + "/force_rmse_N"] = (
@@ -532,7 +560,7 @@ class SupervisedWMRunner(TerrainRunner):
     def save(self, path, infos=None):
         # TerrainRunner performs collective rank-state capture and atomic base save.
         base_path = str(path) + ".ppo"
-        local = dict(sampling_rng=self.generator.get_state().cpu(), terrain_sha256=self.terrain_digest)
+        local = dict(sampling_rng=self.generator.get_state().cpu(), terrain_raster=self.terrain_raster)
         ranks = [None] * dist.get_world_size() if dist.is_initialized() else [local]
         if dist.is_initialized():
             dist.all_gather_object(ranks, local)
@@ -571,7 +599,9 @@ class SupervisedWMRunner(TerrainRunner):
         ]
         if len(saved["ranks"]) != world:
             changed.append("rank count")
-        elif saved["ranks"][rank]["terrain_sha256"] != self.terrain_digest:
+        elif saved["ranks"][rank].get("terrain_raster") != self.terrain_raster and not self.cfg.get(
+            "resume_terrain_change", False
+        ):
             changed.append(f"rank{rank} terrain raster")
         # Reject collectively: another rank must not enter TerrainRunner's
         # reset/normalizer collectives while this rank throws a local exception.

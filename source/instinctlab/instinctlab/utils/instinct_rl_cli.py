@@ -160,6 +160,9 @@ def build_train_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--logroot", type=str, default=None, help="Override the default log root, typically logs/instinct_rl/."
     )
+    parser.add_argument(
+        "--log_dir_name", type=str, default=None, help="Explicit experiment directory name under logroot."
+    )
     parser.add_argument("--max_iterations", type=int, default=None, help="RL policy training iterations.")
     parser.add_argument("--distributed", action="store_true", default=False, help="Run distributed training.")
     parser.add_argument("--local-rank", type=int, help="Local rank assigned by the distributed launcher.")

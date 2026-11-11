@@ -3,7 +3,7 @@
 import os
 
 import isaaclab.envs.mdp as mdp
-from isaaclab.managers import ObservationTermCfg, RewardTermCfg, TerminationTermCfg
+from isaaclab.managers import EventTermCfg, ObservationTermCfg, RewardTermCfg, TerminationTermCfg
 from isaaclab.sensors import RayCasterCfg, patterns
 from isaaclab.utils import configclass
 
@@ -11,8 +11,13 @@ from instinctlab.managers import MultiRewardCfg
 from instinctlab.tasks.shadowing.pgmt.mdp import terrain_observations as obs
 from instinctlab.tasks.shadowing.pgmt.mdp import terrain_rewards as rew
 from instinctlab.tasks.shadowing.pgmt.mdp import terrain_terminations as done
-from instinctlab.tasks.shadowing.pgmt.mdp.terrain_commands import TerrainMotionCfg, reset_on_terrain
+from instinctlab.tasks.shadowing.pgmt.mdp.terrain_commands import (
+    TerrainMotionCfg,
+    reset_on_terrain,
+    set_newton_terrain_margin,
+)
 from instinctlab.tasks.shadowing.pgmt.terrain_cfg import make_pgmt_terrain_cfg
+from instinctlab.tasks.utils.backends import backend_preset
 
 from .pgmt_shadowing_cfg import MOTION_FOLDER, G1PGMTShadowingEnvCfg
 
@@ -49,6 +54,11 @@ class G1PGMTTerrainEnvCfg(G1PGMTShadowingEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         if not self.flat_precheck:
+            # Ground 9 mm + robot 1 mm; retain the original robot self-collision margins.
+            self.events.terrain_contact_margin = backend_preset(
+                None,
+                newton=EventTermCfg(func=set_newton_terrain_margin, mode="prestartup", params={"margin": 0.009}),
+            )
             self.scene.terrain.terrain_type = "generator"
             self.scene.terrain.terrain_generator = make_pgmt_terrain_cfg()
             self.scene.terrain.max_init_terrain_level = 0

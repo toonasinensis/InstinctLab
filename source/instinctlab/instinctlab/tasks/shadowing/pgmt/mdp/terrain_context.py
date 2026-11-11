@@ -73,6 +73,10 @@ class TerrainContext:
     def update(self, reset_ids=None):
         c, env = self.command, self.env
         xy = c.robot_anchor_pos_w[:, :2]
+        if reset_ids is not None:
+            # Root caches can still contain the preceding episode during a reset.
+            xy = xy.clone()
+            xy[reset_ids] = c.anchor_pos_w[reset_ids, :2]
         terrain = env.scene.terrain
         if terrain.cfg.terrain_type == "generator":
             origins = terrain.terrain_origins
@@ -85,7 +89,7 @@ class TerrainContext:
             self.level.copy_(ij[:, 0].clamp(0, 9))
             assigned = torch.stack((terrain.terrain_levels, terrain.terrain_types), -1)
             self.outside.copy_(~inside | (ij != assigned).any(-1))
-            away = (xy - env.scene.env_origins[:, :2]).abs().amax(-1) > 1.1
+            away = (xy - env.scene.env_origins[:, :2]).abs().amax(-1) > c.cfg.off_platform_half_width
             self.off_platform_steps += away
         feet = c.robot_body_pos_w[:, c.foot_ids]
         if reset_ids is not None:

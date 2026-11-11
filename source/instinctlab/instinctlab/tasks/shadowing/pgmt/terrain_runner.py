@@ -3,9 +3,11 @@
 import os
 import torch
 import torch.distributed as dist
+from pathlib import Path
 
 from instinct_rl.modules.normalizer import EmpiricalNormalization
 from instinct_rl.runners import OnPolicyRunner
+from tensorboardX import SummaryWriter
 
 from .terrain_ppo import TerrainPPO
 
@@ -39,6 +41,11 @@ class TerrainRunner(OnPolicyRunner):
         self.source_checkpoint = None
         if train_cfg.get("warm_start"):
             self.warm_start(train_cfg["warm_start"])
+
+    def learn(self, num_learning_iterations, init_at_random_ep_len=False):
+        if self.log_dir is not None and self.writer is None and not self.is_mp_rank_other_process():
+            self.writer = SummaryWriter(str(Path(self.log_dir) / "tensorboard"), flush_secs=10)
+        return super().learn(num_learning_iterations, init_at_random_ep_len)
 
     def warm_start(self, path):
         saved = torch.load(path, map_location=self.device, weights_only=True)
@@ -141,7 +148,18 @@ class TerrainRunner(OnPolicyRunner):
             or info["terrain_gate_ramp"] != self.cfg.get("terrain_gate_ramp", 200)
         ):
             raise ValueError("Terrain resume changed schema, rank count, environment count or gate ramp")
-        if "sampling_contract" in info and info["sampling_contract"] != c.sampling_contract:
+        previous_sampling = dict(info.get("sampling_contract", c.sampling_contract))
+        current_sampling = dict(c.sampling_contract)
+        if self.cfg.get("resume_terrain_change", False):
+            for contract in (previous_sampling, current_sampling):
+                contract.pop("platform_spawn", None)
+                contract.pop("off_platform_half_width", None)
+            print(
+                "[RESUME] Explicit terrain transfer: platform geometry/spawn/exit threshold changed; "
+                "models, optimizers, learning-rate clock and live level assignments retained",
+                flush=True,
+            )
+        if previous_sampling != current_sampling:
             raise ValueError(
                 "Terrain resume changed motion selection, terrain columns or sampling settings; start a new run"
             )

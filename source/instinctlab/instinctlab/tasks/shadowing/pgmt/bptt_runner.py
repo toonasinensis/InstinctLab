@@ -10,16 +10,16 @@ from torch.utils.checkpoint import checkpoint
 
 from tensorboardX import SummaryWriter
 
-from .bptt_distributed import backward, distributed_objective, learning_rates
+from .bptt_distributed import backward, distributed_objective, learning_rates, scheduled_learning_rates
 from .bptt_mdp import BPTTMDP, OBSERVATION_WIDTHS, PROPRIO_WIDTHS, lambda_returns, raw_history
 from .wm_runner import SupervisedWMRunner, ordinary
 
 
-def compile_forward(forward):
+def compile_forward(forward, *, dynamic=None):
     from torch._dynamo import config as dynamo_config
     from torch._functorch import config as functorch_config
 
-    compiled = torch.compile(forward, fullgraph=True, options={"triton.cudagraphs": False})
+    compiled = torch.compile(forward, fullgraph=True, dynamic=dynamic, options={"triton.cudagraphs": False})
 
     def call(*args):
         # AOTAutograd captures the backward assumption during the lazy first
@@ -71,6 +71,7 @@ class BPTTRunner(SupervisedWMRunner):
         super().__init__(env, train_cfg, log_dir, device)
         self.bptt = train_cfg["bptt"]
         self.bptt.setdefault("lr_scaling", "none")
+        self.bptt.setdefault("lr_schedule", None)
         train_collect_steps = self.bptt.setdefault("train_collect_steps", None)
         if train_collect_steps is not None and (type(train_collect_steps) is not int or train_collect_steps <= 0):
             raise ValueError("BPTT train_collect_steps must be a positive integer or None")
@@ -80,12 +81,18 @@ class BPTTRunner(SupervisedWMRunner):
         if not isinstance(horizon, int) or not 1 <= horizon <= self.replay.capacity:
             raise ValueError("BPTT horizon must be a positive integer within replay capacity")
         self.replay_horizon = max(horizon, self.options["train_horizon"], *self.options["validation_horizons"])
-        if self.wm.predict_contact or self.wm.predict_force or len(self.rewards.terms) != 19:
+        if (
+            self.wm.predict_force
+            or len(self.rewards.terms) != 19
+            or (self.wm.predict_contact and not self.options.get("feet_only"))
+        ):
             raise ValueError("BPTT requires exactly 19 noncontact rewards and no contact or force heads")
         if not self.native.cfg.observations.policy.enable_corruption:
             raise ValueError("BPTT requires real and imagined policy observation noise")
-        if not train_cfg.get("ppo_checkpoint"):
-            raise ValueError("Choose an explicit PPO actor initialization source")
+        if not (
+            train_cfg.get("ppo_checkpoint") or train_cfg.get("warm_start") or train_cfg.get("random_initialization")
+        ):
+            raise ValueError("Choose an explicit terrain PPO or stage-one actor initialization source")
         self.pretrained_wm_updates = 0
         if train_cfg.get("wm_checkpoint"):
             saved = torch.load(train_cfg["wm_checkpoint"], map_location=self.device, weights_only=True)["supervised_wm"]
@@ -118,7 +125,7 @@ class BPTTRunner(SupervisedWMRunner):
         self.step_accumulator = 0.0
         if self.bptt["utd"] <= 0 or self.bptt["initial_collect_steps"] < self.replay_horizon:
             raise ValueError(f"BPTT requires positive UTD and at least {self.replay_horizon} initial replay steps")
-        width = 2119 + 68 + self.xi.shape[-1] + 8
+        width = int(self.alg.actor_critic.mlp_input_dim_a) + 68 + self.xi.shape[-1] + 8
         with torch.random.fork_rng(devices=[self.device]):
             torch.manual_seed(train_cfg["seed"] + 11003)
             self.value = IndependentValue(width).to(self.device)
@@ -145,6 +152,7 @@ class BPTTRunner(SupervisedWMRunner):
             compile_ddp_optimizer=False,
         )
         self.actor_updates = self.critic_updates = self.collection_steps = 0
+        self.learner_round = 0
         self.warmup_complete = False
         self.observation, _ = self.env.get_observations()
         self.log_root = Path(log_dir) if log_dir else None
@@ -170,6 +178,7 @@ class BPTTRunner(SupervisedWMRunner):
                         world_model=self.options,
                         reward_contract=self.rewards.contract,
                         ppo_checkpoint=train_cfg["ppo_checkpoint"],
+                        stage1_checkpoint=train_cfg.get("warm_start"),
                         wm_checkpoint=train_cfg["wm_checkpoint"],
                         actor_updates="BPTT only",
                         ppo_updates=0,
@@ -209,13 +218,17 @@ class BPTTRunner(SupervisedWMRunner):
             bf16=False,
             bf16_heads=False,
             compile=False,
+            compile_mode="none",
             actor_checkpoint=self.bptt["checkpoint_activations"],
             wm_checkpoint=self.bptt["checkpoint_activations"],
         )
         unknown = options.keys() - self.execution.keys()
-        if unknown or any(type(value) is not bool for value in options.values()):
+        if unknown or any(type(value) is not bool for key, value in options.items() if key != "compile_mode"):
             raise ValueError(f"Invalid BPTT execution options: {options}")
         self.execution.update(options)
+        mode = self.execution["compile_mode"]
+        if mode not in ("none", "wm", "chain") or (self.execution["compile"] and mode != "none"):
+            raise ValueError("Choose legacy compile or compile_mode=none|wm|chain")
         self.actor.amp = self.value.amp = self.wm.amp = self.execution["bf16"]
         self.actor.amp_heads = self.value.amp_heads = self.wm.amp_heads = self.execution["bf16_heads"]
         self.options["amp"] = self.wm.amp
@@ -224,6 +237,11 @@ class BPTTRunner(SupervisedWMRunner):
         self._rollout_objective = self.rollout_objective
         self._world_model_loss = self.world_model_loss
         self._value_forward = self.value.forward
+        self._terminal_value_forward = self.value.forward
+        self._trajectory_value_forward = self.value.forward
+        self._features_forward = self.features
+        self._imagine_step = self.imagine_step
+        self._bodies_forward = self.rewards.bodies
         if self.execution["compile"]:
             # Keep the closed-loop transition native: compiling it changed H32
             # gradients beyond the numerical gate, even with FP32 networks.
@@ -232,6 +250,26 @@ class BPTTRunner(SupervisedWMRunner):
             self._rollout_objective = compile_forward(self.rollout_objective)
             self._world_model_loss = compile_forward(self.world_model_loss)
             self._value_forward = compile_forward(self.value.forward)
+        elif mode in ("wm", "chain"):
+            self._world_model_loss = compile_forward(self.world_model_loss)
+            self.compiled_regions = ["world_model_loss"]
+            if mode == "chain":
+                # These batches/horizons are fixed. Automatic symbolic-shape
+                # promotion can select cudnn_grid_sampler without a fake kernel.
+                self._features_forward = compile_forward(self.features, dynamic=False)
+                self._imagine_step = compile_forward(self.imagine_step, dynamic=False)
+                self._bodies_forward = compile_forward(self.rewards.bodies, dynamic=False)
+                self._rollout_objective = compile_forward(self.rollout_objective, dynamic=False)
+                self._value_forward = compile_forward(self.value.forward, dynamic=False)
+                self._terminal_value_forward = self._value_forward
+                self._trajectory_value_forward = self._value_forward
+                self.compiled_regions += [
+                    "initial_features",
+                    "imagine_step",
+                    "trajectory_fk",
+                    "rollout_objective",
+                    "value",
+                ]
 
     def actor_loss(self, data):
         loss, features, targets, alive, valid, states, actions = self.imagine(data)
@@ -264,6 +302,8 @@ class BPTTRunner(SupervisedWMRunner):
             self.step_accumulator -= steps
         self.last_collection_steps = steps
         for _ in range(steps):
+            if self.cfg.get("random_initialization") and not self.warmup_complete:
+                self.normalizers["policy"].update(self.observation)
             record = dict(
                 state=ordinary(self.rewards.state()),
                 contact=ordinary(c.contacts.contact.float()),
@@ -349,18 +389,18 @@ class BPTTRunner(SupervisedWMRunner):
         start = self.start(data)
         contexts = [self.mdp.context(start, step) for step in range(self.bptt["horizon"] + 1)]
         batch = len(data["env_id"])
-        observation_noise = [self.mdp.draw_noise(batch, OBSERVATION_WIDTHS, self.noise_generator)]
+        observation_noise = [self.mdp.draw_noise(batch, self.mdp.observation_widths, self.noise_generator)]
         proprio_noise = []
         for _ in range(self.bptt["horizon"]):
             proprio_noise.append(self.mdp.draw_noise(batch, PROPRIO_WIDTHS, self.noise_generator))
-            observation_noise.append(self.mdp.draw_noise(batch, OBSERVATION_WIDTHS, self.noise_generator))
+            observation_noise.append(self.mdp.draw_noise(batch, self.mdp.observation_widths, self.noise_generator))
         return self.imagine_rollout(data, contexts, proprio_noise, observation_noise)
 
     def imagine_step(
         self, state, history, support, previous_action, observation, context, ids, proprio_noise, observation_noise
     ):
         action = self.network_forward(self.actor, self.normalizers["policy"](observation))
-        successor, _, _ = self.network_forward(
+        successor, contact_logits, _ = self.network_forward(
             self.wm, state, action, previous_action, None, observation[:, 1678:], self.xi[ids]
         )
         next_support, support_valid = self.rewards.support_from_state(successor, support, context, ids)
@@ -376,6 +416,7 @@ class BPTTRunner(SupervisedWMRunner):
             features,
             observation,
             support_valid & valid & context["reference_valid"],
+            contact_logits,
         )
 
     def imagine_rollout(self, data, contexts, proprio_noise, observation_noise):
@@ -385,27 +426,33 @@ class BPTTRunner(SupervisedWMRunner):
             data[k][:, 0].contiguous() for k in ("state", "history", "support", "previous_action")
         )
         context = contexts[0]
-        features, observation, valid = self.features(state, history, support, context, ids, observation_noise[0])
+        features, observation, valid = self._features_forward(
+            state, history, support, context, ids, observation_noise[0]
+        )
         feature_rows, states, actions = [features], [state], []
-        reward_contexts, supports, previous_actions = [], [], []
+        reward_contexts, supports, previous_actions, logits = [], [], [], []
         reference_velocities = [context["ref_body_velocity"]]
         for step in range(horizon):
             next_context = contexts[step + 1]
-            successor, history, next_support, action, features, observation, next_valid = self.imagine_step(
-                state,
-                history,
-                support,
-                previous_action,
-                observation,
-                next_context,
-                ids,
-                proprio_noise[step],
-                observation_noise[step + 1],
+            successor, history, next_support, action, features, observation, next_valid, contact_logits = (
+                self._imagine_step(
+                    state,
+                    history,
+                    support,
+                    previous_action,
+                    observation,
+                    next_context,
+                    ids,
+                    proprio_noise[step],
+                    observation_noise[step + 1],
+                )
             )
             valid = valid & next_valid
             feature_rows.append(features)
             states.append(successor)
             actions.append(action)
+            if contact_logits is not None:
+                logits.append(contact_logits)
             previous_actions.append(previous_action)
             supports.append(next_support)
             reward_contexts.append(next_context)
@@ -434,15 +481,17 @@ class BPTTRunner(SupervisedWMRunner):
                 "family",
             )
         }
+        if self.cfg.get("analytic_foot", {}).get("enabled"):
+            reward_context["foot_acceleration_memory"] = data["foot_acceleration_memory"][:, 0]
         supports = torch.stack(supports, 1).flatten()
         derivative_valid = state.new_ones(batch, horizon)
         derivative_valid[:, 0] = data["derivative_valid"][:, 0]
-        all_bodies = self.rewards.bodies(all_states.flatten(0, 1), ids[:, None].expand(-1, horizon + 1).flatten())
+        all_bodies = self._bodies_forward(all_states.flatten(0, 1), ids[:, None].expand(-1, horizon + 1).flatten())
         features = torch.stack(feature_rows, 1)
-        terminal_value = self.value(features[:, -1])
+        terminal_value = self._terminal_value_forward(features[:, -1])
         with torch.no_grad():
-            values = self.value(features.detach())
-        loss, targets, alive = self._rollout_objective(
+            values = self._trajectory_value_forward(features.detach())
+        loss, targets, alive, reward_means = self._rollout_objective(
             all_states,
             torch.stack(actions, 1).flatten(0, 1),
             torch.stack(previous_actions, 1).flatten(0, 1),
@@ -454,7 +503,9 @@ class BPTTRunner(SupervisedWMRunner):
             all_bodies,
             terminal_value,
             values,
+            torch.stack(logits, 1).flatten(0, 1) if logits else None,
         )
+        self.record_imagined_rewards(reward_means)
         return loss, features[:, :-1].detach(), targets, alive, valid, states, actions
 
     def rollout_objective(
@@ -470,6 +521,7 @@ class BPTTRunner(SupervisedWMRunner):
         all_bodies,
         terminal_value,
         values,
+        contact_logits=None,
     ):
         """Batched rewards and returns; keep gradients to every imagined step."""
         batch, steps = all_states.shape[:2]
@@ -494,6 +546,9 @@ class BPTTRunner(SupervisedWMRunner):
             bodies=bodies,
             previous_bodies=previous_bodies,
         )
+        rewards, reward_means = self.augment_imagined_rewards(
+            rewards, successor, reward_context, ids, horizon, bodies, contact_logits, previous_bodies, derivative_valid
+        )
         rewards = rewards.sum(-1).reshape(batch, horizon)
         survival = self.mdp.soft_survival(successor, supports, reward_context, bodies).reshape(batch, horizon)
         discount = (self.bptt["gamma"] * survival).cumprod(1)
@@ -512,7 +567,19 @@ class BPTTRunner(SupervisedWMRunner):
             -objective.mean(),
             targets,
             survival.prod(1).detach().mean(),
+            reward_means,
         )
+
+    def augment_imagined_rewards(
+        self, rewards, state, context, ids, horizon, bodies, logits, previous_bodies=None, derivative_valid=None
+    ):
+        return rewards, rewards.detach().mean(0)
+
+    def record_imagined_rewards(self, means):
+        pass
+
+    def scalar_tag(self, key):
+        return "BPTT/" + key
 
     @torch.no_grad()
     def real_critic_data(self, data):
@@ -640,19 +707,31 @@ class BPTTRunner(SupervisedWMRunner):
             critic_valid_fraction=float(mask.float().mean()),
         )
 
+    def update_learning_rates(self, iteration):
+        rates = scheduled_learning_rates(self.learning_rates["effective"], self.bptt["lr_schedule"], iteration)
+        for name, optimizer in (
+            ("actor", self.actor_optimizer),
+            ("critic", self.value_optimizer),
+            ("world_model", self.wm_optimizer),
+        ):
+            for group in optimizer.param_groups:
+                group["lr"] = rates[name]
+
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
         if init_at_random_ep_len:
             raise ValueError("BPTT experiments retain real reset/episode history semantics")
         stream = (self.log_root / f"bptt-rank-{self.rank}-metrics.jsonl").open("a", buffering=1)
-        writer = SummaryWriter(str(self.log_root)) if self.rank == 0 else None
+        writer = SummaryWriter(str(self.log_root / "tensorboard")) if self.rank == 0 else None
         phases = [] if self.warmup_complete else [("warmup", self.bptt["warmup_iterations"])]
         phases.append(("train", num_learning_iterations))
+        previous_record_time = None
         try:
             if len(self.replay) < self.replay_horizon:
                 self.collect(self.bptt["initial_collect_steps"])
             for phase, iterations in phases:
                 for iteration in range(iterations):
                     started = time.perf_counter()
+                    self.update_learning_rates(self.learner_round)
                     metrics = self.collect(self.bptt["train_collect_steps"] if phase == "train" else None)
                     collected = time.perf_counter()
                     self.fit_world_model()
@@ -669,6 +748,7 @@ class BPTTRunner(SupervisedWMRunner):
                         phase=phase,
                         iteration=self.current_learning_iteration,
                         phase_iteration=iteration,
+                        learner_round=self.learner_round,
                         actor_updates=self.actor_updates,
                         critic_updates=self.critic_updates,
                         wm_updates=self.wm_updates,
@@ -687,9 +767,9 @@ class BPTTRunner(SupervisedWMRunner):
                         policy_critic_seconds=updated - fitted,
                         validation_ran=validating,
                         wm_train_loss=self.training_loss,
-                        actor_learning_rate=self.actor_optimizer.param_groups[0]["lr"],
-                        critic_learning_rate=self.value_optimizer.param_groups[0]["lr"],
-                        wm_learning_rate=self.wm_optimizer.param_groups[0]["lr"],
+                        actor_learning_rate=float(self.actor_optimizer.param_groups[0]["lr"]),
+                        critic_learning_rate=float(self.value_optimizer.param_groups[0]["lr"]),
+                        wm_learning_rate=float(self.wm_optimizer.param_groups[0]["lr"]),
                         **stats,
                         **{key: float(value) for key, value in metrics.items()},
                     )
@@ -701,23 +781,40 @@ class BPTTRunner(SupervisedWMRunner):
                         dist.all_reduce(scalars)
                         scalars /= self.world
                     row.update(zip(scalar_keys, scalars.cpu().tolist()))
+                    recorded_at = time.perf_counter()
                     row.update(
-                        seconds=time.perf_counter() - started,
+                        seconds=recorded_at - started,
+                        # End-to-end cycle includes the preceding log/checkpoint
+                        # write, which happens after the previous metric record.
+                        iteration_seconds=(
+                            recorded_at - previous_record_time
+                            if previous_record_time is not None
+                            else recorded_at - started
+                        ),
                         time=time.time(),
                         finite=True,
                         torch_peak_allocated_bytes=torch.cuda.max_memory_allocated(self.device),
                         torch_peak_reserved_bytes=torch.cuda.max_memory_reserved(self.device),
                     )
+                    previous_record_time = recorded_at
                     stream.write(json.dumps(row) + "\n")
                     if writer:
                         for key in scalar_keys:
-                            writer.add_scalar("BPTT/" + key, row[key], self.current_learning_iteration)
+                            writer.add_scalar(self.scalar_tag(key), row[key], self.current_learning_iteration)
+                        if phase == "train":
+                            writer.add_scalar(
+                                "Performance/iteration_seconds",
+                                row["iteration_seconds"],
+                                self.current_learning_iteration,
+                            )
                         print(
                             f"[BPTT] {phase} {iteration+1}/{iterations} H{self.bptt['horizon']} "
                             f"critic={self.bptt['critic_source']} body={row['PGMT/body_position_error_m']:.4f} "
                             f"loss={row.get('actor_loss', 0):.4f} seconds={row['seconds']:.3f}",
                             flush=True,
                         )
+                    self.write_extra_scalars(writer)
+                    self.learner_round += 1
                     if phase == "train":
                         self.current_learning_iteration += 1
                         if self.current_learning_iteration % self.save_interval == 0:
@@ -730,6 +827,9 @@ class BPTTRunner(SupervisedWMRunner):
             stream.close()
             if writer:
                 writer.close()
+
+    def write_extra_scalars(self, writer):
+        pass
 
     def save(self, path, infos=None):
         intermediate = str(path) + ".bptt-base"
@@ -762,6 +862,7 @@ class BPTTRunner(SupervisedWMRunner):
                 actor_optimizer=self.actor_optimizer.state_dict(),
                 value_optimizer=self.value_optimizer.state_dict(),
                 actor_updates=self.actor_updates,
+                learner_round=self.learner_round,
                 critic_updates=self.critic_updates,
                 collection_steps=self.collection_steps,
                 pretrained_wm_updates=self.pretrained_wm_updates,
@@ -782,6 +883,7 @@ class BPTTRunner(SupervisedWMRunner):
         saved = torch.load(path, map_location="cpu", weights_only=True)["bptt"]
         saved_options = dict(saved["options"])
         saved_options.setdefault("lr_scaling", "none")
+        saved_options.setdefault("lr_schedule", None)
         saved_options.setdefault("train_collect_steps", None)
         if saved["schema"] != "pgmt-bptt-v2" or saved_options != self.bptt:
             raise ValueError("BPTT resume changed critic source or training options")
@@ -798,6 +900,7 @@ class BPTTRunner(SupervisedWMRunner):
         # Early BF16 forks autocast every output head. Never silently change
         # their precision on resume; old FP32 checkpoints remain compatible.
         saved_execution.setdefault("bf16_heads", saved_execution["bf16"])
+        saved_execution.setdefault("compile_mode", "none")
         if saved_execution != self.execution:
             raise ValueError("BPTT resume changed execution options; use an explicit benchmark fork instead")
         if saved.get("compiled_regions", []) != self.compiled_regions:
@@ -806,12 +909,18 @@ class BPTTRunner(SupervisedWMRunner):
         self.value.load_state_dict(saved["value"])
         self.actor_optimizer.load_state_dict(saved["actor_optimizer"])
         self.value_optimizer.load_state_dict(saved["value_optimizer"])
+        self.learner_round = saved.get(
+            "learner_round", saved["actor_updates"] + self.bptt["warmup_iterations"] * saved["warmup_complete"]
+        )
+        expected_rates = scheduled_learning_rates(
+            self.learning_rates["effective"], self.bptt["lr_schedule"], max(0, self.learner_round - 1)
+        )
         for name, optimizer in (
             ("actor", self.actor_optimizer),
             ("critic", self.value_optimizer),
             ("world_model", self.wm_optimizer),
         ):
-            if any(group["lr"] != self.learning_rates["effective"][name] for group in optimizer.param_groups):
+            if any(group["lr"] != expected_rates[name] for group in optimizer.param_groups):
                 raise ValueError(f"Checkpoint optimizer learning rate differs for {name}")
         for name in ("actor_updates", "critic_updates", "collection_steps", "pretrained_wm_updates", "warmup_complete"):
             setattr(self, name, saved[name])

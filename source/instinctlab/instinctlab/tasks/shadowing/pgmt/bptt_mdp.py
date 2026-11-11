@@ -4,11 +4,12 @@ import math
 import torch
 from torch.nn import functional as F
 
-from isaaclab.utils.math import matrix_from_quat, quat_apply, quat_apply_inverse, quat_inv, quat_mul, yaw_quat
+from isaaclab.utils.math import matrix_from_quat, quat_inv, quat_mul, yaw_quat
 from isaaclab.utils.noise import UniformNoiseCfg
 
 from .mdp.terrain_math import corrected_planar_velocity, tolerance_error
 from .models.cross_attention import unpack_terms
+from .tensor_math import cross, quat_apply, quat_apply_inverse
 from .wm_dynamics import state_features, yaw_angle
 
 PROPRIO_WIDTHS = dict(projected_gravity=3, base_ang_vel=3, joint_pos=29, joint_vel=29, last_action=29)
@@ -44,6 +45,7 @@ class BPTTMDP:
         self.heightfield = rewards.heightfield
         self.default_q = c.robot.data.default_joint_pos.torch.clone()
         self.default_qd = c.robot.data.default_joint_vel.torch.clone()
+        self.gravity = self.default_q.new_tensor([0, 0, -1])
         commands = c.env.command_manager
         self.reference_q = commands.get_term("joint_pos_ref_command")._default_joint_pos
         self.reference_qd = commands.get_term("joint_vel_ref_command")._default_joint_vel
@@ -55,6 +57,7 @@ class BPTTMDP:
         self.observation_terms = dict(
             zip(manager._group_obs_term_names["policy"], manager._group_obs_term_cfgs["policy"])
         )
+        self.observation_widths = {**OBSERVATION_WIDTHS, "terrain": len(self.heightfield.local_xy)}
         for name, cfg in self.observation_terms.items():
             if cfg.noise is not None and (not isinstance(cfg.noise, UniformNoiseCfg) or cfg.noise.operation != "add"):
                 raise ValueError(f"Imagined observation noise requires additive uniform noise: {name}")
@@ -148,7 +151,7 @@ class BPTTMDP:
         )
 
     def proprioception(self, state, previous_action, ids, generator=None):
-        gravity = state.new_tensor([0, 0, -1]).expand(len(state), -1)
+        gravity = self.gravity.expand(len(state), -1)
         terms = (
             quat_apply_inverse(state[:, 3:7], gravity),
             quat_apply_inverse(state[:, 3:7], state[:, 10:13]),
@@ -193,7 +196,8 @@ class BPTTMDP:
         return obs, valid
 
     def value_features(self, state, observation, support, context, xi):
-        features = state_features(state, observation[:, 1678:])
+        ground = self.heightfield.query(state[:, :2])[0] if self.dynamics.ground_query is not None else None
+        features = state_features(state, observation[:, 1678:], ground)
         norm = self.dynamics.input_norm
         features = (features - norm.mean[:68]) / norm.std()[:68]
         xi = (xi - norm.mean[-xi.shape[-1] :]) / norm.std()[-xi.shape[-1] :]

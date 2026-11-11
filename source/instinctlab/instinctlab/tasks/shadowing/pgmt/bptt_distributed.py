@@ -18,6 +18,20 @@ def learning_rates(bptt, world_model, world):
     )
 
 
+def scheduled_learning_rates(rates, schedule, iteration):
+    """Schedule the already scaled rates by outer learner round, including warmup."""
+    if schedule is None:
+        return rates.copy()
+    if schedule["type"] != "cosine" or schedule["total_iterations"] <= 0:
+        raise ValueError(f"Invalid BPTT learning-rate schedule: {schedule}")
+    floor = schedule["min_factor"]
+    if not 0 <= floor <= 1:
+        raise ValueError("BPTT cosine min_factor must be between zero and one")
+    progress = min(iteration / schedule["total_iterations"], 1.0)
+    factor = floor + (1 - floor) * (1 + math.cos(math.pi * progress)) / 2
+    return {name: value * factor for name, value in rates.items()}
+
+
 class TrainingObjective(nn.Module):
     """Register only the trainable network, including its complete loss forward.
 
