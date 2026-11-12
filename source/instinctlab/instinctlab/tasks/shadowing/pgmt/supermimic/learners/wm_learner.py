@@ -1,204 +1,197 @@
-"""SuperMimic-style autoregressive WM learner with PGMT terminal masks and BCE.
+"""World model learner (supervised training)."""
 
-Sampling is external to captured updates. Loss is evaluated on integrated states;
-normalization updates consume only newly collected training environments.
-"""
+from __future__ import annotations
 
 import torch
-from torch.nn import functional as F
-from typing import TypedDict
+from collections.abc import Iterable
+from dataclasses import dataclass
+from tensordict import TensorDict
+from typing import TYPE_CHECKING, Literal
 
-from instinctlab.tasks.shadowing.pgmt.supermimic.execution import CapturedUpdate, compile_function, graph_state
-from instinctlab.tasks.shadowing.pgmt.supermimic.interfaces import Learner
-from instinctlab.tasks.shadowing.pgmt.wm_dynamics import yaw_angle
+from .learner_utils import CapturedUpdate, _optimize_step, build_optimizers, graph_state
 
-from .optimizers import build_optimizers, hidden_matrices, optimize
-
-
-class Prediction(TypedDict):
-    loss: torch.Tensor
-    states: torch.Tensor
-    errors: torch.Tensor
-    mask: torch.Tensor
-    probabilities: torch.Tensor | None
+if TYPE_CHECKING:
+    from instinctlab.tasks.shadowing.pgmt.supermimic.models import Dynamics
+    from instinctlab.tasks.shadowing.pgmt.supermimic.representations import StateRepresentation
 
 
-class WorldModelLearner(Learner):
-    def __init__(self, dynamics, context, cfg, optimizer_cfg, execution):
-        self.dynamics, self.context, self.cfg = dynamics, context, cfg
-        self.optimizer_cfg = optimizer_cfg
-        self.optimizer = build_optimizers(
-            dynamics, hidden_matrices(dynamics.trunk, output_in_sequence=False), optimizer_cfg
+@dataclass
+class WorldModelLearnerCfg:
+    lr: float = 2e-4
+    optimizer: Literal["muon", "adam"] = "muon"
+    num_batches: int = 10
+    batch_size: int = 2048
+    horizon: int = 8
+
+    # Loss Weights (Bryson's Rule) — integrated root pose, both representations
+    nominal_error_root_pose_pos: float = 0.01
+    nominal_error_root_pose_ori: float = 0.02
+
+    # Loss Weights — gencoord representation
+    nominal_error_joint_pos: float = 0.1
+    nominal_error_joint_vel: float = 3.14
+
+    # Loss Weights — maxcoord representation
+    nominal_error_body_pos: float = 0.05
+    nominal_error_body_rot: float = 0.1
+    nominal_error_body_vel: float = 1.0
+    nominal_error_body_avel: float = 3.14
+
+
+class WorldModelLearner:
+    """Trainer for World Model (Supervised)."""
+
+    def __init__(
+        self,
+        dynamics: Dynamics,
+        representation: StateRepresentation,
+        cfg: WorldModelLearnerCfg,
+        device: str = "cpu",
+    ) -> None:
+        self.dynamics = dynamics
+        self.representation = representation
+        self.cfg = cfg
+        self.device = device
+
+        self._all_params = list(dynamics.parameters())
+        self.optimizers = self._build_optimizers()
+
+        # Bryson's rule: each named channel group is weighted 1 / nominal_error^2.
+        self.loss_group_weights = self._loss_weights()
+
+        self._compiled_rollout = self._compile(self._rollout)
+        self._compiled_compute_losses = self._compile(self._compute_losses)
+        self._compiled_represent = self._compile(self.representation.represent)
+        self._captured_update = self._capture(
+            self._update_from,
+            lambda: graph_state([dynamics, representation], self.optimizers),
         )
-        self.loss_forward = compile_function(self.loss, execution.compile != "none")
-        self._update = (
-            CapturedUpdate(self._update_from, self.graph_state, execution.capture_warmup)
-            if execution.cuda_graph
-            else self._update_from
-        )
-        self.updates = 0
-        self.frozen_validation = None
 
-    @property
-    def capture_status(self) -> dict[str, bool]:
-        return {"wm": isinstance(self._update, CapturedUpdate) and self._update.captured}
+    def update_normalization(self, states: torch.Tensor, actions: torch.Tensor) -> None:
+        """Update the dynamics state/action normalizers from fresh collected data.
 
-    def graph_state(self):
-        return graph_state([self.dynamics, self.dynamics.terrain], [self.optimizer]) + [self.context]
+        ``actions`` are raw policy outputs (what the replay buffer stores); the
+        action normalizer sees proc (matching what ``forward`` feeds the MLP after
+        ``Dynamics.proc``).
+        """
+        rep_states = self.representation.represent(states)
+        rep_states_flat = rep_states.reshape(-1, rep_states.shape[-1])
+        actions_flat = actions.reshape(-1, actions.shape[-1])
 
-    def update(self, batches):
-        self.dynamics.train().requires_grad_(True)
-        result = self._update(batches)
-        self.updates += len(batches)
-        return result
+        # EmpiricalNormalization.update is a no-op in eval mode; toggle to train
+        # for the updates and restore afterward.
+        normalizers = self.dynamics.normalizers()
+        for n in normalizers:
+            n.train()
+
+        self.dynamics.state_normalizer.update(rep_states_flat)
+        self.dynamics.action_normalizer.update(self.dynamics.proc(actions_flat))
+
+        for n in normalizers:
+            n.eval()
+
+    def update(self, data: Iterable[TensorDict]) -> dict[str, torch.Tensor]:
+        self.dynamics.train()
+        for p in self._all_params:
+            p.requires_grad_(True)
+        return self._captured_update(self._prepare_batches(data))
+
+    def _build_optimizers(self):
+        return build_optimizers([self.dynamics], self.cfg.lr, device=self.device, optimizer=self.cfg.optimizer)
+
+    def _loss_weights(self):
+        return {
+            name: 1.0 / getattr(self.cfg, attr) ** 2 for name, attr in self.representation.LOSS_WEIGHT_CONFIG.items()
+        }
+
+    def _compile(self, fn):
+        return torch.compile(fn)
+
+    def _capture(self, fn, state):
+        return CapturedUpdate(fn, state)
+
+    def _prepare_batches(self, data):
+        return torch.stack([td.select("state", "action", "sim_ctx") for td in data])
+
+    def _optimize(self, loss):
+        return _optimize_step(self.optimizers, loss, self._all_params, max_norm=1.0)
 
     def _update_from(self, batches):
-        losses, contacts, norms = [], [], []
-        for batch in batches.unbind(0):
-            loss, contact = self.loss_forward(batch.to_dict())
-            norm = optimize(self.optimizer, loss, list(self.dynamics.parameters()), self.optimizer_cfg)
-            losses.append(loss.detach())
-            contacts.append(contact.detach())
-            norms.append(norm)
-        # Preserve the established PGMT last-minibatch loss logging semantics.
-        return dict(loss=losses[-1], contact_bce=contacts[-1], grad_norm=torch.stack(norms).amax())
+        stats, norms = [], []
+        for td in batches.unbind(0):
+            loss_state, group_mse = self._batch_loss(td)
+            norms.append(self._optimize(loss_state))
+            stats.append(torch.cat([loss_state.unsqueeze(0), group_mse]).detach())
+        return self._summarize(stats, norms)
 
-    def predict(self, data, horizon: int) -> Prediction:
-        model = self.dynamics
-        rep = model.representation
-        state = data["state"][:, 0]
-        norm = model.delta_norm if model.error_norm is None else model.error_norm
-        scale = rep.nominal_error if rep.cfg.loss_scale == "bryson" else torch.maximum(norm.std(), rep.error_floor)
-        states, probabilities, losses, errors, masks = [], [], [], [], []
-        valid_prefix = state.new_ones(len(state))
-        for step in range(horizon):
-            heights, valid = model.terrain.local(
-                state[:, rep.layout.state["position"]], yaw_angle(state[:, rep.layout.state["rotation"]])
-            )
-            state, logits = model(
-                state, data["action"][:, step], data["previous_action"][:, step], heights, self.context[data["env_id"]]
-            )
-            error = rep.state_error(state, data["next_state"][:, step])
-            loss = (error / scale).square().mean(-1)
-            if logits is not None:
-                target = data["next_contact"][:, step, model.contact_indices]
-                loss = loss + model.cfg.contact_bce_weight * F.binary_cross_entropy_with_logits(
-                    logits, target, reduction="none"
-                ).mean(-1)
-                probabilities.append(logits.sigmoid())
-            valid_prefix = valid_prefix * valid
-            masks.append(data["mask"][:, step] * valid_prefix)
-            states.append(state)
-            losses.append(loss)
-            errors.append(error)
-        mask = torch.stack(masks, 1)
-        loss = (torch.stack(losses, 1) * mask).sum() / mask.sum().clamp_min(1)
-        return Prediction(
-            loss=loss,
-            states=torch.stack(states, 1),
-            errors=torch.stack(errors, 1),
-            mask=mask,
-            probabilities=torch.stack(probabilities, 1) if probabilities else None,
+    def _summarize(self, stats, norms):
+        names = ["state", *self.loss_group_weights]
+        means = torch.stack(stats).mean(0)
+        return {f"Loss/{name}": m for name, m in zip(names, means, strict=True)}
+
+    def _batch_loss(self, td):
+        full_states = td["state"]
+        actions = td["action"]
+
+        all_rep_states = self._compiled_represent(full_states)
+
+        all_aux_states = self.representation.extract_aux_state(full_states)
+        init_rep_state = all_rep_states[:, 0, :]
+        init_aux = all_aux_states[:, 0, :]
+
+        sim_ctx = td["sim_ctx"][:, 0]
+
+        pred_rep_states, pred_aux_states = self._compiled_rollout(init_rep_state, actions, init_aux, sim_ctx)
+
+        # 2. Vectorized Loss Calculation (always FP32, compiled for kernel fusion)
+        loss_state, group_mse = self._compiled_compute_losses(
+            pred_rep_states,
+            pred_aux_states,
+            all_rep_states[:, 1:],
+            all_aux_states[:, 1:],
         )
+        return loss_state, group_mse
 
-    def loss(self, data):
-        result = self.predict(data, self.cfg.horizon)
-        p, mask = result["probabilities"], result["mask"]
-        metric = result["loss"].new_zeros(())
-        if p is not None:
-            with torch.no_grad():
-                target = data["next_contact"][:, : p.shape[1], self.dynamics.contact_indices]
-                epsilon = self.dynamics.cfg.probability_epsilon
-                bce = F.binary_cross_entropy(p.clamp(epsilon, 1 - epsilon), target, reduction="none").mean(-1)
-                metric = (bce * mask).sum() / mask.sum().clamp_min(1)
-        return result["loss"], metric
+    def _rollout(
+        self,
+        init_rep_state: torch.Tensor,
+        actions: torch.Tensor,
+        init_aux: torch.Tensor,
+        sim_ctx: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Autoregressive rollout over the window's actions.
 
-    @torch.no_grad()
-    def update_normalization(self, replay, env_ids):
-        model, rep = self.dynamics, self.dynamics.representation
-        ids = env_ids[env_ids % self.cfg.holdout_stride != 0]
-        inputs, deltas, errors = [], [], []
-        ages = torch.arange(len(replay) - replay.added, len(replay), device=ids.device)
-        for row in replay.rows(ages):
-            data = {key: replay.data[key][row, ids] for key in ("state", "action", "previous_action", "next_state")}
-            heights, valid = model.terrain.local(
-                data["state"][:, rep.layout.state["position"]],
-                yaw_angle(data["state"][:, rep.layout.state["rotation"]]),
-            )
-            inputs.append(
-                model.inputs(data["state"], data["action"], data["previous_action"], heights, self.context[ids])[valid]
-            )
-            deltas.append(rep.target(data["state"], data["next_state"])[valid])
-            if model.error_norm is not None:
-                errors.append(rep.state_error(data["next_state"], data["state"])[valid])
-        model.input_norm.update(torch.cat(inputs))
-        model.delta_norm.update(torch.cat(deltas))
-        if model.error_norm is not None:
-            model.error_norm.update(torch.cat(errors))
-        replay.added = 0
+        The prediction from the last action is never scored, so the rollout stops
+        one step short.
 
-    def sample(self, replay, env_ids, generator, *, validation=False, horizon=None):
-        selected = env_ids % self.cfg.holdout_stride == 0
-        eligible = env_ids[selected if validation else ~selected]
-        count = self.cfg.validation_batch if validation else self.cfg.batch_size
-        ids = eligible[torch.randint(len(eligible), (count,), device=eligible.device, generator=generator)]
-        return replay.sequences(ids, horizon or self.cfg.horizon, generator, history=False)
+        Returns:
+          (pred_rep_states, pred_aux_states), stacked on dim 1.
+        """
+        rep_state, aux = init_rep_state, init_aux
+        pred_rep_states: list[torch.Tensor] = []
+        pred_aux_states: list[torch.Tensor] = []
+        for k in range(actions.shape[1] - 1):
+            aux, rep_state = self.dynamics(rep_state, actions[:, k], aux, sim_ctx)
+            pred_rep_states.append(rep_state)
+            pred_aux_states.append(aux)
+        return torch.stack(pred_rep_states, dim=1), torch.stack(pred_aux_states, dim=1)
 
-    @torch.no_grad()
-    def validate(self, replay, env_ids, generator):
-        horizon = max(self.cfg.validation_horizons)
-        if self.frozen_validation is None:
-            self.frozen_validation = self.sample(replay, env_ids, generator, validation=True, horizon=horizon)
-        current = self.sample(replay, env_ids, generator, validation=True, horizon=horizon)
-        metrics = {}
-        layout = self.dynamics.representation.layout
-        for name, data in (("fixed", self.frozen_validation), ("current", current)):
-            result = self.predict(data, horizon)
-            for length in self.cfg.validation_horizons:
-                weight = result["mask"][:, length - 1]
-                mean = lambda value: (value * weight).sum() / weight.sum().clamp_min(1)
-                prefix = f"{name}/h{length}/"
-                for field, tag in (
-                    ("position", "root_m"),
-                    ("rotation", "rotation_rad"),
-                    ("joint_position", "joint_rad"),
-                ):
-                    err = result["errors"][:, length - 1, layout.delta[field]]
-                    metrics[prefix + tag] = float(mean(err.square().mean(-1)).sqrt())
-                state, target = result["states"][:, length - 1], data["next_state"][:, length - 1]
-                scan, valid = self.dynamics.terrain.local(
-                    state[:, layout.state["position"]], yaw_angle(state[:, layout.state["rotation"]])
-                )
-                real_scan, real_valid = self.dynamics.terrain.local(
-                    target[:, layout.state["position"]], yaw_angle(target[:, layout.state["rotation"]])
-                )
-                scan_weight = weight * valid * real_valid
-                metrics[prefix + "heightmap_mae_m"] = float(
-                    ((scan - real_scan).abs().mean(-1) * scan_weight).sum() / scan_weight.sum().clamp_min(1)
-                )
-                if result["probabilities"] is not None:
-                    predicted = result["probabilities"][:, length - 1] > self.dynamics.cfg.contact_threshold
-                    actual = data["next_contact"][:, length - 1, self.dynamics.contact_indices].bool()
-                    denominator = mean(predicted.sum(-1) + actual.sum(-1))
-                    metrics[prefix + "foot_contact_f1"] = float(
-                        2 * mean((predicted & actual).sum(-1)) / denominator.clamp_min(torch.finfo(weight.dtype).eps)
-                    )
-                metrics[prefix + "valid_fraction"] = float(weight.mean())
-        return metrics
-
-    def state_dict(self):
-        return dict(
-            model=self.dynamics.state_dict(),
-            optimizer=self.optimizer.state_dict(),
-            updates=self.updates,
-            frozen_validation=self.frozen_validation,
-        )
-
-    def load_state_dict(self, state):
-        if isinstance(self._update, CapturedUpdate):
-            self._update.reset()
-
-        self.dynamics.load_state_dict(state["model"])
-        self.optimizer.load_state_dict(state["optimizer"])
-        self.updates = state["updates"]
-        self.frozen_validation = state["frozen_validation"]
+    def _compute_losses(
+        self,
+        pred_rep_states: torch.Tensor,
+        pred_aux_states: torch.Tensor,
+        gt_rep_states: torch.Tensor,
+        gt_aux_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Squared error per named channel group. Bryson's rule scales each group by
+        # its weight; the state loss is the plain mean over every channel.
+        loss_blocks = self.representation.loss_blocks
+        pred_blocks = loss_blocks(pred_rep_states, pred_aux_states)
+        gt_blocks = loss_blocks(gt_rep_states, gt_aux_states)
+        sq_errs = {name: (pred_blocks[name] - gt_blocks[name]) ** 2 for name in pred_blocks}
+        group_mse = torch.stack([sq.mean() for sq in sq_errs.values()])
+        # Filled on the device: a captured update cannot copy from the host.
+        widths = torch.stack([group_mse.new_full((), sq.shape[-1]) for sq in sq_errs.values()])
+        weights = torch.stack([group_mse.new_full((), self.loss_group_weights[name]) for name in sq_errs])
+        loss_state = (group_mse * weights * widths).sum() / widths.sum()
+        return loss_state, group_mse

@@ -8,9 +8,9 @@ from isaaclab.envs.mdp import time_out
 from isaaclab.managers import TerminationTermCfg
 
 from instinctlab.tasks.shadowing.pgmt.config.g1.pgmt_terrain_cfg import (
-    G1PGMTTerrainBPTTEnvCfg,
-    G1PGMTTerrainBPTTEnvCfg_PLAY,
     G1PGMTTerrainPPOValidationEnvCfg,
+    G1PGMTTerrainSMEnvCfg,
+    G1PGMTTerrainSMEnvCfg_PLAY,
 )
 from instinctlab.tasks.shadowing.pgmt.mdp.terrain_terminations import InitialTimeOut
 
@@ -82,12 +82,12 @@ class InitialTimeOutTests(unittest.TestCase):
         self.assertFalse(term(env)[[0, 2]].any())
         self.assertTrue(time_out(env)[[0, 2]].all())
 
-    def test_only_bptt_training_staggers(self):
-        train = G1PGMTTerrainBPTTEnvCfg()
+    def test_only_sm_training_staggers(self):
+        train = G1PGMTTerrainSMEnvCfg()
         self.assertIs(train.terminations.initial_time_out.func, InitialTimeOut)
         self.assertTrue(train.terminations.initial_time_out.time_out)
         self.assertIs(train.terminations.time_out.func, time_out)
-        self.assertIsNone(G1PGMTTerrainBPTTEnvCfg_PLAY().terminations.initial_time_out)
+        self.assertIsNone(G1PGMTTerrainSMEnvCfg_PLAY().terminations.initial_time_out)
         self.assertIsNone(G1PGMTTerrainPPOValidationEnvCfg().terminations.initial_time_out)
 
 

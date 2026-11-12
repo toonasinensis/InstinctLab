@@ -218,18 +218,18 @@ class G1PGMTTerrainPPONoContactForceEnvCfg_PLAY(G1PGMTTerrainPPONoContactForceEn
 
 
 @configclass
-class G1PGMTTerrainBPTTEnvCfg(G1PGMTTerrainPPONoContactForceEnvCfg):
+class G1PGMTTerrainSMEnvCfg(G1PGMTTerrainPPONoContactForceEnvCfg):
     """Native observation corruption also applies to imagined policy inputs."""
 
     def __post_init__(self):
         super().__post_init__()
         self.observations.policy.enable_corruption = True
         self.terminations.initial_time_out = TerminationTermCfg(func=done.InitialTimeOut, time_out=True)
-        self.run_name = "G1PGMTDance1Subject2BPTT"
+        self.run_name = "G1PGMTDance1Subject2SM"
 
 
 @configclass
-class G1PGMTTerrainBPTTEnvCfg_PLAY(G1PGMTTerrainBPTTEnvCfg):
+class G1PGMTTerrainSMEnvCfg_PLAY(G1PGMTTerrainSMEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.scene.num_envs = 32

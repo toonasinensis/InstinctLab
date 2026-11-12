@@ -38,6 +38,7 @@ class RepresentationCfg:
 
 @dataclass(frozen=True)
 class DynamicsCfg:
+    match_delta_initialization: bool = True
     hidden_width: int = 2048
     hidden_layers: int = 3
     terrain_widths: tuple[int, ...] = (128, 64)
@@ -183,3 +184,31 @@ def from_dict(values: dict) -> SuperMimicCfg:
     )
     result.validate()
     return result
+
+
+@dataclass(frozen=True)
+class ContactRewardCfg:
+    enabled: bool = True
+    match: float = 1.5
+    support: float = 0.25
+    penetration: float = 0.5
+    slip: float = 1.0
+    height_scale: float = 0.05
+    penetration_scale: float = 0.02
+    penetration_tolerance: float = 0.005
+    warmup_updates: int = 500
+    ramp_updates: int = 500
+
+
+@dataclass(frozen=True)
+class AnalyticFootRewardCfg:
+    enabled: bool = True
+    grid_x: int = 5
+    grid_y: int = 3
+    drop: float = 0.1
+    drop_temperature: float = 0.01
+    terrain_margin: float = 0.009
+    acceleration_threshold: float = 30.0
+    tau: float = 0.06
+    illegal_weight: float = -1.0
+    acceleration_weight: float = -0.01

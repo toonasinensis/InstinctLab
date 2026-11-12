@@ -1,10 +1,16 @@
-Algorithm organization, CUDA Graph capture, optimizer grouping, gradient clipping,
-and actor-critic learning flow are adapted from HybridRobotics SuperMimic,
+SuperMimic runtime source is adapted from HybridRobotics SuperMimic,
 Apache License 2.0; see LICENSE-SuperMimic.
-Reference: /home/thl/Desktop/实验/supermimic, commit
-5efbf114e11f725c31d83e217be987c13c0e4ce2.
+Upstream: https://github.com/HybridRobotics/SuperMimic
+Desktop Git base: 5efbf114e11f725c31d83e217be987c13c0e4ce2.
+Copy source: /home/thl/Desktop/实验/supermimic working tree, frozen 2026-11-12,
+including local uncommitted learner/replay changes and the local FK utility.
+The Git base does not by itself identify the modified copied source.
 
-PGMT-specific modifications: named state layout, terrain-aware dynamics,
-terminal-inclusive replay, reference placement/support recursion, contact BCE,
-contact and analytic foot rewards, device Muon LR scheduling, passive actor EMA,
-configurable compilation, and existing PGMT logging semantics.
+Modifications include package-local imports, repository formatting, an explicit
+WXYZ/XYZW math bridge, optional-dependency imports, generic runner/learner/env/logger
+extension hooks, shaped replay fields, and PGMT subclasses. PGMT extensions preserve
+terrain-aware state integration, terminal-inclusive replay, reference/support updates,
+contact BCE and foot rewards, grouped Muon scheduling, actor EMA, compilation/graphs,
+checkpoint contracts, and native logging semantics.
+
+README.md documents the copied source, exclusions and modified base interfaces.

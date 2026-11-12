@@ -1,26 +1,31 @@
 """Numerical regression tests for the composed SM components; no simulator required."""
 
 import copy
+import os
 import torch
 import unittest
 from tensordict import TensorDict
 
+from _legacy_source import legacy_module
+
 from instinctlab.tasks.shadowing.pgmt.supermimic.config import OptimizerCfg, RepresentationCfg, ScheduleCfg
-from instinctlab.tasks.shadowing.pgmt.supermimic.execution import CapturedUpdate, graph_state
 from instinctlab.tasks.shadowing.pgmt.supermimic.layouts import RobotLayout
-from instinctlab.tasks.shadowing.pgmt.supermimic.learners.optimizers import (
+from instinctlab.tasks.shadowing.pgmt.supermimic.learners.pgmt_learner_utils import (
+    CapturedUpdate,
     build_optimizers,
+    graph_state,
     hidden_matrices,
     optimize,
     set_learning_rate,
 )
-from instinctlab.tasks.shadowing.pgmt.supermimic.replay_buffer import ReplayBuffer
-from instinctlab.tasks.shadowing.pgmt.supermimic.representations import REPRESENTATIONS
-from instinctlab.tasks.shadowing.pgmt.wm_dynamics import TerrainDynamics
+from instinctlab.tasks.shadowing.pgmt.supermimic.pgmt_replay_buffer import PGMTReplayBuffer as ReplayBuffer
+from instinctlab.tasks.shadowing.pgmt.supermimic.pgmt_representation import REPRESENTATIONS
 
 
 class RepresentationTests(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("PGMT_LEGACY_SOURCE"), "Requires an external legacy comparison snapshot")
     def test_predictions_targets_and_gradients_match_previous_models(self):
+        TerrainDynamics = legacy_module("wm_dynamics").TerrainDynamics
         torch.manual_seed(13)
         for kind in REPRESENTATIONS:
             with self.subTest(kind=kind):
@@ -50,7 +55,7 @@ class RepresentationTests(unittest.TestCase):
                 old.predict_delta = lambda *args: (delta, None, None)
                 a = torch.zeros(8, 29)
                 before = old(x, a, a, None, torch.zeros(8, 441), torch.zeros(8, 1))[0]
-                after = rep.apply_prediction(x, delta)
+                after = rep.integrate(x, delta)
                 torch.testing.assert_close(after, before, rtol=2e-6, atol=2e-6)
                 weight = torch.randn_like(after)
                 g0 = torch.autograd.grad((before * weight).sum(), delta, retain_graph=True)[0]
@@ -64,7 +69,7 @@ class RepresentationTests(unittest.TestCase):
             state = torch.zeros(2, layout.state.width)
             state[:, layout.state["rotation"].stop - 1] = 1
             delta = torch.zeros(2, rep.prediction_dim, requires_grad=True)
-            rep.apply_prediction(state, delta).sum().backward()
+            rep.integrate(state, delta).sum().backward()
             self.assertTrue(torch.isfinite(delta.grad).all())
 
 
@@ -81,7 +86,7 @@ class ReplayTests(unittest.TestCase):
             else:
                 history = torch.cat((history[:, 1:], torch.full((1, 1, 1), float(step))), 1)
             histories.append(history.clone())
-            replay.add(
+            replay.insert(
                 dict(
                     history=history,
                     episode_step=torch.tensor([episode_step]),
@@ -102,7 +107,7 @@ class ReplayTests(unittest.TestCase):
 
 class ReturnTests(unittest.TestCase):
     def test_timeout_bootstraps_terminal_value_without_reset_leak(self):
-        from instinctlab.tasks.shadowing.pgmt.supermimic.mdp import lambda_returns
+        from instinctlab.tasks.shadowing.pgmt.supermimic.learners.pgmt_learner_utils import lambda_returns
 
         rewards = torch.tensor([[1.0, 2.0, 100.0]])
         values = torch.tensor([[0.0, 10.0, 20.0, 999.0]])

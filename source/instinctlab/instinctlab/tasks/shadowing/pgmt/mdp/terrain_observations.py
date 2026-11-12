@@ -41,8 +41,9 @@ def critic_state(env):
 
 def bilinear_elevation(env):
     """Query the same immutable 5 cm terrain used by imagined observations."""
+    from instinctlab.tasks.shadowing.pgmt.tensor_math import yaw_angle
+
     from ..heightfield import HeightField
-    from ..wm_dynamics import yaw_angle
 
     if not hasattr(env, "pgmt_heightfield"):
         env.pgmt_heightfield = HeightField.from_context(

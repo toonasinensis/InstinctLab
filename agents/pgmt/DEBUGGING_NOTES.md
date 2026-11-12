@@ -19,4 +19,5 @@
 日志、checkpoint、测速数据及完整实验报告继续保存在仓库同级的 `InstinctLab-local/`，不提交到 Git。
 经验文件只沉淀可复用的判断、适用边界和证据入口，不复制原始实验报告。
 
-当前训练协议见 [BPTT_EXPERIMENTS.md](../../source/instinctlab/instinctlab/tasks/shadowing/pgmt/BPTT_EXPERIMENTS.md)。
+当前训练入口见 [SuperMimic](../../source/instinctlab/instinctlab/tasks/shadowing/pgmt/supermimic/README.md)。
+表中 BPTT 经验来自历史实现；旧 Runner 已退出当前审核树，历史源码用于外部数值对照。

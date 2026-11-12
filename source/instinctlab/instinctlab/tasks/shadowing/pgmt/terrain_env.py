@@ -17,6 +17,7 @@ class PGMTTerrainEnv(InstinctRlEnv):
         super().load_managers()
 
     def __init__(self, *args, **kwargs):
+        self._transition_observers = []
         super().__init__(*args, **kwargs)
         termination = self.termination_manager.compute
         reward = self.reward_manager.compute
@@ -77,7 +78,26 @@ class PGMTTerrainEnv(InstinctRlEnv):
                         buffer._num_pushes.copy_(pushes)
                         if data is not None:
                             buffer._buffer.copy_(data)
+            for observer in tuple(self._transition_observers):
+                observer(dt)
             return values
 
         self.termination_manager.compute = compute_termination
         self.reward_manager.compute = compute_reward
+
+    def add_transition_observer(self, observer):
+        """Observe post-physics, post-reward state before resets change any buffers."""
+        self._transition_observers.append(observer)
+
+    def remove_transition_observer(self, observer):
+        self._transition_observers.remove(observer)
+
+    def reward_terms(self, names, dt):
+        """Current weighted reward terms including dt, in the requested order."""
+        return torch.stack(
+            [
+                self.reward_manager._termwise_reward_buf[group][term] * dt
+                for group, term in (name.split("/") for name in names)
+            ],
+            -1,
+        )

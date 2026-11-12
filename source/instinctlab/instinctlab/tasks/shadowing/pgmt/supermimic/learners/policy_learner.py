@@ -1,226 +1,220 @@
-"""Actor/critic learner adapted from SuperMimic's ActorCriticPolicyLearner.
+"""Policy learners using a differentiable world model."""
 
-BPTT traverses the environment, then critic regression uses detached imagined
-features and lambda-return targets. Sampling, random permutations and EMA updates
-remain outside captured optimizer updates.
-"""
+from __future__ import annotations
 
-import copy
 import torch
+import torch.nn as nn
+from dataclasses import dataclass
 from tensordict import TensorDict
+from typing import TYPE_CHECKING, Literal
 
-from instinctlab.tasks.shadowing.pgmt.supermimic.execution import CapturedUpdate, compile_function, graph_state
-from instinctlab.tasks.shadowing.pgmt.supermimic.interfaces import Learner
+if TYPE_CHECKING:
+    from instinctlab.tasks.shadowing.pgmt.supermimic.envs.world_model_env import WorldModelEnv
 
-from .optimizers import build_optimizers, hidden_matrices, optimize
+from .learner_utils import CapturedUpdate, _optimize_step, build_optimizers, graph_state
 
 
-class PolicyLearner(Learner):
-    def __init__(self, policy, value, wm_env, cfg, actor_cfg, critic_cfg, execution, generator, gradient_generator):
-        self.policy, self.value, self.wm_env = policy, value, wm_env
-        self.cfg, self.actor_cfg, self.critic_cfg = cfg, actor_cfg, critic_cfg
-        self.generator, self.gradient_generator = generator, gradient_generator
-        self.actor_optimizer = build_optimizers(policy.network, hidden_matrices(policy.network.action_head), actor_cfg)
-        self.value_optimizer = build_optimizers(value, hidden_matrices(value.network), critic_cfg)
-        self.ema = copy.deepcopy(policy.network).eval().requires_grad_(False)
-        self.value_forward = compile_function(value.forward, execution.compile != "none")
-        self.actor_updates = self.critic_updates = 0
-        self.gradient_data = None
-        self._actor_update = (
-            CapturedUpdate(self._actor, self.graph_state, execution.capture_warmup)
-            if execution.cuda_graph
-            else self._actor
+@dataclass
+class BpttPolicyLearnerCfg:
+    lr: float = 2e-4
+    optimizer: Literal["muon", "adam"] = "muon"
+    num_batches: int = 1
+    batch_size: int = 4096
+    noise: float = 0.1
+    horizon: int = 32
+    gamma: float = 1.0
+    survival_masking: bool = True
+    beta2: float = 0.95  # faster Adam EMA recovery after gradient spikes
+    grad_clip_value: float = 0.1  # per-parameter gradient element clipping
+
+
+@dataclass
+class ActorCriticPolicyLearnerCfg(BpttPolicyLearnerCfg):
+    gamma: float = 0.99
+    lam: float = 0.95
+
+
+def gae_returns(
+    values: torch.Tensor,
+    last_value: torch.Tensor,
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+    gamma: float,
+    lam: float,
+) -> torch.Tensor:
+    """GAE returns ``A_t + V(s_t)`` of a time-major rollout. A soft done ``p_t``
+    discounts the next state by ``(1 - p_t) * gamma``."""
+    returns = torch.empty_like(values)
+    advantage = 0.0
+    next_value = last_value
+    for t in reversed(range(values.shape[0])):
+        not_done = 1.0 - dones[t]
+        delta = rewards[t] + not_done * gamma * next_value - values[t]
+        advantage = delta + not_done * gamma * lam * advantage
+        returns[t] = advantage + values[t]
+        next_value = values[t]
+    return returns
+
+
+class BpttPolicyLearner:
+    """Policy Learner using direct Backpropagation Through Time (BPTT)."""
+
+    def __init__(
+        self,
+        policy: nn.Module,
+        wm_env: WorldModelEnv,
+        cfg: BpttPolicyLearnerCfg,
+        device: str = "cpu",
+    ):
+        self.device = device
+        self.actor = policy
+        self.wm_env = wm_env
+        self.cfg = cfg
+        self.actor_params = list(self.actor.parameters())
+        self.actor_optimizers = self._build_optimizers(policy)
+        self._rollout_actor = self._compile_actor(policy)
+        self._captured_update = self._capture(self._update_from, self._graph_state)
+
+    def _build_optimizers(self, module):
+        return build_optimizers(
+            [module], self.cfg.lr, betas=(0.9, self.cfg.beta2), device=self.device, optimizer=self.cfg.optimizer
         )
-        self._critic_update = (
-            CapturedUpdate(self._critic, lambda: graph_state([value], [self.value_optimizer]), execution.capture_warmup)
-            if execution.cuda_graph
-            else self._critic
-        )
 
-    @property
-    def capture_status(self) -> dict[str, bool]:
+    def _compile_actor(self, policy):
+        return torch.compile(policy) if torch.device(self.device).type == "cuda" else policy
+
+    def _capture(self, fn, state):
+        return CapturedUpdate(fn, state)
+
+    def update(self, starts: TensorDict | None = None) -> dict[str, torch.Tensor]:
+        self.actor.train()
+        for module in (self.wm_env.dynamics, self.wm_env.representation):
+            module.eval()
+            module.requires_grad_(False)
+        if starts is None:
+            starts = torch.stack([self.wm_env.sample_initial_states() for _ in range(self.cfg.num_batches)])
+        return self._captured_update(starts)
+
+    def _update_from(self, starts: TensorDict) -> dict[str, torch.Tensor]:
+        totals: dict[str, torch.Tensor] = {}
+        for start in starts.unbind(0):
+            for k, v in self._train_batch(start).items():
+                totals[k] = totals[k] + v if k in totals else v
+        return self._summarize(totals, len(starts))
+
+    def _summarize(self, totals, n):
+        reward = totals.pop("return") / self.cfg.horizon / n / self.wm_env.representation.dt
+        return {"Policy/reward": reward} | {f"Policy/{k}": v / n for k, v in totals.items()}
+
+    def _train_batch(self, start: TensorDict) -> dict[str, torch.Tensor]:
+        """Imagine one rollout from ``start`` and take one actor step on its return."""
+        cfg = self.cfg
+        obs = self.wm_env.reset(start)
+        ret, aux_loss, survival = 0.0, 0.0, 1.0
+        rollout: list[TensorDict] = []
+        for t in range(cfg.horizon):
+            actions = self._rollout_actor(obs)
+            next_obs, reward, term_prob, _ = self.wm_env.step(actions)
+            step = {"critic": obs["critic"], "reward": reward, "done": term_prob}
+            rollout.append(TensorDict(step, batch_size=reward.shape).detach())
+            ret = ret + cfg.gamma**t * survival * reward
+            aux_loss = aux_loss + getattr(self.actor, "auxiliary_loss", lambda: 0.0)()
+            if cfg.survival_masking:
+                survival = survival * (1 - term_prob)
+            obs = next_obs
+        ret = ret + self._bootstrap(obs, survival, term_prob)
+        loss = (-ret + aux_loss).mean()
+        grad_norm = _optimize_step(self.actor_optimizers, loss, self.actor_params, 1.0, cfg.grad_clip_value)
         return {
-            name: isinstance(update, CapturedUpdate) and update.captured
-            for name, update in (("actor", self._actor_update), ("critic", self._critic_update))
+            "return": ret.mean().detach(),
+            "grad_norm": grad_norm,
+            **self._fit_critic(rollout, obs),
+            **getattr(self.actor, "auxiliary_stats", lambda: {})(),
         }
 
-    def graph_state(self):
-        env = self.wm_env
-        return graph_state(
-            [self.policy.network, self.policy.normalizer, self.value, env.dynamics, env.dynamics.terrain],
-            [self.actor_optimizer],
-        ) + [env.xi, env.foot_rewards.scale]
+    def _bootstrap(self, obs: TensorDict, survival: torch.Tensor, term_prob: torch.Tensor) -> torch.Tensor | float:
+        """Value of the rollout's last state, discounted into its return."""
+        del obs, survival, term_prob
+        return 0.0
 
-    def update(self, inputs, *, train_actor=True):
-        self.policy.network.train()
-        self.policy.normalizer.eval()
-        self.wm_env.dynamics.eval().requires_grad_(False)
-        self.value.requires_grad_(False)
-        # Clear old supervised gradients so frozen-model checks have meaning.
-        for parameter in self.wm_env.dynamics.parameters():
-            parameter.grad = None
-        try:
-            if train_actor:
-                result = self._actor_update(inputs)
-                self.actor_updates += 1
-            else:
-                with torch.no_grad():
-                    result = self.wm_env.rollout(inputs)
-                result["grad_norm"] = result["loss"].new_zeros(())
-            if any(parameter.grad is not None for parameter in self.wm_env.dynamics.parameters()):
-                raise AssertionError("Actor update wrote world-model parameter gradients")
-        finally:
-            self.wm_env.dynamics.requires_grad_(True)
-            self.value.requires_grad_(True)
-        features, targets = result["features"].flatten(0, 1), result["targets"].flatten()
-        orders = torch.stack(
-            [
-                torch.randperm(len(targets), device=targets.device, generator=self.generator)
-                for _ in range(self.cfg.critic_epochs)
-            ]
-        )
-        critic_input = TensorDict(dict(features=features, targets=targets, orders=orders), batch_size=[])
-        critic = (self._critic_update if train_actor else self._critic)(critic_input)
-        self.critic_updates += self.cfg.critic_epochs * self.cfg.critic_minibatches
-        if train_actor:
-            self.update_ema()
-        return dict(
-            actor_loss=result["loss"].detach(),
-            critic_loss=critic["loss"],
-            actor_grad_norm=result["grad_norm"],
-            critic_grad_norm=critic["grad_norm"],
-            imagination_survival=result["survival"],
-            reward_means=result["reward_means"],
-            **{key: value for key, value in critic.items() if key.startswith("ValueGradient/")},
-            **{key: value for key, value in result.items() if key.startswith(("Encoder/",))}
-        )
+    def _fit_critic(self, rollout: list[TensorDict], last_obs: TensorDict) -> dict[str, torch.Tensor]:
+        """Fit a critic to the rollout after the actor step."""
+        del rollout, last_obs
+        return {}
 
-    def _actor(self, inputs):
-        if self.cfg.value_gradient_weight:
-            inputs = inputs.clone()
-            initial = inputs["data", "state"][:, 0].detach().requires_grad_()
-            inputs["data", "state"] = torch.cat((initial[:, None], inputs["data", "state"][:, 1:]), 1)
-        result = self.wm_env.rollout(inputs)
-        torch._assert_async(result["valid"].all(), "Imagined rollout left valid reference/terrain domain")
-        if self.cfg.value_gradient_weight:
-            target = torch.autograd.grad(-len(initial) * result["loss"], initial, retain_graph=True)[0]
-            self.gradient_data = dict(
-                state=initial.detach(),
-                target=target.detach(),
-                history=inputs["data", "history"][:, 0].detach(),
-                support=inputs["data", "support"][:, 0].detach(),
-                context=inputs["contexts"][0].to_dict(),
-                noise=inputs["observation_noise"][0].to_dict(),
-                ids=inputs["data", "env_id"],
-                scale=(inputs["data", "next_state"][:, 0] - initial.detach())
-                .std(0)
-                .clamp_min(self.cfg.gradient_scale_floor),
-            )
-        result["grad_norm"] = optimize(
-            self.actor_optimizer, result["loss"], list(self.policy.network.parameters()), self.actor_cfg
-        )
-        encoder = getattr(self.policy.network, "encoder", None)
-        if encoder is not None:
-            gradients = [p.grad.square().sum() for p in encoder.parameters() if p.grad is not None]
-            result["Encoder/encoder_gradient_norm"] = (
-                torch.stack(gradients).sum().sqrt().detach() if gradients else result["loss"].new_zeros(())
-            )
-        result["loss"] = result["loss"].detach()
-        return result
+    def _graph_state(self) -> list[torch.Tensor]:
+        """What the captured update reads that Python can rebind."""
+        wm = self.wm_env
+        modules = [self.actor, wm.dynamics, wm.representation]
+        return graph_state(modules, self.actor_optimizers)
 
-    def _critic(self, inputs):
-        losses, norms, errors, cosines = [], [], [], []
-        for epoch, order in enumerate(inputs["orders"].unbind(0)):
-            for ids in order.tensor_split(self.cfg.critic_minibatches):
-                loss = (self.value_forward(inputs["features"][ids]) - inputs["targets"][ids]).square().mean()
-                reported_loss = loss.detach()
-                if self.gradient_data is not None and epoch == 0:
-                    count = min(self.cfg.gradient_batch_size, len(self.gradient_data["state"]))
-                    indices = torch.randperm(
-                        len(self.gradient_data["state"]), device=ids.device, generator=self.gradient_generator
-                    )[:count]
-                    surrogate, error, cosine = self.gradient_loss(indices)
-                    loss = loss + self.cfg.value_gradient_weight * surrogate
-                    errors.append(error)
-                    cosines.append(cosine)
-                norms.append(optimize(self.value_optimizer, loss, list(self.value.parameters()), self.critic_cfg))
-                losses.append(reported_loss)
-        self.gradient_data = None
-        metrics = dict(loss=torch.stack(losses).mean(), grad_norm=torch.stack(norms).amax())
-        if errors:
-            metrics["ValueGradient/relative_error"] = torch.stack(errors).mean()
-            metrics["ValueGradient/cosine"] = torch.stack(cosines).mean()
-        return metrics
 
-    def gradient_loss(self, indices):
-        data = self.gradient_data
-        assert data is not None
-        state = data["state"][indices].detach().requires_grad_()
-        context = {key: value[indices] for key, value in data["context"].items()}
-        noise = {key: value[indices] for key, value in data["noise"].items()}
+class ActorCriticPolicyLearner(BpttPolicyLearner):
+    """Actor-critic variant that adds a critic bootstrap and GAE critic update."""
 
-        def features(value):
-            return self.wm_env.features(
-                value, data["history"][indices], data["support"][indices], context, data["ids"][indices], noise
-            )[0]
+    def __init__(
+        self,
+        policy: nn.Module,
+        critic: nn.Module,
+        wm_env: WorldModelEnv,
+        cfg: ActorCriticPolicyLearnerCfg,
+        device: str = "cpu",
+    ):
+        super().__init__(policy, wm_env, cfg, device)
+        self.critic = critic
+        self.critic_optimizers = self._build_critic_optimizers(critic)
+        self._v_max = self._value_bound()
 
-        x = features(state)
-        leaf = x.detach().requires_grad_()
-        u = torch.autograd.grad(self.value(leaf).sum(), leaf, create_graph=True)[0]
-        prediction = torch.autograd.grad(x, state, grad_outputs=u.detach())[0].detach().requires_grad_()
-        scale = data["scale"]
-        rotation_slice = self.wm_env.dynamics.representation.layout.state["rotation"]
+    def _build_critic_optimizers(self, critic):
+        return build_optimizers([critic], self.cfg.lr, device=self.device, optimizer=self.cfg.optimizer)
 
-        def tangent(value):
-            rotation = state[:, rotation_slice].detach()
-            angular = value[:, rotation_slice] - (value[:, rotation_slice] * rotation).sum(-1, keepdim=True) * rotation
-            return torch.cat((value[:, : rotation_slice.start], angular, value[:, rotation_slice.stop :]), -1)
+    def _value_bound(self):
+        return self.wm_env.max_step_reward / (1 - self.cfg.gamma)
 
-        predicted, target = tangent(prediction) * scale, tangent(data["target"][indices]) * scale
-        error = (predicted - target).square().sum() / target.square().sum().clamp_min(self.cfg.denominator_epsilon)
-        direction = tangent(torch.autograd.grad(error, prediction)[0])
+    def _bootstrap(self, obs: TensorDict, survival: torch.Tensor, term_prob: torch.Tensor) -> torch.Tensor:
+        self.critic.requires_grad_(False)
+        value = self.critic(obs["critic"]).clamp(max=self._v_max).squeeze(-1)
+        alive = survival if self.cfg.survival_masking else 1.0 - term_prob
+        return self.cfg.gamma**self.cfg.horizon * value * alive
+
+    def _fit_critic(self, rollout: list[TensorDict], last_obs: TensorDict) -> dict[str, torch.Tensor]:
+        steps = torch.stack(rollout)
         with torch.no_grad():
-            epsilon = self.cfg.gradient_epsilon / (direction / scale).norm(dim=-1).clamp_min(
-                self.cfg.denominator_epsilon
-            )
+            values = self.critic(steps["critic"])
+            last_value = self.critic(last_obs["critic"])
+        returns = gae_returns(
+            values,
+            last_value,
+            steps["reward"].unsqueeze(-1),
+            steps["done"].unsqueeze(-1),
+            self.cfg.gamma,
+            self.cfg.lam,
+        ).clamp(max=self._v_max)
+        obs, returns = steps["critic"].flatten(0, 1), returns.flatten(0, 1)
+        return self._regress_critic(obs, returns, self._critic_orders(returns))
 
-            def shifted(sign):
-                value = state + sign * epsilon[:, None] * direction
-                rotation = torch.nn.functional.normalize(value[:, rotation_slice], dim=-1)
-                return torch.cat((value[:, : rotation_slice.start], rotation, value[:, rotation_slice.stop :]), -1)
+    def _critic_orders(self, returns):
+        perm = torch.randperm(len(returns) // 4 * 4, device=returns.device)
+        return [perm.view(4, -1) for _ in range(5)]
 
-            jacobian = (features(shifted(1)) - features(shifted(-1))) / (2 * epsilon[:, None])
-            cosine = torch.nn.functional.cosine_similarity(predicted, target, dim=-1).mean()
-        return (u * jacobian).sum(), error.detach(), cosine
+    def _critic_loss(self, obs, targets, ids, epoch):
+        return (targets[ids] - self.critic(obs[ids])).pow(2).mean(), {}
 
-    @torch.no_grad()
-    def update_ema(self):
-        torch._foreach_lerp_(
-            list(self.ema.parameters()), list(self.policy.network.parameters()), 1 - self.cfg.ema_decay
-        )
-        for averaged, current in zip(self.ema.buffers(), self.policy.network.buffers(), strict=True):
-            averaged.copy_(current)
+    def _critic_optimize(self, loss):
+        return _optimize_step(self.critic_optimizers, loss, self.critic.parameters(), max_norm=1.0)
 
-    def state_dict(self):
-        return dict(
-            actor=self.policy.network.state_dict(),
-            value=self.value.state_dict(),
-            ema=self.ema.state_dict(),
-            actor_optimizer=self.actor_optimizer.state_dict(),
-            value_optimizer=self.value_optimizer.state_dict(),
-            actor_updates=self.actor_updates,
-            critic_updates=self.critic_updates,
-        )
+    def _regress_critic(self, obs, targets, orders):
+        self.critic.requires_grad_(True)
+        statistics = []
+        for epoch, batches in enumerate(orders):
+            for idx in batches:
+                loss, stats = self._critic_loss(obs, targets, idx, epoch)
+                norm = self._critic_optimize(loss)
+                statistics.append({"loss": loss.detach(), "grad_norm": norm, **stats})
+        return self._critic_summary(statistics)
 
-    def load_state_dict(self, state):
-        if isinstance(self._actor_update, CapturedUpdate):
-            self._actor_update.reset()
-        if isinstance(self._critic_update, CapturedUpdate):
-            self._critic_update.reset()
+    def _critic_summary(self, stats):
+        return {"value_function": torch.stack([s["loss"] for s in stats]).mean()}
 
-        self.policy.network.load_state_dict(state["actor"])
-        self.value.load_state_dict(state["value"])
-        self.ema.load_state_dict(state["ema"])
-        self.actor_optimizer.load_state_dict(state["actor_optimizer"])
-        self.value_optimizer.load_state_dict(state["value_optimizer"])
-        self.actor_updates, self.critic_updates = state["actor_updates"], state["critic_updates"]
+    def _graph_state(self) -> list[torch.Tensor]:
+        return super()._graph_state() + graph_state([self.critic], self.critic_optimizers)

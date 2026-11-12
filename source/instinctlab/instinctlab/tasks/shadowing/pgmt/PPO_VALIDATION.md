@@ -2,7 +2,8 @@
 
 This branch starts at native PGMT `ec5237e`. The PPO presets described here
 do not train a world model or use imagined policy updates or WM checkpoints.
-The separate supervised WM tasks are described in `WM_DIAGNOSTICS.md`.
+The current heightscan SM backend is described in [supermimic/README.md](supermimic/README.md).
+The earlier auxiliary supervised WM tasks have been retired.
 The baseline PPO uses four reward groups and the native terrain height scanner.
 
 ## Presets and reversible configuration

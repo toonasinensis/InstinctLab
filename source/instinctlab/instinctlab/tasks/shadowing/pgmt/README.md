@@ -1,7 +1,14 @@
-# PGMT flat LAFAN stage one
+# PGMT tasks
 
-Development references: [BPTT training](BPTT_EXPERIMENTS.md) and
+The heightscan SM backend and training recipes are documented in
+[SuperMimic](supermimic/README.md). It keeps the original `runners/`, `envs/`, `learners/`, and utility layout;
+PGMT subclasses sit beside their copied base classes with a `pgmt_` prefix. Retired BPTT and auxiliary WM runners
+are absent from this checkout; numerical comparisons use an external historical source.
+
+PPO and stage-one development references:
 [debugging experience index](../../../../../../agents/pgmt/DEBUGGING_NOTES.md).
+
+## Flat LAFAN stage one
 
 `Instinct-PGMT-Shadowing-G1-Newton-v0` trains a G1 CrossAttention actor and independent scalar critic
 on flat ground. The implementation follows the `shadowing/perceptive` configuration layout and uses
