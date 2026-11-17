@@ -22,6 +22,7 @@ from .pgmt_learner_utils import build_optimizers, hidden_matrices, optimize
 
 
 class Prediction(TypedDict):
+    auxiliary_states: torch.Tensor | None
     loss: torch.Tensor
     states: torch.Tensor
     errors: torch.Tensor
@@ -81,21 +82,30 @@ class PGMTWorldModelLearner(SuperMimicWorldModelLearner):
         self.updates += len(batches)
         return result
 
+    def prediction_initial(self, data):
+        return data["state"][:, 0], None
+
+    def prediction_step(self, state, carry, data, step, heights):
+        state, logits = self.dynamics.predict_transition(
+            state, data["action"][:, step], data["previous_action"][:, step], heights, self.context[data["env_id"]]
+        )
+        return state, logits, carry
+
     def predict(self, data, horizon: int) -> Prediction:
         model = self.dynamics
         rep = model.representation
-        state = data["state"][:, 0]
+        state, carry = self.prediction_initial(data)
         norm = model.delta_norm if model.error_norm is None else model.error_norm
         scale = rep.nominal_error if rep.cfg.loss_scale == "bryson" else torch.maximum(norm.std(), rep.error_floor)
-        states, probabilities, losses, errors, masks = [], [], [], [], []
+        states, probabilities, losses, errors, masks, auxiliary = [], [], [], [], [], []
         valid_prefix = state.new_ones(len(state))
         for step in range(horizon):
             heights, valid = model.terrain.local(
                 state[:, rep.layout.state["position"]], yaw_angle(state[:, rep.layout.state["rotation"]])
             )
-            state, logits = model.predict_transition(
-                state, data["action"][:, step], data["previous_action"][:, step], heights, self.context[data["env_id"]]
-            )
+            state, logits, carry = self.prediction_step(state, carry, data, step, heights)
+            if carry is not None:
+                auxiliary.append(carry)
             error = rep.state_error(state, data["next_state"][:, step])
             loss = (error / scale).square().mean(-1)
             if logits is not None:
@@ -111,16 +121,21 @@ class PGMTWorldModelLearner(SuperMimicWorldModelLearner):
             errors.append(error)
         mask = torch.stack(masks, 1)
         loss = (torch.stack(losses, 1) * mask).sum() / mask.sum().clamp_min(1)
-        return Prediction(
+        result: Prediction = dict(
             loss=loss,
+            auxiliary_states=torch.stack(auxiliary, 1) if auxiliary else None,
             states=torch.stack(states, 1),
             errors=torch.stack(errors, 1),
             mask=mask,
             probabilities=torch.stack(probabilities, 1) if probabilities else None,
         )
+        return result
 
     def loss(self, data):
         result = self.predict(data, self.cfg.horizon)
+        return self.prediction_loss(result, data)
+
+    def prediction_loss(self, result, data):
         p, mask = result["probabilities"], result["mask"]
         metric = result["loss"].new_zeros(())
         if p is not None:

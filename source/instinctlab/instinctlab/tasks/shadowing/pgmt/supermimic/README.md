@@ -58,3 +58,28 @@ Batched reward evaluation is explicitly deferred until the end of the imagined t
 See the repository-root `REVIEW.md`, `SM_ARCHITECTURE.md` and `SM_VALIDATION.md` for review order,
 contracts and measured validation. Only the Newton PGMT path is validated by this migration;
 original mjlab scripts and convergence equivalence require their own checks.
+
+## G1 head-depth training
+
+The depth extension inherits the same collection and training loop. Its task recipes are:
+
+- `Instinct-PGMT-SuperMimicHeadDepth-G1-Newton-v0`: D1S2, G1 head-mounted camera.
+- `Instinct-PGMT-SuperMimicHeadDepthLafanBox-G1-Newton-v0`: full LAFAN and Boxes20, same camera.
+- `Instinct-PGMT-SuperMimicHeightLafanBox-G1-Newton-v0`: paired full-LAFAN/Boxes20 heightscan recipe.
+
+`pgmt_depth_cfg.py` defines the visual recipe; `pgmt_head_camera_cfg.py` transfers the official
+G1 head-relative camera mount onto the local torso/head asset. Optical pose and sensor parameters
+are saved in the checkpoint contract. The reconstruction target remains on the pelvis/yaw grid.
+
+`PGMTDepthRunner` specializes assembly, replay fields and perception diagnostics. The actor takes
+one 48x64 depth frame through a 64-dimensional latent; its existing hidden layers and the critic
+remain unchanged. The encoder is trained by masked metric-height reconstruction and world-model
+latent prediction. Actor loss detaches the latent at the action-network boundary. Physical inputs
+use frozen/online empirical normalization as appropriate; image preprocessing belongs to the sensor.
+There is no visual EMA target; policy EMA is a separate checkpoint/deployment choice.
+
+Copied visual primitives and their upstream attribution are documented in
+[`perception/PROVENANCE.md`](perception/PROVENANCE.md). Masking, gradient ownership and terminal
+image handling are checked by `source/instinctlab/test/pgmt/test_depth_perception.py`; the sibling
+`validate_depth.py` checks the Newton training integration and checkpoint reload in an external
+validation directory.

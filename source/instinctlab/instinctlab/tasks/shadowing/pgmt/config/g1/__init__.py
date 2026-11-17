@@ -64,3 +64,26 @@ register_backend_tasks(
     entry_point="instinctlab.tasks.shadowing.pgmt.terrain_env:PGMTTerrainEnv",
     instinct_rl_cfg_entry_point=f"{task_entry}.pgmt_supermimic_cfg:G1PGMTSuperMimicTFCfg",
 )
+
+
+register_backend_tasks(
+    "Instinct-PGMT-SuperMimicDepth-G1",
+    env_cfg_entry_point=f"{task_entry}.pgmt_depth_cfg:G1PGMTDepthEnvCfg",
+    play_env_cfg_entry_point=f"{task_entry}.pgmt_depth_cfg:G1PGMTDepthEnvCfg",
+    entry_point="instinctlab.tasks.shadowing.pgmt.terrain_env:PGMTTerrainEnv",
+    instinct_rl_cfg_entry_point=f"{task_entry}.pgmt_depth_cfg:G1PGMTDepthSMCfg",
+)
+
+
+for suffix, env_class, agent_class in (
+    ("HeadDepth", "G1PGMTHeadDepthEnvCfg", "G1PGMTHeadDepthSMCfg"),
+    ("HeadDepthLafanBox", "G1PGMTHeadDepthLafanBoxEnvCfg", "G1PGMTHeadDepthSMCfg"),
+    ("HeightLafanBox", "G1PGMTHeightLafanBoxEnvCfg", "G1PGMTHeightContact5SMCfg"),
+):
+    register_backend_tasks(
+        f"Instinct-PGMT-SuperMimic{suffix}-G1",
+        env_cfg_entry_point=f"{task_entry}.pgmt_head_camera_cfg:{env_class}",
+        play_env_cfg_entry_point=f"{task_entry}.pgmt_head_camera_cfg:{env_class}",
+        entry_point="instinctlab.tasks.shadowing.pgmt.terrain_env:PGMTTerrainEnv",
+        instinct_rl_cfg_entry_point=f"{task_entry}.pgmt_head_camera_cfg:{agent_class}",
+    )

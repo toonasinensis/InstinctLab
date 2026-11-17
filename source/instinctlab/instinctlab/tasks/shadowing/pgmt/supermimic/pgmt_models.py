@@ -232,5 +232,5 @@ def initialize_shared_dynamics(dynamics, seed: int, substeps: int):
     source = dict(reference.named_parameters())
     with torch.no_grad():
         for name, value in dynamics.named_parameters():
-            if source[name].shape == value.shape:
+            if name in source and source[name].shape == value.shape:
                 value.copy_(source[name])

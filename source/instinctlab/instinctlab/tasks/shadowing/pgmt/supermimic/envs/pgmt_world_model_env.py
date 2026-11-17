@@ -80,6 +80,13 @@ class PGMTWorldModelEnv(MotionTrackingEnv):
             self.xi[ids],
             recompute=self.execution.wm_recompute,
         )
+        return self.finish_transition(
+            successor, logits, history, support, action, context, ids, proprio_noise, observation_noise
+        )
+
+    def finish_transition(
+        self, successor, logits, history, support, action, context, ids, proprio_noise, observation_noise
+    ):
         next_support, support_valid = self.rewards.support_from_state(successor, support, context, ids)
         history = torch.cat(
             (history[:, 1:], self.mdp.proprioception(successor, action, ids, proprio_noise)[:, None]), 1
@@ -143,6 +150,10 @@ class PGMTWorldModelEnv(MotionTrackingEnv):
             self.proprio_noise[step],
             self.observation_noise[step + 1],
         )
+        return self.record_transition((successor, history, support, action, features, observation, valid, logits))
+
+    def record_transition(self, result):
+        successor, history, support, action, features, observation, valid, logits = result
         self.valid = self.valid & valid
         self.feature_rows.append(features)
         self.states.append(successor)

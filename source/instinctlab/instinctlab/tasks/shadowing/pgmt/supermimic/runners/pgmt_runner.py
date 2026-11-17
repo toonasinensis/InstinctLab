@@ -60,6 +60,15 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
         if train_cfg.get("initialize_checkpoint"):
             pgmt_checkpoint.initialize_legacy_weights(self, train_cfg["initialize_checkpoint"])
 
+    policy_type = PGMTPolicy
+    imagination_type = PGMTWorldModelEnv
+    policy_learner_type = PGMTActorCriticPolicyLearner
+    _policy_normalizer = staticmethod(PolicyNormalizer)
+    _create_dynamics = staticmethod(PGMTDynamics)
+
+    def _collection_fields(self):
+        return {}
+
     def _build_world_model(self):
         env, cfg, options, device = self.env, self.train_cfg, self.options, self.device
         native = env.unwrapped
@@ -77,7 +86,7 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
                 values = {key: value for key, value in values.items() if key != "class_name"}
                 shape = get_subobs_size(env.get_obs_format()[group])
                 normalizer = (
-                    PolicyNormalizer(shape, scan_width, **values)
+                    self._policy_normalizer(shape, scan_width, **values)
                     if group == "policy"
                     else EmpiricalNormalization(shape, **values)
                 )
@@ -99,7 +108,8 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
             representation = REPRESENTATIONS[options.representation.kind](
                 layout, options.representation, native.step_dt, native.cfg.decimation, rewards.root_com[0]
             ).to(device)
-            dynamics = PGMTDynamics(
+            self.actor, self.normalizers = actor, normalizers
+            dynamics = self._create_dynamics(
                 representation,
                 terrain,
                 options.dynamics,
@@ -127,7 +137,7 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
         native, actor, normalizers = env.unwrapped, self.actor, self.normalizers
         rewards, context, command, layout = self.rewards, self.context, self.command, self._representation.layout
         dynamics = self._dynamics
-        policy = PGMTPolicy(actor, normalizers["policy"], options.execution)
+        policy = self.policy_type(actor, normalizers["policy"], options.execution)
         reference_frames = command.reference.cfg.num_frames
         mdp = PGMTMDP(
             rewards,
@@ -147,11 +157,11 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
             raise ValueError("Enabled contact rewards require the foot probability head")
         self.policy, self.mdp, self.value = policy, mdp, value
         self.foot_rewards, self.analytic_foot = foot_rewards, analytic_foot
-        self.wm_env = PGMTWorldModelEnv(
+        self.wm_env = self.imagination_type(
             dynamics, mdp, context, self.replay_buffer, foot_rewards, analytic_foot, options
         )
         self.wm_env.sample_generator = self.generators["actor"]
-        self.policy_learner = PGMTActorCriticPolicyLearner(
+        self.policy_learner = self.policy_learner_type(
             policy,
             value,
             self.wm_env,
@@ -164,7 +174,13 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
         )
         if options.execution.compile != "none":
             policy.network.action_from_inputs = compile_function(policy.network.action_from_inputs, True)
-            dynamics.predict_delta = compile_function(dynamics.predict_delta, True)
+            self._compile_dynamics(dynamics)
+
+    def _compile_dynamics(self, dynamics):
+        dynamics.predict_delta = compile_function(dynamics.predict_delta, True)
+
+    def checkpoint_extra_contract(self):
+        return {}
 
     def _build_logger(self, **kwargs):
         return PGMTLogger(self.env, self.mdp, self.foot_rewards, self.analytic_foot, self.log_root, **kwargs)
@@ -201,6 +217,7 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
             )
             * self.options.collection.action_noise
         )
+        record.update(self._collection_fields())
         record["action_noise"] = ordinary(noise)
         action = self.policy.collect(self.observation) + noise
         self.observation, _, done, info = self._step_and_store(
@@ -282,7 +299,7 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
     def _combine_metrics(self, metrics, wm, policy):
         metrics.update(self.logger.metrics(self.replay_buffer, self.last_steps, policy.pop("reward_means")))
         metrics.update({key if "/" in key else "Train/" + key: value for key, value in policy.items()})
-        metrics.update({"WorldModel/" + key: value for key, value in wm.items()})
+        metrics.update({key if "/" in key else "WorldModel/" + key: value for key, value in wm.items()})
         metrics.update(
             {
                 "Performance/cuda_graph_" + key: float(value)

@@ -45,6 +45,7 @@ def restore_environment(runner, state):
 
 def contract(runner):
     return dict(
+        **runner.checkpoint_extra_contract(),
         options=asdict(runner.options),
         policy=runner.train_cfg["policy"],
         num_envs=runner.env.num_envs,
