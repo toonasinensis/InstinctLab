@@ -84,6 +84,15 @@ def dummy_task() -> str:
         del gym.registry[task]
 
 
+def test_saved_config_can_use_training_entry_without_play_changes(dummy_task):
+    saved = {"seed": 9}
+    training, _ = cli.resolve_saved_cfg(dummy_task, [], env_yaml=saved)
+    play, _ = cli.resolve_play_cfg(dummy_task, [], env_yaml=saved)
+    assert training.seed == play.seed == 9
+    assert not training.played
+    assert play.played
+
+
 # ---------------------------------------------------------------------------
 # 1. Command-line parsing
 # ---------------------------------------------------------------------------

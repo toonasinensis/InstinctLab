@@ -299,6 +299,13 @@ def resolve_play_cfg(task: str, overrides: list[str], *, env_yaml: dict | None =
     Returns:
         The env and agent configs.
     """
+    return resolve_saved_cfg(task, overrides, env_yaml=env_yaml, agent_yaml=agent_yaml, play_mode=True)
+
+
+def resolve_saved_cfg(
+    task: str, overrides: list[str], *, env_yaml: dict | None = None, agent_yaml: dict | None = None, play_mode=False
+):
+    """Restore saved configs onto the training entry by default, or the play entry when requested."""
     from isaaclab.envs.utils.spaces import replace_strings_with_env_cfg_spaces
     from isaaclab.utils.dict import replace_strings_with_slices, update_class_from_dict
     from isaaclab_tasks.utils import resolve_task_config
@@ -307,11 +314,11 @@ def resolve_play_cfg(task: str, overrides: list[str], *, env_yaml: dict | None =
     if env_yaml is None and agent_yaml is None:
         _reject_in_memory_meshes_with_hydra(task, overrides)
         return resolve_task_config(
-            task, AGENT_ENTRY_POINT, play_mode=True, overrides=with_hydra_output_suppressed(overrides)
+            task, AGENT_ENTRY_POINT, play_mode=play_mode, overrides=with_hydra_output_suppressed(overrides)
         )
 
     selectors = [token for token in overrides if token.partition("=")[0] in (*PRESET_SELECTORS, VISUALIZER_SELECTOR)]
-    env_cfg, agent_cfg, _ = register_task(task, AGENT_ENTRY_POINT, play_mode=True, overrides=selectors)
+    env_cfg, agent_cfg, _ = register_task(task, AGENT_ENTRY_POINT, play_mode=play_mode, overrides=selectors)
     if env_yaml is not None:
         _materialize_saved_physics(env_cfg, env_yaml)
         update_class_from_dict(env_cfg, _prune_disabled(env_cfg, replace_strings_with_slices(env_yaml), "env"))

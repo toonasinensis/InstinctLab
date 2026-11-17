@@ -67,8 +67,8 @@ The depth extension inherits the same collection and training loop. Its task rec
 - `Instinct-PGMT-SuperMimicHeadDepthLafanBox-G1-Newton-v0`: full LAFAN and Boxes20, same camera.
 - `Instinct-PGMT-SuperMimicHeightLafanBox-G1-Newton-v0`: paired full-LAFAN/Boxes20 heightscan recipe.
 
-`pgmt_depth_cfg.py` defines the visual recipe; `pgmt_head_camera_cfg.py` transfers the official
-G1 head-relative camera mount onto the local torso/head asset. Optical pose and sensor parameters
+`pgmt_head_camera_cfg.py` defines the depth observation, supervision scanner and SM recipe, and
+constructs the camera directly at the official G1 head-relative mount on the local torso/head asset. Optical pose and sensor parameters
 are saved in the checkpoint contract. The reconstruction target remains on the pelvis/yaw grid.
 
 `PGMTDepthRunner` specializes assembly, replay fields and perception diagnostics. The actor takes
@@ -83,3 +83,69 @@ Copied visual primitives and their upstream attribution are documented in
 image handling are checked by `source/instinctlab/test/pgmt/test_depth_perception.py`; the sibling
 `validate_depth.py` checks the Newton training integration and checkpoint reload in an external
 validation directory.
+
+### Saved-config depth evaluation
+
+The evaluator uses the registered **training** entry and restores `params/env.yaml`.
+It never selects a play-specific environment class. No dataset, terrain mixture, difficulty,
+phase or episode-limit override is implicit: omitted settings inherit the saved training value.
+Runtime curriculum/sampler history is not reconstructed from the checkpoint.
+
+```text
+config/g1/pgmt_terrain_recipe_cfg.py   shared terrain/spawn/curriculum/query-grid recipe
+  ├── pgmt_scan187_cfg.py             heightscan policy task
+  └── pgmt_head_camera_cfg.py         head-depth task and paired LAFAN/Boxes20 recipe
+
+supermimic/evaluation/
+  config.py     training-config restoration and typed, explicit overrides
+  policy.py     frozen depth actor/normalizer loading using training model classes
+  runner.py     native environment stepping and first-episode lifecycle
+  observer.py   collector interface, composition and optional state/RNG purity audit
+  metrics.py    raw aligned/world tracking errors, native termination/return accumulation
+  contact.py    optional read-only ground-contact measurements
+  report.py     per-episode, per-terrain and aggregate output
+  cli.py        argument parsing and simulation launch
+  presets/      explicit common-cohort evaluation settings
+```
+
+Depth and heightscan inherit the shared terrain recipe independently. The shared query grid
+also serves the world model and reconstruction supervision; preserving that grid and the legacy
+observation layout does not require inheriting the heightscan task. The optical camera is created once at the G1 head mount; its reconstruction labels remain
+on the original pelvis/yaw grid. The legacy pelvis-depth task and configuration are removed.
+
+The actor class and constructor arguments come from the checkpoint contract; inference calls
+training `PGMTDepthPolicy.collect()`. Collectors attach to the existing
+`PGMTTerrainEnv.add_transition_observer()` before reset. They do not change rewards, terminations,
+lower-body tolerance, action handling, observations/noise, camera configuration or physics.
+The optional contact sensor supplements the original sensor and samples the native control
+boundary without changing backend decimation. Only each environment's first episode is scored,
+including its terminal step. Primary body errors use the training XY/yaw-aligned target without
+subtracting tolerance. World-frame body/root errors are separate; failure flags are native.
+
+Configuration order is task defaults → saved training YAML → settings YAML → explicit CLI flags.
+`None` means inherit. Outputs include `training_env.yaml`, `effective_env.yaml`, `config_diff.json`
+and `overrides.json`; `env.yaml` retains the effective-config filename used by existing tooling.
+The loader currently supports depth policies, not arbitrary PPO/TF checkpoints.
+
+Inherit the training environment (set paths to a checkpoint and an external validation output):
+
+```bash
+python scripts/pgmt/evaluate.py \
+  --task Instinct-PGMT-SuperMimicHeadDepth-G1-Newton-v0 \
+  --checkpoint "$CHECKPOINT" --output "$VALIDATION_OUTPUT" --weights ema --contacts
+```
+
+Reproduce the previous A/B cohort explicitly (D1S2, six equal shared terrains, L9, 4000 environments,
+9999 seconds, post-flat-warmup phase; geometry stays training-native):
+
+```bash
+python scripts/pgmt/evaluate.py \
+  --task Instinct-PGMT-SuperMimicHeadDepth-G1-Newton-v0 \
+  --checkpoint "$CHECKPOINT" --output "$VALIDATION_OUTPUT" --weights ema --contacts \
+  --settings source/instinctlab/instinctlab/tasks/shadowing/pgmt/supermimic/evaluation/presets/d1s2_l9.yaml
+```
+
+`python -m instinctlab.tasks.shadowing.pgmt.supermimic.evaluation` remains supported.
+`--smoke --num-envs 32 --steps 20` enables within-step state/RNG purity checks. Independent
+GPU physics runs are not assumed bitwise deterministic. Retain the same settings preset when
+comparing results across evaluator versions; the new default no longer selects that cohort.
