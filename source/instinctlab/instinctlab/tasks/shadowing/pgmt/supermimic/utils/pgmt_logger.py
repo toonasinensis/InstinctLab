@@ -6,6 +6,8 @@ import time
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
+from tensorboard.compat.proto.summary_pb2 import Summary
+
 from instinctlab.tasks.shadowing.pgmt.episode_rewards import EpisodeRewards
 
 from .logger import Logger
@@ -59,8 +61,8 @@ class PGMTLogger(Logger):
             + "\n"
         )
         if phase == "train":
-            for key, value in scalars.items():
-                self.writer.add_scalar(key, value, iteration)
+            summary = Summary(value=[Summary.Value(tag=key, simple_value=value) for key, value in scalars.items()])
+            self.writer.file_writer.add_summary(summary, iteration)
         # Only task aggregates are retained; do not accumulate reset extras forever.
         self.ep_extras.clear()
         print(
