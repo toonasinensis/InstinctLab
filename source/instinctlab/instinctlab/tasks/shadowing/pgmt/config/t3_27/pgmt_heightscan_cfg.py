@@ -1,7 +1,6 @@
 import os
 from dataclasses import asdict
 
-from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 
 from instinctlab.assets.t3_27 import T3_27_ACTION_SCALE, T3_27_CFG, T3_27_JOINT_NAMES, T3_27_TRACKED_BODIES
@@ -38,7 +37,6 @@ class T3_27PGMTHeightScanEnvCfg(G1PGMTScan187EnvCfg):
         self.commands.motion.motion_buffer_name = "SOMA"
         self.commands.motion.hand_body_names = ("left_wrist_roll_link", "right_wrist_roll_link")
         self.commands.motion.impact_body_names = ("pelvis", "waist_yaw_link")
-        self.events.base_com.params["asset_cfg"] = SceneEntityCfg("robot", body_names="waist_yaw_link")
         self.run_name = "T3_27HeightScan"
 
     def _configure_tracking_joints(self):

@@ -73,7 +73,7 @@ T3_27_CFG = ArticulationCfg(
     spawn=UrdfFileCfg(
         asset_path=str(Path(__file__).resolve().parent / "resources" / "t3_27" / "t_0_3_2_27dof.urdf"),
         fix_base=False,
-        merge_fixed_joints=True,
+        merge_fixed_joints=False,
         activate_contact_sensors=True,
         self_collision=True,
     ),
