@@ -16,9 +16,10 @@ def mlp(widths):
 
 
 class TerrainCNNActor(nn.Module):
-    def __init__(self, num_actions, scan_shape=(21, 21)):
+    def __init__(self, num_actions, scan_shape=(21, 21), non_terrain_width=1678):
         super().__init__()
         self.scan_shape = tuple(scan_shape)
+        self.non_terrain_width = non_terrain_width
         pooled = ((scan_shape[0] + 3) // 4) * ((scan_shape[1] + 3) // 4) * 64
         self.amp = False
         self.amp_heads = True
@@ -33,21 +34,22 @@ class TerrainCNNActor(nn.Module):
             nn.SiLU(),
             nn.Linear(128, 32),
         )
-        self.action_head = mlp((1710, 1024, 512, 256, num_actions))
+        self.action_head = mlp((non_terrain_width + 32, 1024, 512, 256, num_actions))
 
     def encode(self, heights):
         return self.encoder(heights.reshape(-1, 1, *self.scan_shape))
 
     def inputs(self, obs):
-        return obs[:, :1678], obs[:, 1678:]
+        return obs[:, : self.non_terrain_width], obs[:, self.non_terrain_width :]
 
     def action_from_inputs(self, history_reference, heights):
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.amp and heights.is_cuda):
             return self.action_head(torch.cat((history_reference, self.encode(heights)), -1)).float()
 
     def forward(self, obs):
-        self.intent = self.encode(obs[:, 1678:])
-        return self.action_head(torch.cat((obs[:, :1678], self.intent), -1))
+        history_reference, heights = self.inputs(obs)
+        self.intent = self.encode(heights)
+        return self.action_head(torch.cat((history_reference, self.intent), -1))
 
     def action(self, obs):
         return self.action_from_inputs(*self.inputs(obs))

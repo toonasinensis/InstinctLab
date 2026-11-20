@@ -791,7 +791,7 @@ class MotionReferenceManagerBase(SensorBase):
         # wait for events to match with the entities in the scene.
 
     def _initialize_robot_kinematics(self):
-        with open(self.cfg.robot_model_path) as f:
+        with open(self.cfg.robot_model_path, "rb") as f:
             self._robot_kinematics_chain = pk.build_chain_from_urdf(f.read()).to(dtype=torch.float, device=self.device)
 
         # pytorch-kinematics decorates these instance methods with process-global,

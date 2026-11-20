@@ -2,7 +2,7 @@
 
 import torch
 
-from isaaclab.utils.math import matrix_from_quat, quat_apply_inverse, quat_inv, quat_mul
+from isaaclab.utils.math import matrix_from_quat, quat_inv, quat_mul
 
 from .observations import privileged_state
 
@@ -31,12 +31,14 @@ def elevation(env):
 
 
 def critic_state(env):
-    state = privileged_state(env)
     c = env.command_manager.get_term("motion")
-    state[:, 67:68] = c.anchor_pos_w[:, 2:3] - c.terrain.support_z[:, None]
-    state[:, 68:71] = quat_apply_inverse(c.robot_anchor_quat_w, c.anchor_pos_w - c.robot_anchor_pos_w)
-    state[:, 71:77] = matrix_from_quat(quat_mul(quat_inv(c.robot_anchor_quat_w), c.anchor_quat_w))[..., :2].flatten(1)
-    return state
+    anchor_pos_w = c.anchor_pos_w
+    return privileged_state(
+        env,
+        reference_height=anchor_pos_w[:, 2:3] - c.terrain.support_z[:, None],
+        anchor_pos_w=anchor_pos_w,
+        anchor_quat_w=c.anchor_quat_w,
+    )
 
 
 def bilinear_elevation(env):

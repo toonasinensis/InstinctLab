@@ -14,6 +14,7 @@ from instinctlab.tasks.shadowing.pgmt.mdp.terrain_math import (
     tangent_velocity,
     tolerance_error,
 )
+from instinctlab.tasks.shadowing.pgmt.supermimic.layouts import RobotLayout
 from instinctlab.tasks.shadowing.pgmt.tensor_math import cross, quat_apply, quat_apply_inverse, rotation_increment
 
 
@@ -21,6 +22,7 @@ class RobotKinematics:
     """Link poses and COM twists matching native PGMT articulation data."""
 
     def __init__(self, urdf_path, joint_names, tracked_bodies, device):
+        self.state_layout = RobotLayout(len(joint_names)).state
         root = ET.parse(urdf_path).getroot()
         joints = root.findall("joint")
         child_names = {joint.find("child").get("link") for joint in joints}
@@ -79,7 +81,8 @@ class RobotKinematics:
             root_offset = (rotations[0] @ root_com[..., None]).squeeze(-1)
             linear = [state[:, 7:10] - cross(state[:, 10:13], root_offset, dim=-1)]
             angular = [state[:, 10:13]]
-        q, qd = state[:, 13:42], state[:, 42:71]
+        q = state[:, self.state_layout["joint_position"]]
+        qd = state[:, self.state_layout["joint_velocity"]]
         for index in range(1, len(self.names)):
             parent, joint = self.parents[index], self.joint_ids[index]
             offset = (rotations[parent] @ self.offset[index, :, None]).squeeze(-1)
@@ -161,6 +164,7 @@ class AnalyticRewards:
         self.kinematics = RobotKinematics(
             c.reference.cfg.robot_model_path, robot.joint_names, c.reference.cfg.link_of_interests, env.device
         )
+        self.state_layout = self.kinematics.state_layout
         self.support_kinematics = RobotKinematics(
             c.reference.cfg.robot_model_path,
             robot.joint_names,
@@ -301,13 +305,14 @@ class AnalyticRewards:
         aligned = delta[:, None].expand(-1, position.shape[1], -1)
         target = target_root[:, None] + quat_apply(aligned, context["ref_body_position"])
         target_rotation = matrix_from_quat(quat_mul(aligned, context["ref_body_rotation"]))
+        joints = state[:, self.state_layout["joint_position"]]
         errors = dict(
             position=(target - position).norm(dim=-1),
             orientation=rotation_error(target_rotation, rotation),
             linear_velocity=(context["ref_body_velocity"] - velocity).norm(dim=-1),
             angular_velocity=(context["ref_body_angular"] - spin).norm(dim=-1),
-            joint_position=(context["ref_q"] - state[:, 13:42]).abs(),
-            joint_velocity=(context["ref_qd"] - state[:, 42:71]).abs(),
+            joint_position=(context["ref_q"] - joints).abs(),
+            joint_velocity=(context["ref_qd"] - state[:, self.state_layout["joint_velocity"]]).abs(),
         )
         tolerances = dict(
             position=c.cfg.tolerance_position_m,
@@ -315,12 +320,12 @@ class AnalyticRewards:
             joint_position=c.cfg.tolerance_joint_rad,
         )
         terms = {}
-        for group, bodies, joints in (
+        for group, bodies, joint_ids in (
             ("upper", self.upper_ids, self.upper_joint_ids),
             ("lower", self.lower_ids, self.lower_joint_ids),
         ):
             for name, error in errors.items():
-                error = error[:, joints if name.startswith("joint_") else bodies]
+                error = error[:, joint_ids if name.startswith("joint_") else bodies]
                 if group == "lower":
                     error = tolerance_error(
                         error,
@@ -358,7 +363,6 @@ class AnalyticRewards:
         ) * derivative_valid
         terms["auxiliary/action_rate"] = (action - previous_action).square().sum(-1)
         limits = self.limits[ids]
-        joints = state[:, 13:42]
         terms["auxiliary/joint_limits"] = (
             (limits[..., 0] - joints).clamp_min(0) + (joints - limits[..., 1]).clamp_min(0)
         ).sum(-1)

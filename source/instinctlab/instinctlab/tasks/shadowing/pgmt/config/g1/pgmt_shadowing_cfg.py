@@ -39,6 +39,16 @@ motion_reference_cfg = MotionReferenceManagerCfg(
 )
 
 
+def configure_tracking_joints(cfg, joint_names, action_scale):
+    order = list(joint_names)
+    set_cfg_joint_order(cfg.actions.joint_pos, order)
+    cfg.actions.joint_pos.scale = action_scale
+    for name in ("joint_pos", "joint_vel"):
+        getattr(cfg.observations.policy, name).params["asset_cfg"] = set_cfg_joint_order(SceneEntityCfg("robot"), order)
+    set_cfg_joint_order(cfg.commands.joint_pos_ref_command.asset_cfg, order)
+    set_cfg_joint_order(cfg.commands.joint_vel_ref_command.asset_cfg, order)
+
+
 @configclass
 class G1PGMTShadowingEnvCfg(pgmt_cfg.PGMTEnvCfg):
     scene: pgmt_cfg.PGMTSceneCfg = pgmt_cfg.PGMTSceneCfg(
@@ -47,20 +57,15 @@ class G1PGMTShadowingEnvCfg(pgmt_cfg.PGMTEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        order = list(JOINT_NAMES)
-        set_cfg_joint_order(self.actions.joint_pos, order)
-        self.actions.joint_pos.scale = G1_ACTION_SCALE
-        for name in ("joint_pos", "joint_vel"):
-            getattr(self.observations.policy, name).params["asset_cfg"] = set_cfg_joint_order(
-                SceneEntityCfg("robot"), order
-            )
-        set_cfg_joint_order(self.commands.joint_pos_ref_command.asset_cfg, order)
-        set_cfg_joint_order(self.commands.joint_vel_ref_command.asset_cfg, order)
+        self._configure_tracking_joints()
         self.sim.physics = physics_preset(PhysxCfg(), newton=newton_physics_cfg(njmax=384, nconmax=192))
         self.sim.visualizer_cfgs = backend_viewers(
             VisualizerCfg(backend=KitBackendCfg()), newton=InstinctNewtonVisualizerCfg()
         )
         self.run_name = "G1PGMTLafanStage1"
+
+    def _configure_tracking_joints(self):
+        configure_tracking_joints(self, JOINT_NAMES, G1_ACTION_SCALE)
 
 
 @configclass

@@ -159,7 +159,9 @@ class G1PGMTTerrainPPOValidationEnvCfg(G1PGMTTerrainEnvCfg):
         proportions = dict(flat=0.2, slope_up=0.1, slope_down=0.1, stairs_up=0.2, stairs_down=0.2, boxes=0.0, rough=0.2)
         for name, proportion in proportions.items():
             self.scene.terrain.terrain_generator.sub_terrains[name].proportion = proportion
-        self.scene.motion_reference.motion_buffers["LAFAN"].motion_names = ["dance1_subject2"]
+        lafan = self.scene.motion_reference.motion_buffers.get("LAFAN")
+        if lafan is not None:
+            lafan.motion_names = ["dance1_subject2"]
         self.run_name = "G1PGMTDance1Subject2TerrainPPO"
 
 

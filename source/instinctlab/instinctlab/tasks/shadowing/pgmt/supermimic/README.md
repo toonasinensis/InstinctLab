@@ -149,3 +149,33 @@ python scripts/pgmt/evaluate.py \
 `--smoke --num-envs 32 --steps 20` enables within-step state/RNG purity checks. Independent
 GPU physics runs are not assumed bitwise deterministic. Retain the same settings preset when
 comparing results across evaluator versions; the new default no longer selects that cohort.
+
+## T3_27 heightscan
+
+The Newton task is `Instinct-PGMT-SuperMimic-T3_27-Newton-v0`. It uses the 27-joint
+T3 URDF, a 17 × 11 height grid, the existing flat warmup and the terrain curriculum
+with flat, ramps, stairs and rough terrain. The URDF and its meshes ship in
+`$PROJECT_DIR/source/instinctlab/instinctlab/assets/resources/t3_27/`.
+Set `PGMT_T3_27_MOTION_H5` to the original
+`moving_upright_middlespeed.h5` or another grouped 50 Hz T3 dataset.
+
+Run the standard `$PROJECT_DIR/scripts/instinct_rl/train.py` entry point with the
+task ID. The motion path can also be set with
+`env.scene.motion_reference.motion_buffers.SOMA.path`. The optional
+`env.scene.motion_reference.motion_buffers.SOMA.motion_names` selects exact HDF5
+group names for a smaller run. The optional `cache_dir` in the same motion buffer
+sets the cache location. By default the cache is written to the sibling
+`InstinctLab-local/motion_cache/` directory.
+
+The first load validates the named joint columns and computes velocities and
+world-frame body targets for each clip. Position and angle differences use a
+centered interval within the clip and one-sided intervals at its ends. The cache
+stores the named NPZ motion fields, clip boundaries and
+`contact`, `valid`, and `bottom`. On disk, quaternions are WXYZ. Loading builds
+the same XYZW `MotionSequence` used by the G1 named-NPZ path. Contact labels and
+reset clearance use the T3 URDF collision meshes. The differentiable foot reward
+uses 32 representative vertices per foot and retains the axis extrema of each
+mesh. Disk lookup is keyed by source metadata and the preprocessing contract.
+The checkpoint data key also identifies byte-identical source files on different
+hosts. Allow about 3.3 GiB for the full motion tensors at 14 tracked bodies, plus
+the contact tensors and the memory used by simulation and training.

@@ -1,9 +1,27 @@
 """Differentiable two-foot contact rewards shared by real and imagined states."""
 
+import numpy as np
 import torch
 
 from .mdp.contact_labels import collision_vertices
-from .tensor_math import cross, quat_apply, quat_apply_inverse
+from .tensor_math import cross
+
+
+def sample_foot_vertices(points, limit):
+    if limit is None or len(points) <= limit:
+        return points
+    if limit < 6:
+        raise ValueError("max_foot_vertices must be at least six")
+    selected = np.unique(np.concatenate((points.argmin(0), points.argmax(0)))).tolist()
+    distance = np.full(len(points), np.inf, dtype=points.dtype)
+    for index in selected:
+        distance = np.minimum(distance, np.square(points - points[index]).sum(1))
+    while len(selected) < limit:
+        distance[selected] = -1
+        index = int(distance.argmax())
+        selected.append(index)
+        distance = np.minimum(distance, np.square(points - points[index]).sum(1))
+    return points[selected]
 
 
 class FootContactRewards:
@@ -14,12 +32,15 @@ class FootContactRewards:
         self.feet = rewards.command.foot_ids
         vertices = collision_vertices(rewards.command.reference.cfg.robot_model_path)
         names = rewards.command.reference.cfg.link_of_interests
-        self.points = torch.stack(
-            [
-                torch.as_tensor(vertices[names[index]], device=rewards.env.device, dtype=torch.float32)
-                for index in self.feet
-            ]
-        )
+        limit = cfg.get("max_foot_vertices")
+        points = [
+            torch.as_tensor(
+                sample_foot_vertices(vertices[names[index]], limit), device=rewards.env.device, dtype=torch.float32
+            )
+            for index in self.feet
+        ]
+        width = max(len(foot) for foot in points)
+        self.points = torch.stack([torch.cat((foot, foot[-1:].expand(width - len(foot), -1))) for foot in points])
         self.weights = self.points.new_tensor([cfg["match"], -cfg["support"], -cfg["penetration"], -cfg["slip"]])
         self.scale = self.points.new_zeros(())
 

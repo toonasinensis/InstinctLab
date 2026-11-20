@@ -22,6 +22,7 @@ INSTALL_REQUIRES = [
     "instinct-rl==1.0.3",
     # Direct numerical/runtime dependencies
     "numpy>=2",
+    "h5py",
     "torch==2.11.0",
     "torchvision==0.26.0",
     "gymnasium==1.3.0",

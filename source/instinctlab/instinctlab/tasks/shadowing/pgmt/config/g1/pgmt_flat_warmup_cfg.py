@@ -22,7 +22,9 @@ class G1PGMTFlatWarmupEnvCfg(G1PGMTTerrainSMEnvCfg):
         self.commands.motion.class_type = (
             "instinctlab.tasks.shadowing.pgmt.mdp.curriculum_commands:FlatWarmupTerrainMotion"
         )
-        self.scene.motion_reference.motion_buffers["LAFAN"].motion_names = ["dance1_subject2.named.npz"]
+        lafan = self.scene.motion_reference.motion_buffers.get("LAFAN")
+        if lafan is not None:
+            lafan.motion_names = ["dance1_subject2.named.npz"]
         self.observations.policy.terrain.func = bilinear_elevation
         self.scene.height_scanner = None
         self.run_name = "G1PGMTCNNFlatWarmupD1S2"

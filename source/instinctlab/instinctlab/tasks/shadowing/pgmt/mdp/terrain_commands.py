@@ -44,17 +44,17 @@ class TerrainMotion(CommandTerm):
         self.env = env
         self.robot = env.scene["robot"]
         self.reference = env.scene["motion_reference"]
-        self.motion = self.reference.motion_buffers["LAFAN"]
+        self.motion = self.reference.motion_buffers[cfg.motion_buffer_name]
         # 身体状态、接触标签及身体分组均按 link_of_interests 的顺序索引。
         self.body_ids = self.robot.find_bodies(self.reference.cfg.link_of_interests, preserve_order=True)[0]
         names = self.reference.cfg.link_of_interests
-        self.foot_ids = [names.index(s + "_ankle_roll_link") for s in ("left", "right")]
-        self.hand_ids = [names.index(s + "_wrist_yaw_link") for s in ("left", "right")]
-        self.impact_ids = [names.index(n) for n in ("pelvis", "torso_link")]
+        self.foot_ids = [names.index(name) for name in cfg.foot_body_names]
+        self.hand_ids = [names.index(name) for name in cfg.hand_body_names]
+        self.impact_ids = [names.index(name) for name in cfg.impact_body_names]
         self.motion_anchor_body_index = names.index("pelvis")
         self.lower_ids = [i for i, n in enumerate(names) if any(s in n for s in ("hip", "knee", "ankle"))]
         self.upper_ids = [
-            i for i, n in enumerate(names) if any(s in n for s in ("torso", "shoulder", "elbow", "wrist"))
+            i for i, n in enumerate(names) if any(s in n for s in ("torso", "waist", "shoulder", "elbow", "wrist"))
         ]
         self.lower_joint_ids = [
             i for i, n in enumerate(self.robot.joint_names) if any(s in n for s in ("hip", "knee", "ankle"))
@@ -108,12 +108,27 @@ class TerrainMotion(CommandTerm):
         if cfg.spawn_root_only or cfg.off_platform_half_width != 1.1:
             self.sampling_contract["platform_spawn"]["root_only"] = cfg.spawn_root_only
             self.sampling_contract["off_platform_half_width"] = cfg.off_platform_half_width
-        print(f"[PGMT] Sampling contract: {self.sampling_contract}")
+        data_key = getattr(self.motion, "motion_data_key", None)
+        if data_key is None:
+            print(f"[PGMT] Sampling contract: {self.sampling_contract}")
+        else:
+            self.sampling_contract["motion_files"] = list(self.motion._all_motion_files)
+            self.sampling_contract["motion_data_key"] = data_key
+            print(f"[PGMT] Loaded {self.num_motions} H5 clips with data key {data_key}")
         for name in ("error_body_pos", "error_joint_pos", "terrain_level", "terrain_gate"):
             self.metrics[name] = torch.zeros(self.num_envs, device=self.device)
 
     def _load_contacts(self):
         """按动作文件名加载离线接触标签，并统一身体顺序。"""
+        labels = getattr(self.motion, "reference_contact_labels", None)
+        if labels is None:
+            labels = self._read_contact_files()
+        self.labels, self.label_valid, self.label_bottom = labels
+        lengths = self.motion._all_motion_sequences.buffer_length.long().to(self.device)
+        self.label_starts = lengths.cumsum(0) - lengths
+        self.label_lengths = lengths
+
+    def _read_contact_files(self):
         directory = Path(self.cfg.contact_labels_dir)
         contacts, validity, bottom = [], [], []
         for path in self.motion._all_motion_files:
@@ -123,13 +138,7 @@ class TerrainMotion(CommandTerm):
                 order = [data["body_names"].tolist().index(n) for n in self.reference.cfg.link_of_interests]
                 for target, key in ((contacts, "contact"), (validity, "valid"), (bottom, "bottom")):
                     target.append(torch.as_tensor(data[key][:, order], device=self.device))
-        # 所有动作沿帧维拼接，通过各段起始索引定位当前帧的标签。
-        self.labels = torch.cat(contacts)
-        self.label_valid = torch.cat(validity)
-        self.label_bottom = torch.cat(bottom)
-        lengths = self.motion._all_motion_sequences.buffer_length.long().to(self.device)
-        self.label_starts = lengths.cumsum(0) - lengths
-        self.label_lengths = lengths
+        return torch.cat(contacts), torch.cat(validity), torch.cat(bottom)
 
     @property
     def frame_ids(self):
@@ -407,6 +416,10 @@ class TerrainMotionCfg(CommandTermCfg):
     class_type: type | str = "{DIR}.terrain_commands:TerrainMotion"
     resampling_time_range: tuple = (1e9, 1e9)
     contact_labels_dir: str = ""
+    motion_buffer_name: str = "LAFAN"
+    foot_body_names: tuple[str, str] = ("left_ankle_roll_link", "right_ankle_roll_link")
+    hand_body_names: tuple[str, str] = ("left_wrist_yaw_link", "right_wrist_yaw_link")
+    impact_body_names: tuple[str, ...] = ("pelvis", "torso_link")
     enable_terrain_curriculum: bool = True
     randomize_terrain_on_reset: bool = False
     randomize_platform_spawn: bool = False

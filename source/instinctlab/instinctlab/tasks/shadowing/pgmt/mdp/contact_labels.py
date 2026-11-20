@@ -14,6 +14,7 @@ from pathlib import Path
 
 
 def collision_vertices(urdf):
+    urdf = Path(urdf)
     tree = ET.parse(urdf)
     output = {}
     for link in tree.findall("link"):
@@ -86,28 +87,26 @@ def make_labels(path, vertices):
     with np.load(path, allow_pickle=False) as data:
         names = data["body_names"].astype(str).tolist()
         p, q, v = (data[key] for key in ("body_pos_w", "body_quat_w", "body_lin_vel_w"))
-        count = len(p)
-        bottom = np.full((count, len(names)), np.nan, np.float32)
-        for index, name in enumerate(names):
-            if name not in vertices:
-                continue
-            # Last row of rotation(wxyz): maps collision local coordinates to world height.
-            w, x, y, z = q[:, index].T
-            row = np.stack((2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)), -1)
-            bottom[:, index] = (row @ vertices[name].T).min(-1) + p[:, index, 2]
-        speed = np.linalg.norm(v, axis=-1)
-        contact = (bottom < 0.04) & (speed < 0.4)
-        # Ambiguous phase transitions and invalid source geometry are NOT negative labels.
-        valid = np.isfinite(bottom) & np.isfinite(speed) & (bottom >= -0.05)
-        valid &= (np.abs(bottom - 0.04) > 0.01) & (np.abs(speed - 0.4) > 0.1)
-        fps = float(data["fps"].reshape(-1)[0])
         return dict(
-            contact=contact,
-            valid=valid,
-            bottom=bottom,
+            **labels_from_pose(p, q, v, names, vertices),
             body_names=np.asarray(names),
-            fps=np.asarray([fps]),
+            fps=np.asarray([float(data["fps"].reshape(-1)[0])]),
         )
+
+
+def labels_from_pose(position, rotation, velocity, names, vertices):
+    bottom = np.full((len(position), len(names)), np.nan, np.float32)
+    for index, name in enumerate(names):
+        if name not in vertices:
+            continue
+        w, x, y, z = rotation[:, index].T
+        row = np.stack((2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)), -1)
+        bottom[:, index] = (row @ vertices[name].T).min(-1) + position[:, index, 2]
+    speed = np.linalg.norm(velocity, axis=-1)
+    contact = (bottom < 0.04) & (speed < 0.4)
+    valid = np.isfinite(bottom) & np.isfinite(speed) & (bottom >= -0.05)
+    valid &= (np.abs(bottom - 0.04) > 0.01) & (np.abs(speed - 0.4) > 0.1)
+    return dict(contact=contact, valid=valid, bottom=bottom)
 
 
 def main():

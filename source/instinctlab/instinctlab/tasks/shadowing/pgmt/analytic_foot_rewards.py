@@ -14,20 +14,21 @@ class AnalyticFootRewards:
         self.feet = rewards.command.foot_ids
         vertices = collision_vertices(rewards.command.reference.cfg.robot_model_path)
         names = rewards.command.reference.cfg.link_of_interests
-        points = torch.stack(
-            [torch.as_tensor(vertices[names[i]], device=rewards.env.device, dtype=torch.float32) for i in self.feet]
-        )
-        lo, hi = points.amin(1), points.amax(1)
+        points = [
+            torch.as_tensor(vertices[names[i]], device=rewards.env.device, dtype=torch.float32) for i in self.feet
+        ]
+        lo = torch.stack([foot.amin(0) for foot in points])
+        hi = torch.stack([foot.amax(0) for foot in points])
         u, v = torch.meshgrid(
-            torch.linspace(0, 1, cfg["grid_x"], device=points.device),
-            torch.linspace(0, 1, cfg["grid_y"], device=points.device),
+            torch.linspace(0, 1, cfg["grid_x"], device=lo.device),
+            torch.linspace(0, 1, cfg["grid_y"], device=lo.device),
             indexing="ij",
         )
         self.grid = lo[:, None].expand(-1, u.numel(), -1).clone()
         self.grid[..., 0] += u.flatten() * (hi[:, 0] - lo[:, 0])[:, None]
         self.grid[..., 1] += v.flatten() * (hi[:, 1] - lo[:, 1])[:, None]
         self.alpha = math.exp(-rewards.dt / cfg["tau"])
-        self.memory = points.new_zeros(rewards.env.num_envs)
+        self.memory = lo.new_zeros(rewards.env.num_envs)
 
     def filter(self, excess, initial):
         """Exact recurrence in batch: no truncation or extra (1-alpha) factor."""

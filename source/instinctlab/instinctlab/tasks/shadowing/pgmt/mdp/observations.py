@@ -17,11 +17,14 @@ def reference_height(env):
     return env.scene["motion_reference"].data.base_pos_w[..., 2]
 
 
-def privileged_state(env): 
+def privileged_state(env, *, reference_height=None, anchor_pos_w=None, anchor_quat_w=None):
     motion = env.scene["motion_reference"]
     ref = motion.reference_frame
     robot = env.scene["robot"]
     q = ref.base_quat_w[:, 0]
+    reference_height = ref.base_pos_w[:, 0, 2:3] if reference_height is None else reference_height
+    anchor_pos_w = ref.base_pos_w[:, 0] if anchor_pos_w is None else anchor_pos_w
+    anchor_quat_w = q if anchor_quat_w is None else anchor_quat_w
     gravity = q.new_tensor([0.0, 0.0, -1.0]).expand(env.num_envs, -1)
     command = torch.cat(
         (
@@ -30,7 +33,7 @@ def privileged_state(env):
             quat_apply_inverse(q, ref.base_lin_vel_w[:, 0]),
             quat_apply_inverse(q, ref.base_ang_vel_w[:, 0]),
             quat_apply_inverse(q, gravity),
-            ref.base_pos_w[:, 0, 2:3],
+            reference_height,
         ),
         -1,
     )
@@ -38,8 +41,8 @@ def privileged_state(env):
     pos = robot.data.body_pos_w.torch[:, ids]
     rot = robot.data.body_quat_w.torch[:, ids]
     root_q = robot.data.root_quat_w.torch
-    anchor_pos = quat_apply_inverse(root_q, ref.base_pos_w[:, 0] - robot.data.root_pos_w.torch)
-    anchor_ori = matrix_from_quat(quat_mul(quat_inv(root_q), q))[..., :2].flatten(1)
+    anchor_pos = quat_apply_inverse(root_q, anchor_pos_w - robot.data.root_pos_w.torch)
+    anchor_ori = matrix_from_quat(quat_mul(quat_inv(root_q), anchor_quat_w))[..., :2].flatten(1)
     inverse = quat_inv(root_q[:, None].expand_as(rot))
     body_pos = quat_apply_inverse(root_q[:, None].expand_as(rot), pos - robot.data.root_pos_w.torch[:, None]).flatten(1)
     body_ori = matrix_from_quat(quat_mul(inverse, rot))[..., :2].flatten(1)
@@ -60,7 +63,7 @@ def privileged_state(env):
     )
 
 
-def anchor_height_reward(env, std=0.3): # 这个不应该出现
+def anchor_height_reward(env, std=0.3):  # 这个不应该出现
     ref = env.scene["motion_reference"].reference_frame
     error = ref.base_pos_w[:, 0, 2] - env.scene["robot"].data.root_pos_w.torch[:, 2]
     return torch.exp(-error.square() / std**2)
