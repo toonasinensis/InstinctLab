@@ -50,3 +50,4 @@ agents/computation
 /imgui.ini
 /agents/pgmt_*validation*
 /agents/pgmt_*curve_comparison*
+tmp/
