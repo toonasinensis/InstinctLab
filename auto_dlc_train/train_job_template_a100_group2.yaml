@@ -1,0 +1,31 @@
+jobName: HEFT_train_t3_2gpu_stage3_maxdelay1_agent_test
+clusterName: 集群2
+priority: 9
+podCount: 1
+command: |
+  export PROJECT_DIR=/mnt/data/mgg/project_2026/motion_tracking
+  bash $PROJECT_DIR/tmp/train_t3_2gpu_stage3_maxdelay1.sh
+imageName: rl-wbc-a100-rxlu-0703:teleop
+
+# 阿里云规格
+specName: NVIDIA-A100
+gpuCount: 1
+
+projectName: AWE
+resourcePoolName: A100-Group1
+
+# 数据集挂载（选填，可多条）
+dataSet:
+  - datasetName: RL-Group-wlcb-cpfs-taplab        # 数据集中文名 → datasetLocalId
+    mountPath: /mnt/data/                # 挂载路径
+    readOnly: false
+  # - datasetName: another-dataset
+  #   mountPath: /mnt/data2/
+  #   version: v2                          # 选填，数据集版本
+
+# 存储挂载（选填，可多条）
+# storageMountList:
+#   - storageName: tars-datasets-wlcb      # 存储中文名 → fileStorageId
+#     fileSystemPath: /                    # 文件系统路径
+#     mountPath: /mnt/oss_wlcb/            # 挂载路径
+#     readOnly: true

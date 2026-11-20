@@ -1,0 +1,3 @@
+credentials.yaml
+.token_cache.json
+__pycache__/
