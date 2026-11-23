@@ -96,16 +96,29 @@ class PGMTLogger(Logger):
             result["Episode/mean_episode_length"] = float(lengths.mean())
             result["Episode/median_episode_length"] = float(lengths.median())
         command = self.command
-        result["Terrain/mean_level"] = float(command.terrain.level.float().mean())
+        levels = command.terrain.level
+        result["Terrain/mean_level"] = float(levels.float().mean())
         away = (command.robot_anchor_pos_w[:, :2] - self.native.scene.env_origins[:, :2]).abs().amax(
             -1
         ) > command.cfg.off_platform_half_width
         result["Terrain/off_platform_fraction"] = float(away.float().mean())
-        for family in {name.split("_")[0] for name in command.terrain.column_names}:
-            columns = [i for i, name in enumerate(command.terrain.column_names) if name.startswith(family)]
-            selected = torch.stack([self.native.scene.terrain.terrain_types == i for i in columns]).any(0)
-            if selected.any():
-                result["Terrain/" + family + "_level"] = float(command.terrain.level[selected].float().mean())
+        column_names = command.terrain.column_names
+        if column_names:
+            types = self.native.scene.terrain.terrain_types
+            families = {name.split("_", 1)[0] for name in column_names}
+            for name in sorted(families | set(column_names)):
+                columns = [i for i, column in enumerate(column_names) if name in (column, column.split("_", 1)[0])]
+                selected = torch.stack([types == i for i in columns]).any(0)
+                if selected.any():
+                    terrain_levels = levels[selected]
+                    if name in families or name in command.stair_directions:
+                        result[f"Terrain/{name}_level"] = float(terrain_levels.float().mean())
+                    result[f"Terrain/{name}_max_level"] = int(terrain_levels.max())
+            for direction, counts in zip(command.stair_directions, command.stair_counts.tolist(), strict=True):
+                for name, count in zip(command.stair_count_names, counts, strict=True):
+                    result[f"Curriculum/{direction}/{name}"] = count
+        else:
+            result["Terrain/flat_max_level"] = int(levels.max())
         result.update(
             {
                 key: float(value)

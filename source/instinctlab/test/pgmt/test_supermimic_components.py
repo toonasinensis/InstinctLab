@@ -5,9 +5,12 @@ import os
 import torch
 import unittest
 from tensordict import TensorDict
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 from _legacy_source import legacy_module
 
+from instinctlab.tasks.shadowing.pgmt.mdp.terrain_commands import TerrainMotion
 from instinctlab.tasks.shadowing.pgmt.supermimic.config import OptimizerCfg, RepresentationCfg, ScheduleCfg
 from instinctlab.tasks.shadowing.pgmt.supermimic.layouts import RobotLayout
 from instinctlab.tasks.shadowing.pgmt.supermimic.learners.pgmt_learner_utils import (
@@ -20,6 +23,51 @@ from instinctlab.tasks.shadowing.pgmt.supermimic.learners.pgmt_learner_utils imp
 )
 from instinctlab.tasks.shadowing.pgmt.supermimic.pgmt_replay_buffer import PGMTReplayBuffer as ReplayBuffer
 from instinctlab.tasks.shadowing.pgmt.supermimic.pgmt_representation import REPRESENTATIONS
+
+
+class TerrainCurriculumTests(unittest.TestCase):
+    def test_motion_end_upgrade_and_stair_direction_counts(self):
+        ids = torch.arange(11)
+        time_out = torch.tensor([False] * 5 + [True, False, True, False, False, False])
+        motion_end = torch.tensor([True] * 5 + [False, True, True, True, True, False])
+        failed = torch.tensor([False, False, False, True, False, False, False, False, True, False, False])
+        env = SimpleNamespace(
+            termination_manager=SimpleNamespace(get_term={"time_out": time_out, "motion_end": motion_end}.__getitem__),
+            episode_length_buf=torch.tensor([249, 250, 250, 300, 300, 500, 250, 500, 300, 250, 300]),
+            step_dt=0.02,
+        )
+        terrain = SimpleNamespace(
+            terrain_levels=torch.tensor([2, 2, 2, 2, 2, 2, 9, 2, 0, 2, 2]),
+            terrain_types=torch.tensor([0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 1]),
+            max_terrain_level=10,
+            update_env_origins=Mock(),
+        )
+        command = SimpleNamespace(
+            env=env,
+            cfg=SimpleNamespace(curriculum_motion_end_min_s=5.0, curriculum_off_platform_steps=50),
+            terrain=SimpleNamespace(
+                outside=ids == 4, off_platform_steps=torch.tensor([51, 51, 50, 51, 51, 51, 51, 51, 51, 0, 51])
+            ),
+            stair_columns=torch.tensor([[True, False, False], [False, True, False]]),
+            stair_counts=torch.zeros(2, 5),
+        )
+        family = torch.where(ids == 9, 0, 2)
+        TerrainMotion._update_terrain_curriculum(command, ids, terrain, family, failed)
+        moved_ids, promotions, demotions = terrain.update_env_origins.call_args.args
+        torch.testing.assert_close(moved_ids, ids)
+        torch.testing.assert_close(promotions, torch.isin(ids, torch.tensor([1, 5, 6, 7, 9])))
+        torch.testing.assert_close(demotions, failed)
+        torch.testing.assert_close(
+            command.stair_counts, torch.tensor([[4.0, 1.0, 1.0, 0.0, 1.0], [6.0, 2.0, 0.0, 1.0, 0.0]])
+        )
+
+        command.cfg.curriculum_motion_end_min_s = 0.0
+        command.stair_counts.zero_()
+        TerrainMotion._update_terrain_curriculum(command, ids, terrain, family, failed)
+        torch.testing.assert_close(terrain.update_env_origins.call_args.args[1], time_out)
+        torch.testing.assert_close(
+            command.stair_counts, torch.tensor([[4.0, 0.0, 1.0, 0.0, 0.0], [6.0, 2.0, 0.0, 0.0, 0.0]])
+        )
 
 
 class RepresentationTests(unittest.TestCase):

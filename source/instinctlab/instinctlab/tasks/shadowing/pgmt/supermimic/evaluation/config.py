@@ -5,6 +5,8 @@ import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from instinctlab.tasks.shadowing.pgmt.selection import rename_legacy_stair_settings
+
 
 @dataclass(frozen=True)
 class EnvironmentOverrides:
@@ -86,7 +88,7 @@ def apply_overrides(cfg, overrides):
 def prepare_config(settings):
     from instinctlab.utils import instinct_rl_cli as cli
 
-    saved_env = cli.load_saved_yaml(str(settings.env_config))
+    saved_env = rename_legacy_stair_settings(cli.load_saved_yaml(str(settings.env_config)))
     # Dynamic mapping keys must be restored after the strict saved-config loader.
     weights = saved_env["commands"]["motion"].pop("terrain_sampling_weights", {})
     cfg, _ = cli.resolve_saved_cfg(settings.task, [], env_yaml=copy.deepcopy(saved_env), play_mode=False)

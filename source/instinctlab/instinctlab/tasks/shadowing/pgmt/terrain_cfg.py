@@ -84,7 +84,7 @@ def make_pgmt_terrain_cfg(seed: int = 42):
                 border_width=0.25,
                 inverted=True,
             ),
-            "stairs_up": terrain_gen.MeshPyramidStairsTerrainCfg(
+            "stairs_down": terrain_gen.MeshPyramidStairsTerrainCfg(
                 function=level_stairs,
                 proportion=0.1,
                 step_height_range=(0.02, 0.20),
@@ -93,7 +93,7 @@ def make_pgmt_terrain_cfg(seed: int = 42):
                 border_width=1.0,
                 holes=False,
             ),
-            "stairs_down": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
+            "stairs_up": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
                 function=level_inverted_stairs,
                 proportion=0.1,
                 step_height_range=(0.02, 0.20),

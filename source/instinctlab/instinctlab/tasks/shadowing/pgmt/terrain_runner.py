@@ -9,6 +9,7 @@ from instinct_rl.modules.normalizer import EmpiricalNormalization
 from instinct_rl.runners import OnPolicyRunner
 from tensorboardX import SummaryWriter
 
+from .selection import rename_legacy_stair_columns
 from .terrain_ppo import TerrainPPO
 
 
@@ -150,6 +151,7 @@ class TerrainRunner(OnPolicyRunner):
             raise ValueError("Terrain resume changed schema, rank count, environment count or gate ramp")
         previous_sampling = dict(info.get("sampling_contract", c.sampling_contract))
         current_sampling = dict(c.sampling_contract)
+        previous_sampling = rename_legacy_stair_columns(previous_sampling, current_sampling)
         if self.cfg.get("resume_terrain_change", False):
             for contract in (previous_sampling, current_sampling):
                 contract.pop("platform_spawn", None)

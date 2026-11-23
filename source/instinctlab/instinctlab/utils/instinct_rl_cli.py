@@ -311,6 +311,8 @@ def resolve_saved_cfg(
     from isaaclab_tasks.utils import resolve_task_config
     from isaaclab_tasks.utils.hydra import _parse_val, _setattr, register_task
 
+    from instinctlab.tasks.shadowing.pgmt.selection import rename_legacy_stair_settings
+
     if env_yaml is None and agent_yaml is None:
         _reject_in_memory_meshes_with_hydra(task, overrides)
         return resolve_task_config(
@@ -320,6 +322,7 @@ def resolve_saved_cfg(
     selectors = [token for token in overrides if token.partition("=")[0] in (*PRESET_SELECTORS, VISUALIZER_SELECTOR)]
     env_cfg, agent_cfg, _ = register_task(task, AGENT_ENTRY_POINT, play_mode=play_mode, overrides=selectors)
     if env_yaml is not None:
+        env_yaml = rename_legacy_stair_settings(env_yaml)
         _materialize_saved_physics(env_cfg, env_yaml)
         update_class_from_dict(env_cfg, _prune_disabled(env_cfg, replace_strings_with_slices(env_yaml), "env"))
     if agent_yaml is not None:

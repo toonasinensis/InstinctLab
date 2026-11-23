@@ -25,8 +25,9 @@ motions and the original terrain proportions. The new
 
 There are 10 rows and 10 columns of 8 x 8 m tiles, a 10 m outer border,
 0.10 m horizontal and 0.005 m vertical terrain resolution. The column order is
-`flat, flat, slope_up, slope_down, stairs_up, stairs_up, stairs_down,
-stairs_down, rough, rough`. Slopes and stairs retain their original
+`flat, flat, slope_up, slope_down, stairs_down, stairs_down, stairs_up,
+stairs_up, rough, rough`. Stair names describe the direction from the center
+platform toward the rim. Slopes and stairs retain their original
 2 m center platform; rough terrain has no separately
 flattened center platform. Slope/rough border width is 0.25 m and stairs border
 width is 1 m. The height scanner is 21 x 21 points over 2 x 2 m, at 0.10 m spacing,

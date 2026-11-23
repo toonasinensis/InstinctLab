@@ -156,6 +156,16 @@ The Newton task is `Instinct-PGMT-SuperMimic-T3_27-Newton-v0`. It uses the 27-jo
 T3 URDF, a 17 × 11 height grid, the existing flat warmup and the terrain curriculum
 with flat, ramps, stairs and rough terrain. The URDF and its meshes ship in
 `$PROJECT_DIR/source/instinctlab/instinctlab/assets/resources/t3_27/`.
+From the center platform to the rim, `stairs_up` rises and `stairs_down` descends.
+Saved configurations and checkpoints with the original stair names are translated
+on load. TensorBoard logs from those runs retain the labels used when recorded.
+
+TensorBoard's `Terrain/mean_level` and `Terrain/<terrain>_level` curves report means
+across the matching environments. `Terrain/<terrain>_max_level` reports their highest
+current level at each training update, including separate curves for the two ramp
+and stair directions. A terrain with no matching environment has no sample for
+that update. Level 9 on this curve means at least one environment is on level 9.
+
 Set `PGMT_T3_27_MOTION_H5` to the original
 `moving_upright_middlespeed.h5` or another grouped 50 Hz T3 dataset.
 

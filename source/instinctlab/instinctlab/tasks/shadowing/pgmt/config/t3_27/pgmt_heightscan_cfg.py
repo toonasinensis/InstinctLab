@@ -37,6 +37,7 @@ class T3_27PGMTHeightScanEnvCfg(G1PGMTScan187EnvCfg):
         self.commands.motion.motion_buffer_name = "SOMA"
         self.commands.motion.hand_body_names = ("left_wrist_roll_link", "right_wrist_roll_link")
         self.commands.motion.impact_body_names = ("pelvis", "waist_yaw_link")
+        self.commands.motion.curriculum_motion_end_min_s = 5.0
         self.run_name = "T3_27HeightScan"
 
     def _configure_tracking_joints(self):

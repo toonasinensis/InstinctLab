@@ -242,6 +242,7 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
     def _before_iteration(self, train_actor):
         self._actor_updates_before_collection = self.policy_learner.actor_updates
         self._finish_flat_warmup()
+        self.command.stair_counts.zero_()
         self.foot_rewards.set_updates(self.policy_learner.actor_updates)
         gate = (
             min(1.0, (self.policy_learner.actor_updates + 1) / self.train_cfg["terrain_gate_ramp"])

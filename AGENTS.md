@@ -27,6 +27,10 @@
 
 训练默认使用 RTX4090。只有用户明确指定其他 GPU 时，才切换到 A100、A800 或其他资源；RTX4090 需要排队时仍提交到 RTX4090，不自动更换 GPU 类型。
 
+## 本地回放
+
+- 用户未指定其他播放器时，PGMT 的 `play` 默认使用 `$PROJECT_DIR/source/instinctlab/instinctlab/tasks/shadowing/pgmt/msic/play.sh` 对应的 MuJoCo 播放器。T3_27 已有本地适配时，使用对应实验目录下的 `$PROJECT_DIR/../InstinctLab-local/playback/<run>/msic-flat/play.sh`。
+
 ## 说明文档规范
 
 - **路径表示**：除本文档外，项目说明文档中的项目根路径统一使用 `$PROJECT_DIR` 代称，不得使用绝对路径。

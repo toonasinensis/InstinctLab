@@ -4,6 +4,42 @@ import math
 from pathlib import Path
 
 TERRAIN_FAMILIES = {"flat": 0, "slope_up": 1, "slope_down": 1, "stairs_up": 2, "stairs_down": 2, "boxes": 3, "rough": 4}
+LEGACY_STAIR_NAMES = {"stairs_up": "stairs_down", "stairs_down": "stairs_up"}
+
+
+def rename_legacy_stair_settings(env):
+    scene = env.get("scene") or {}
+    terrain = scene.get("terrain") or {}
+    generator = terrain.get("terrain_generator") or {}
+    sub_terrains = generator.get("sub_terrains") or {}
+    old_up = sub_terrains.get("stairs_up") or {}
+    old_down = sub_terrains.get("stairs_down") or {}
+    prefix = "instinctlab.tasks.shadowing.pgmt.terrain_cfg:"
+    if (
+        old_up.get("function") != prefix + "level_stairs"
+        and old_down.get("function") != prefix + "level_inverted_stairs"
+    ):
+        return env
+
+    renamed = {LEGACY_STAIR_NAMES.get(name, name): value for name, value in sub_terrains.items()}
+    env = {
+        **env,
+        "scene": {**scene, "terrain": {**terrain, "terrain_generator": {**generator, "sub_terrains": renamed}}},
+    }
+    commands = env.get("commands") or {}
+    motion = commands.get("motion") or {}
+    weights = motion.get("terrain_sampling_weights")
+    if weights:
+        renamed_weights = {LEGACY_STAIR_NAMES.get(name, name): value for name, value in weights.items()}
+        env["commands"] = {**commands, "motion": {**motion, "terrain_sampling_weights": renamed_weights}}
+    return env
+
+
+def rename_legacy_stair_columns(saved, current):
+    if current.get("stair_names_from_center") and "stair_names_from_center" not in saved:
+        columns = [LEGACY_STAIR_NAMES.get(name, name) for name in saved["terrain_columns"]]
+        return {**saved, "terrain_columns": columns, "stair_names_from_center": True}
+    return saved
 
 
 def select_motion_files(files, names):

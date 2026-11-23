@@ -35,6 +35,29 @@ class TestSelection(unittest.TestCase):
                 self.assertEqual(columns.count("stairs_up"), 2)
                 self.assertEqual(columns.count("stairs_down"), 2)
 
+    def test_legacy_stair_names_preserve_geometry_and_column_order(self):
+        prefix = "instinctlab.tasks.shadowing.pgmt.terrain_cfg:"
+        old_up = {"function": prefix + "level_stairs", "step_height_range": (0.02, 0.25)}
+        old_down = {"function": prefix + "level_inverted_stairs", "step_height_range": (0.02, 0.20)}
+        sub_terrains = {"flat": {}, "stairs_up": old_up, "stairs_down": old_down, "rough": {}}
+        generator = {"sub_terrains": sub_terrains}
+        motion = {"terrain_sampling_weights": {"stairs_up": 1, "stairs_down": 2}}
+        saved = {"scene": {"terrain": {"terrain_generator": generator}}, "commands": {"motion": motion}}
+
+        restored = selection.rename_legacy_stair_settings(saved)
+        terrains = restored["scene"]["terrain"]["terrain_generator"]["sub_terrains"]
+        self.assertEqual(list(terrains), ["flat", "stairs_down", "stairs_up", "rough"])
+        self.assertIs(terrains["stairs_down"], old_up)
+        self.assertIs(terrains["stairs_up"], old_down)
+        self.assertEqual(restored["commands"]["motion"]["terrain_sampling_weights"], {"stairs_down": 1, "stairs_up": 2})
+        self.assertIs(selection.rename_legacy_stair_settings(restored), restored)
+        self.assertIs(sub_terrains["stairs_up"], old_up)
+
+        previous = {"terrain_columns": list(sub_terrains)}
+        current = {"terrain_columns": list(terrains), "stair_names_from_center": True}
+        self.assertEqual(selection.rename_legacy_stair_columns(previous, current), current)
+        self.assertIs(selection.rename_legacy_stair_columns(current, current), current)
+
     def test_invalid_terrain_proportions_are_not_silently_accepted(self):
         for weights in ((0, 0), (-1, 2), (float("nan"), 1), (0.99999, 0.00001)):
             cfg = {name: SimpleNamespace(proportion=w) for name, w in zip(("flat", "rough"), weights)}

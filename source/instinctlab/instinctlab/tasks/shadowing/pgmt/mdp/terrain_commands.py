@@ -41,6 +41,8 @@ class TerrainMotion(CommandTerm):
             raise ValueError("Motion uniform fraction must be in [0,1] and failure decay in [0,1)")
         if cfg.curriculum_off_platform_steps < 0:
             raise ValueError("curriculum_off_platform_steps must be nonnegative")
+        if not 0 <= cfg.curriculum_motion_end_min_s <= env.max_episode_length_s:
+            raise ValueError("curriculum_motion_end_min_s must be within the episode time limit")
         self.env = env
         self.robot = env.scene["robot"]
         self.reference = env.scene["motion_reference"]
@@ -72,6 +74,14 @@ class TerrainMotion(CommandTerm):
         self.stratum_visits = torch.zeros_like(self.stratum_failure)
         self._load_contacts()
         self.terrain = TerrainContext(self)
+        self.stair_directions = ("stairs_up", "stairs_down")
+        self.stair_columns = torch.tensor(
+            [[name == direction for name in self.terrain.column_names] for direction in self.stair_directions],
+            device=self.device,
+            dtype=torch.bool,
+        )
+        self.stair_count_names = ("episodes", "promotions", "demotions", "max_level_passes", "motion_end_promotions")
+        self.stair_counts = torch.zeros((len(self.stair_directions), len(self.stair_count_names)), device=self.device)
         self.contacts = TerrainContacts(self)
         if cfg.randomize_platform_spawn:
             if env.scene.terrain.cfg.terrain_type != "generator" or cfg.spawn_platform_margin <= 0:
@@ -95,6 +105,10 @@ class TerrainMotion(CommandTerm):
             enable_terrain_curriculum=cfg.enable_terrain_curriculum,
             terrain_curriculum_version="max_level_resample_v1",
         )
+        if any(direction in self.terrain.column_names for direction in self.stair_directions):
+            self.sampling_contract["stair_names_from_center"] = True
+        if cfg.curriculum_motion_end_min_s > 0:
+            self.sampling_contract["curriculum_motion_end_min_s"] = cfg.curriculum_motion_end_min_s
         self.sampling_contract["platform_spawn"] = dict(
             enabled=cfg.randomize_platform_spawn,
             margin=cfg.spawn_platform_margin,
@@ -298,6 +312,31 @@ class TerrainMotion(CommandTerm):
         self.terrain.update()
         self.contacts.update()
 
+    def _update_terrain_curriculum(self, ids, terrain, family, failed):
+        terminations = self.env.termination_manager
+        time_out = terminations.get_term("time_out")[ids]
+        motion_end = torch.zeros_like(time_out)
+        if self.cfg.curriculum_motion_end_min_s > 0:
+            elapsed = self.env.episode_length_buf[ids] * self.env.step_dt
+            motion_end = terminations.get_term("motion_end")[ids] & (elapsed >= self.cfg.curriculum_motion_end_min_s)
+        success = (time_out | motion_end) & ~failed & ~self.terrain.outside[ids]
+        success &= (self.terrain.off_platform_steps[ids] > self.cfg.curriculum_off_platform_steps) | (family == 0)
+        assigned_levels = terrain.terrain_levels[ids]
+        at_max = assigned_levels == terrain.max_terrain_level - 1
+        promoted = success & ~at_max
+        outcomes = torch.stack(
+            (
+                torch.ones_like(success),
+                promoted,
+                failed & (assigned_levels > 0),
+                success & at_max,
+                promoted & motion_end & ~time_out,
+            ),
+            dim=-1,
+        )
+        self.stair_counts += (self.stair_columns[:, terrain.terrain_types[ids], None] & outcomes).sum(dim=1)
+        terrain.update_env_origins(ids, success, failed)
+
     def reset_placement(self, ids):
         """结算上一轮、采样参考片段，并将机器人放置到所分配地形块的出生位置。"""
         if isinstance(ids, slice):
@@ -315,13 +354,7 @@ class TerrainMotion(CommandTerm):
             decay = self.cfg.motion_failure_decay
             self.stratum_failure.mul_(decay).add_(counts.reshape_as(self.stratum_failure), alpha=1 - decay)
             if self.cfg.enable_terrain_curriculum and t.cfg.terrain_type == "generator":
-                # 无失败且未越界地跑满时长才算成功；非平地还需累计超过 50 步离开中心平台。
-                # 成功升一级、失败降一级；通过最高等级后随机分配等级，并同步出生原点。
-                success = self.env.termination_manager.get_term("time_out")[old] & ~failed & ~self.terrain.outside[old]
-                success &= (self.terrain.off_platform_steps[old] > self.cfg.curriculum_off_platform_steps) | (
-                    family == 0
-                )
-                t.update_env_origins(old, success, failed)
+                self._update_terrain_curriculum(old, t, family, failed)
         if self.cfg.randomize_terrain_on_reset:
             # Sample every terrain column and difficulty independently on each reset.
             # Account for the previous episode above before changing its assignment.
@@ -428,6 +461,7 @@ class TerrainMotionCfg(CommandTermCfg):
     spawn_platform_margin: float = 0.2
     spawn_center_region_width: float = 2.0
     curriculum_off_platform_steps: int = 50
+    curriculum_motion_end_min_s: float = 0.0
     motion_uniform_fraction: float = 0.2
     motion_failure_decay: float = 0.99
     enable_contact_objectives: bool = True

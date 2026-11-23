@@ -4,6 +4,8 @@ import torch
 from dataclasses import asdict
 from pathlib import Path
 
+from instinctlab.tasks.shadowing.pgmt.selection import rename_legacy_stair_columns
+
 SCHEMA = "pgmt-supermimic-upstream-v2"
 
 
@@ -107,7 +109,13 @@ def save(runner, path):
 
 def load(runner, path):
     payload = torch.load(path, map_location=runner.device, weights_only=True)["supermimic"]
-    if payload["schema"] != SCHEMA or payload["contract"] != contract(runner):
+    saved, current = payload["contract"], contract(runner)
+    saved = {**saved, "sampling": rename_legacy_stair_columns(saved["sampling"], current["sampling"])}
+    if payload["environment"]["flat_warmup_active"] and runner.command.flat_warmup_active:
+        field = "curriculum_motion_end_min_s"
+        saved = {**saved, "sampling": {key: value for key, value in saved["sampling"].items() if key != field}}
+        current["sampling"] = {key: value for key, value in current["sampling"].items() if key != field}
+    if payload["schema"] != SCHEMA or saved != current:
         raise ValueError("Resume configuration differs; use explicit weight initialization for a changed experiment")
     runner.policy_learner.load_state_dict(payload["policy"])
     runner.world_model_learner.load_state_dict(payload["world_model"])
