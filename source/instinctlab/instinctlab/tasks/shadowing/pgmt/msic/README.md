@@ -26,12 +26,20 @@ Space pauses; R resets; G toggles the reference; H toggles the scan; V switches 
 terrain-adjusted reference display. Time-based reset defaults off (`--reset-seconds 0`);
 failure, motion-end and tile-exit resets stay active.
 
+The dashboard records the MuJoCo scene at 960 × 540 and 25 fps. Start and stop
+recording next to the playback controls, then download the saved MP4 from the
+same panel. It uses the current camera and follows the ghost and scan toggles.
+Recording counts simulation time and skips pauses. Files are saved in the
+sibling `InstinctLab-local/recordings/<run>/` directory unless
+`--recordings-dir` is supplied. Recording uses FFmpeg with libx264 or GStreamer
+with x264enc and mp4mux.
+
 The player loads the canonical native `TerrainActor` weights, keeps checkpoint observation
 statistics frozen, and bypasses normalization for the 441 terrain values. Joint mapping,
 PD, action scales, armature, limits and reset duration come from the saved environment.
 NPZ remains WXYZ at the boundary. Scan point order matches the native ray pattern exactly;
-the panel converts it to physical XY for display. There is no training, automatic evaluation,
-rollout recording or background counterfactual evaluation. Input comparison modes run only
+the panel converts it to physical XY for display. There is no training, automatic evaluation
+or background counterfactual evaluation. Input comparison modes run only
 when explicitly selected in the panel.
 
 The G1 MJCF/common helpers are copied from `wbc_parkour/whole_body_tracking/scripts/deploy`;

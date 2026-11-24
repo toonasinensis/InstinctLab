@@ -54,6 +54,7 @@ class PGMTDepthRunner(PGMTSuperMimicRunner):
     def checkpoint_extra_contract(self):
         native = self.env.unwrapped.cfg
         return {
+            **super().checkpoint_extra_contract(),
             "depth_sensor": native.depth_sensor,
             "scan": native.height_scan,
             "camera_mount": {
@@ -86,6 +87,7 @@ class PGMTDepthRunner(PGMTSuperMimicRunner):
         }
 
     def _capture_transition(self, dt):
-        super()._capture_transition(dt)
+        reward = super()._capture_transition(dt)
         image = sensor_tensor(self.camera().output["distance_to_image_plane_noised"]).permute(0, 3, 1, 2)
         self.terminal.update(next_depth_image=ordinary(image), next_image_valid=ordinary(self.camera_valid()))
+        return reward

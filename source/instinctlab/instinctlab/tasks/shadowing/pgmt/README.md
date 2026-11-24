@@ -131,6 +131,12 @@ represent L0--L9. Only resets change assigned difficulty; leaving the centre pla
 non-flat promotion. Lower-body position/orientation/joint tracking tolerances increase with difficulty.
 Recovery is disabled.
 
+`env.commands.motion.curriculum_motion_end_min_s` controls promotion at motion
+end. A positive value sets the minimum episode age. Set it to `null` to accept
+motion end at any episode age, or `0.0` for timeout-only promotion. Both paths
+require a successful episode inside the assigned tile and retain the platform
+exit threshold on non-flat terrain.
+
 Rewards are native `MultiRewardCfg` groups: upper (6 terms), lower (6), auxiliary (9), terrain (6).
 The kernels, weights, contact hysteresis and collision-plane label definitions follow the local
 `whole_body_tracking` terrain implementation. These include local engineering choices; they do not

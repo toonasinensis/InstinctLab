@@ -22,6 +22,16 @@ def velocity(env):
     return env.command_manager.get_term("motion").corrected_velocity_future_b.flatten(1)
 
 
+def foothold_joint_reference(env, command_name, derivative=False):
+    term = env.command_manager.get_term(command_name)
+    reference = term.command
+    adaptation = env.command_manager.get_term("motion").foothold_reference()
+    if adaptation is not None:
+        delta = adaptation[2 if derivative else 1]
+        reference = reference + delta[..., term._asset_joint_ids] * term.mask
+    return reference
+
+
 def elevation(env):
     robot = env.scene["robot"]
     hits = env.scene["height_scanner"].data.ray_hits_w.torch

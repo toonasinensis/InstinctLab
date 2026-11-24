@@ -5,6 +5,7 @@ from isaaclab.utils import configclass
 
 from instinctlab.assets.t3_27 import T3_27_ACTION_SCALE, T3_27_CFG, T3_27_JOINT_NAMES, T3_27_TRACKED_BODIES
 from instinctlab.tasks.shadowing.pgmt.mdp.motion import PGMTGroupedH5MotionCfg
+from instinctlab.tasks.shadowing.pgmt.mdp.terrain_observations import foothold_joint_reference
 from instinctlab.tasks.shadowing.pgmt.pgmt_env_cfg import PGMTSceneCfg
 from instinctlab.tasks.shadowing.pgmt.supermimic.config import ContactRewardCfg
 
@@ -38,6 +39,9 @@ class T3_27PGMTHeightScanEnvCfg(G1PGMTScan187EnvCfg):
         self.commands.motion.hand_body_names = ("left_wrist_roll_link", "right_wrist_roll_link")
         self.commands.motion.impact_body_names = ("pelvis", "waist_yaw_link")
         self.commands.motion.curriculum_motion_end_min_s = 5.0
+        self.observations.policy.joint_pos_ref.func = foothold_joint_reference
+        self.observations.policy.joint_vel_ref.func = foothold_joint_reference
+        self.observations.policy.joint_vel_ref.params["derivative"] = True
         self.run_name = "T3_27HeightScan"
 
     def _configure_tracking_joints(self):

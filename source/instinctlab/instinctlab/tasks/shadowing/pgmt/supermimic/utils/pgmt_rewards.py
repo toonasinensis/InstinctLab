@@ -222,7 +222,7 @@ class AnalyticRewards:
                 (torch.zeros_like(c.terrain.support_z), torch.zeros_like(c.terrain.support_z), c.terrain.support_z), -1
             ),
             ref_rotation=c.anchor_quat_w,
-            ref_body_position=c.body_pos_w - c.anchor_pos_w[:, None],
+            ref_body_position=c.tracking_body_pos_w - c.anchor_pos_w[:, None],
             ref_body_rotation=c.body_quat_w,
             ref_body_velocity=c.body_lin_vel_w,
             ref_body_angular=c.body_ang_vel_w,

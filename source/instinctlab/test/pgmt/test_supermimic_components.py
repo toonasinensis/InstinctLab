@@ -69,6 +69,17 @@ class TerrainCurriculumTests(unittest.TestCase):
             command.stair_counts, torch.tensor([[4.0, 0.0, 1.0, 0.0, 0.0], [6.0, 2.0, 0.0, 0.0, 0.0]])
         )
 
+        command.cfg.curriculum_motion_end_min_s = None
+        env.episode_length_buf[0] = 60
+        command.stair_counts.zero_()
+        TerrainMotion._update_terrain_curriculum(command, ids, terrain, family, failed)
+        _, promotions, demotions = terrain.update_env_origins.call_args.args
+        torch.testing.assert_close(promotions, torch.isin(ids, torch.tensor([0, 1, 5, 6, 7, 9])))
+        torch.testing.assert_close(demotions, failed)
+        torch.testing.assert_close(
+            command.stair_counts, torch.tensor([[4.0, 2.0, 1.0, 0.0, 2.0], [6.0, 2.0, 0.0, 1.0, 0.0]])
+        )
+
 
 class RepresentationTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get("PGMT_LEGACY_SOURCE"), "Requires an external legacy comparison snapshot")

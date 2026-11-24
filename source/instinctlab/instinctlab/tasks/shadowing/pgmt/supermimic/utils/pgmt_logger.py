@@ -24,6 +24,8 @@ class PGMTLogger(Logger):
         )
         if analytic_foot is not None:
             self.term_groups["analytic2"] = tuple(analytic_foot.names)
+        if mdp.progress is not None:
+            self.term_groups["progress"] = ("progress/signed",)
         self.terms = sum(self.term_groups.values(), ())
         self.episode_rewards = EpisodeRewards(
             env.num_envs, self.terms, len(self.rewards.terms), self.native.max_episode_length_s, self.device
@@ -86,6 +88,8 @@ class PGMTLogger(Logger):
         rewards = [replay.data[key][rows] for key in ("native_reward", "native_foot_reward")]
         if self.analytic_foot is not None:
             rewards.append(replay.data["native_analytic_reward"][rows])
+        if "progress" in self.term_groups:
+            rewards.append(replay.data["native_progress_reward"][rows])
         result = self.reward_metrics("RealReward", torch.cat(rewards, -1).mean((0, 1)))
         result.update(self.reward_metrics("ImaginedReward", imagined_means))
         result.update(self.episode_rewards.take())

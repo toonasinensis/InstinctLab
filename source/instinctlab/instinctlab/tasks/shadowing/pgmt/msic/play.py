@@ -11,6 +11,7 @@ from pathlib import Path
 
 import mujoco
 
+from .pgmt_recording import VideoRecorder
 from .pgmt_runtime import REFERENCE_DISPLAYS, PGMTMuJoCo, validate_reset_seconds
 from .pgmt_scene import TERRAINS, SceneCatalog, ViewerWindow
 from .pgmt_terrain import build_scene
@@ -34,6 +35,7 @@ def parser():
     p.add_argument("--heading-deg", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--port", type=int, default=6020)
+    p.add_argument("--recordings-dir", type=Path)
     p.add_argument("--speed", type=float, default=1.0)
     p.add_argument(
         "--reset-seconds",
@@ -68,7 +70,9 @@ def main():
         reset_seconds=args.reset_seconds,
     )
     catalog = SceneCatalog(args.motion.parent, args.contacts, args.seed)
-    dashboard = Dashboard(args.port, catalog)
+    directory = args.recordings_dir or (REPO.with_name(REPO.name + "-local") / "recordings" / policy.path.parent.name)
+    recorder = VideoRecorder(directory)
+    dashboard = Dashboard(args.port, catalog, recordings=recorder.directory)
     print(f"[POLICY] Native PGMT checkpoint {policy.update}: {policy.path}", flush=True)
     print(f"[DASHBOARD] {dashboard.url} · click the map to choose a spawn point", flush=True)
     print("[VIEWER] Single robot; free camera; G reference, H scan, Space pause, R reset", flush=True)
@@ -172,6 +176,16 @@ def main():
                             mode=reference_display,
                             message=REFERENCE_DISPLAYS[reference_display],
                         )
+                    elif kind in ("record_start", "record_stop"):
+                        recorder.request_id = command["request_id"]
+                        recorder.error = None
+                        try:
+                            if kind == "record_start":
+                                recorder.start(policy.update, scene_settings["terrain"], scene_settings["level"])
+                            else:
+                                recorder.stop()
+                        except (OSError, RuntimeError) as error:
+                            recorder.error = str(error)
                 elif command == "pause":
                     paused = not paused
                 elif command == "ghost":
@@ -202,11 +216,20 @@ def main():
                 reset_seconds=sim.reset_seconds,
             )
             snapshot.update(reference_display_snapshot(sim, reference_display, show_ghost))
-            dashboard.update(snapshot)
             if viewer:
                 with viewer.lock():
                     overlay.draw(viewer.user_scn, result, show_scan, show_ghost, reference_display)
                 viewer.sync()
+            try:
+                recorder.capture(step * sim.dt, sim, viewer, overlay, result, show_scan, show_ghost, reference_display)
+            except (OSError, RuntimeError, ValueError) as error:
+                try:
+                    recorder.stop()
+                except (OSError, RuntimeError) as encoder_error:
+                    error = encoder_error
+                recorder.error = str(error)
+            snapshot["recording"] = recorder.snapshot()
+            dashboard.update(snapshot)
             if not paused:
                 metrics = sim.step(result["actions"])
                 step += 1
@@ -222,6 +245,10 @@ def main():
                     metrics = sim.metrics()
             time.sleep(max(0, sim.dt / args.speed - (time.monotonic() - started)))
     finally:
+        try:
+            recorder.stop()
+        except (OSError, RuntimeError) as error:
+            print(f"[RECORDING] {error}", flush=True)
         dashboard.close()
         if window:
             window.close()

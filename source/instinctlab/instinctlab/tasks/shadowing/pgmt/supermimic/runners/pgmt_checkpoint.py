@@ -169,7 +169,9 @@ def initialize_legacy_weights(runner, path):
             source = target
         normalizer.load_state_dict(source)
     runner.normalize_during_warmup = False
-    if "supervised_wm" in saved:
+    if saved.get("supermimic", {}).get("schema") == SCHEMA:
+        runner._dynamics.load_state_dict(saved["supermimic"]["world_model"]["model"])
+    elif "supervised_wm" in saved:
         source = saved["supervised_wm"]["model"]
         mapped = {}
         for key, value in runner._dynamics.state_dict().items():

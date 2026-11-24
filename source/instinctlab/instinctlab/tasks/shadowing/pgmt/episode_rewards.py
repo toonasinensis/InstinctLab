@@ -33,8 +33,9 @@ class EpisodeRewards:
         metrics = {"Episode_Reward/" + key.replace("/", "_"): float(value) for key, value in zip(self.terms, means)}
         metrics["Episode_Reward/base19"] = float(means[: self.base_terms].sum())
         metrics["Episode_Reward/contact4"] = float(means[self.base_terms : self.base_terms + 4].sum())
-        if len(self.terms) > self.base_terms + 4:
-            metrics["Episode_Reward/analytic2"] = float(means[self.base_terms + 4 :].sum())
+        analytic_end = len(self.terms) - int(self.terms[-1] == "progress/signed")
+        if analytic_end > self.base_terms + 4:
+            metrics["Episode_Reward/analytic2"] = float(means[self.base_terms + 4 : analytic_end].sum())
         metrics["Episode_Reward/total"] = float(means.sum())
         metrics["Episode/completed_count"] = count
         self.completed.zero_()

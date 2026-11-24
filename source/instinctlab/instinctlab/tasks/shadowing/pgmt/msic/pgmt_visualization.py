@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import numpy as np
+import re
+import shutil
 import threading
 import uuid
 from collections import deque
@@ -20,7 +22,7 @@ COLORS = np.array([[1.0, 0.69, 0.20], [0.21, 0.85, 0.65], [0.66, 0.52, 1.0], [1.
 
 
 class Dashboard:
-    def __init__(self, port, catalog=None):
+    def __init__(self, port, catalog=None, recordings=None):
         self.snapshot = {}
         self.commands = deque()
         self.lock = threading.Lock()
@@ -39,6 +41,21 @@ class Dashboard:
                 self.wfile.write(payload)
 
             def do_GET(self):
+                endpoint = urlparse(self.path).path
+                if endpoint.startswith("/recordings/") and recordings is not None:
+                    name = endpoint.removeprefix("/recordings/")
+                    path = recordings / name
+                    if not re.fullmatch(r"pgmt-[\w-]+\.mp4", name) or not path.is_file():
+                        self.send_error(404)
+                        return
+                    with path.open("rb") as video:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "video/mp4")
+                        self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+                        self.send_header("Content-Length", str(path.stat().st_size))
+                        self.end_headers()
+                        shutil.copyfileobj(video, self.wfile)
+                    return
                 if self.path.split("?")[0] == "/catalog" and catalog:
                     self.reply(catalog.public())
                     return
@@ -91,6 +108,8 @@ class Dashboard:
                         if not isinstance(mode, str) or mode not in REFERENCE_DISPLAYS:
                             raise ValueError("参考显示必须是 terrain（地形适配）或 source（原始 NPZ）")
                         value = dict(command="reference_display", mode=mode, request_id=uuid.uuid4().hex)
+                    elif value in ("record_start", "record_stop") and recordings is not None:
+                        value = dict(command=value, request_id=uuid.uuid4().hex)
                     elif value not in (
                         "pause",
                         "reset",
@@ -147,9 +166,10 @@ class SceneOverlay:
         self.options.geomgroup[2] = 1
         self.perturbation = mujoco.MjvPerturb()
 
-    def draw(self, scene, result, show_scan=True, show_ghost=True, reference_display="terrain"):
+    def draw(self, scene, result, show_scan=True, show_ghost=True, reference_display="terrain", append=False):
         sim = self.sim
-        scene.ngeom = 0
+        initial_geoms = scene.ngeom if append else 0
+        scene.ngeom = initial_geoms
         if show_ghost:
             pos, quat = sim.display_reference(reference_display)
             self.reference.qpos[:] = sim.model.qpos0
@@ -160,7 +180,7 @@ class SceneOverlay:
             mujoco.mjv_addGeoms(
                 sim.model, self.reference, self.options, self.perturbation, mujoco.mjtCatBit.mjCAT_DYNAMIC, scene
             )
-            for i in range(scene.ngeom):
+            for i in range(initial_geoms, scene.ngeom):
                 scene.geoms[i].rgba[:] = [0.25, 0.95, 0.85, 0.24]
         for box in sim.terrain_info.get("test_boxes", []):
             if scene.ngeom >= scene.maxgeom:

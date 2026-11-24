@@ -79,7 +79,9 @@ class PGMTTerrainEnv(InstinctRlEnv):
                         if data is not None:
                             buffer._buffer.copy_(data)
             for observer in tuple(self._transition_observers):
-                observer(dt)
+                observed_reward = observer(dt)
+                if observed_reward is not None:
+                    values = observed_reward
             return values
 
         self.termination_manager.compute = compute_termination

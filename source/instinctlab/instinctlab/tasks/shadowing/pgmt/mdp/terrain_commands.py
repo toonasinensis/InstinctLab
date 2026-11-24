@@ -41,7 +41,8 @@ class TerrainMotion(CommandTerm):
             raise ValueError("Motion uniform fraction must be in [0,1] and failure decay in [0,1)")
         if cfg.curriculum_off_platform_steps < 0:
             raise ValueError("curriculum_off_platform_steps must be nonnegative")
-        if not 0 <= cfg.curriculum_motion_end_min_s <= env.max_episode_length_s:
+        minimum = cfg.curriculum_motion_end_min_s
+        if minimum is not None and not 0 <= minimum <= env.max_episode_length_s:
             raise ValueError("curriculum_motion_end_min_s must be within the episode time limit")
         self.env = env
         self.robot = env.scene["robot"]
@@ -74,6 +75,8 @@ class TerrainMotion(CommandTerm):
         self.stratum_visits = torch.zeros_like(self.stratum_failure)
         self._load_contacts()
         self.terrain = TerrainContext(self)
+        self._foothold_planner = None
+        self._foothold_cache = None
         self.stair_directions = ("stairs_up", "stairs_down")
         self.stair_columns = torch.tensor(
             [[name == direction for name in self.terrain.column_names] for direction in self.stair_directions],
@@ -107,8 +110,10 @@ class TerrainMotion(CommandTerm):
         )
         if any(direction in self.terrain.column_names for direction in self.stair_directions):
             self.sampling_contract["stair_names_from_center"] = True
-        if cfg.curriculum_motion_end_min_s > 0:
-            self.sampling_contract["curriculum_motion_end_min_s"] = cfg.curriculum_motion_end_min_s
+        if minimum != 0:
+            self.sampling_contract["curriculum_motion_end_min_s"] = minimum
+        if cfg.foothold_adaptation:
+            self.sampling_contract["foothold_adaptation"] = "terrain_contact_window_v1"
         self.sampling_contract["platform_spawn"] = dict(
             enabled=cfg.randomize_platform_spawn,
             margin=cfg.spawn_platform_margin,
@@ -168,6 +173,40 @@ class TerrainMotion(CommandTerm):
     def reference_contact_valid(self):
         return self.label_valid[self.frame_ids]
 
+    def foothold_window(self, motion, frame, count, placement, offset, family):
+        if not self.cfg.foothold_adaptation:
+            return None
+        if self._foothold_planner is None:
+            from .footholds import FootholdReference
+
+            self._foothold_planner = FootholdReference(self)
+        planner = self._foothold_planner
+        offsets = torch.arange(count + 1, device=frame.device)
+        parts = [
+            planner.window(motion, frame[:, None] + offsets[i : i + 13], placement, offset, family)
+            for i in range(0, count, 12)
+        ]
+        if len(parts) == 1:
+            return parts[0]
+        return tuple(torch.cat(values, dim=1) for values in zip(*parts, strict=True))
+
+    def foothold_reference(self):
+        if not self.cfg.foothold_adaptation:
+            return None
+        step = self.env.common_step_counter
+        if self._foothold_cache is None or self._foothold_cache[0] != step:
+            motion = self.motion_ids
+            reference = self.foothold_window(
+                motion,
+                self.frame_ids - self.label_starts[motion],
+                self.reference.cfg.num_frames,
+                self.rotation,
+                self.offset,
+                self.terrain.family,
+            )
+            self._foothold_cache = (step, reference)
+        return self._foothold_cache[1]
+
     @property
     def command(self):
         return self.corrected_velocity_future_b.flatten(1)
@@ -208,6 +247,13 @@ class TerrainMotion(CommandTerm):
         return self._position(self.reference.reference_frame.link_pos_w[:, 0])
 
     @property
+    def tracking_body_pos_w(self):
+        position = self.body_pos_w
+        if (adaptation := self.foothold_reference()) is not None:
+            position[:, self.foot_ids] += adaptation[0][:, 0]
+        return position
+
+    @property
     def body_quat_w(self):
         return self._rotate(self.reference.reference_frame.link_quat_w[:, 0])
 
@@ -237,11 +283,15 @@ class TerrainMotion(CommandTerm):
 
     @property
     def joint_pos(self):
-        return self.reference.reference_frame.joint_pos[:, 0]
+        position = self.reference.reference_frame.joint_pos[:, 0]
+        adaptation = self.foothold_reference()
+        return position if adaptation is None else position + adaptation[1][:, 0]
 
     @property
     def joint_vel(self):
-        return self.reference.reference_frame.joint_vel[:, 0]
+        velocity = self.reference.reference_frame.joint_vel[:, 0]
+        adaptation = self.foothold_reference()
+        return velocity if adaptation is None else velocity + adaptation[2][:, 0]
 
     @property
     def robot_body_pos_w(self):
@@ -286,7 +336,7 @@ class TerrainMotion(CommandTerm):
         root = self.robot_anchor_pos_w.clone()
         root[:, 2] = self.anchor_pos_w[:, 2]
         return root[:, None] + quat_apply(
-            delta[:, None].expand_as(self.body_quat_w), self.body_pos_w - self.anchor_pos_w[:, None]
+            delta[:, None].expand_as(self.body_quat_w), self.tracking_body_pos_w - self.anchor_pos_w[:, None]
         )
 
     @property
@@ -310,15 +360,19 @@ class TerrainMotion(CommandTerm):
     def advance(self):
         # 每个控制步先更新地形支撑高度，再采样接触事件及实际/参考加速度，供终止和奖励使用。
         self.terrain.update()
+        self._foothold_cache = None
         self.contacts.update()
 
     def _update_terrain_curriculum(self, ids, terrain, family, failed):
         terminations = self.env.termination_manager
         time_out = terminations.get_term("time_out")[ids]
         motion_end = torch.zeros_like(time_out)
-        if self.cfg.curriculum_motion_end_min_s > 0:
-            elapsed = self.env.episode_length_buf[ids] * self.env.step_dt
-            motion_end = terminations.get_term("motion_end")[ids] & (elapsed >= self.cfg.curriculum_motion_end_min_s)
+        minimum = self.cfg.curriculum_motion_end_min_s
+        if minimum != 0:
+            motion_end = terminations.get_term("motion_end")[ids]
+            if minimum is not None:
+                elapsed = self.env.episode_length_buf[ids] * self.env.step_dt
+                motion_end = motion_end & (elapsed >= minimum)
         success = (time_out | motion_end) & ~failed & ~self.terrain.outside[ids]
         success &= (self.terrain.off_platform_steps[ids] > self.cfg.curriculum_off_platform_steps) | (family == 0)
         assigned_levels = terrain.terrain_levels[ids]
@@ -437,11 +491,13 @@ class TerrainMotion(CommandTerm):
             ),
             env_ids=ids,
         )
-        self.robot.write_joint_state_to_sim(self.joint_pos[ids], self.joint_vel[ids], env_ids=ids)
+        source = self.reference.reference_frame
+        self.robot.write_joint_state_to_sim(source.joint_pos[ids, 0], source.joint_vel[ids, 0], env_ids=ids)
         # 重置时用已知参考脚位置查询地形，避免读取尚未刷新的旧身体缓存；同时清空接触事件历史。
         self.terrain.update(reset_ids=ids)
         self.contacts.reset(ids)
         self.started[ids] = True
+        self._foothold_cache = None
 
 
 @configclass
@@ -461,7 +517,7 @@ class TerrainMotionCfg(CommandTermCfg):
     spawn_platform_margin: float = 0.2
     spawn_center_region_width: float = 2.0
     curriculum_off_platform_steps: int = 50
-    curriculum_motion_end_min_s: float = 0.0
+    curriculum_motion_end_min_s: float | None = 0.0
     motion_uniform_fraction: float = 0.2
     motion_failure_decay: float = 0.99
     enable_contact_objectives: bool = True
@@ -471,6 +527,7 @@ class TerrainMotionCfg(CommandTermCfg):
     tolerance_orientation_rad: float = 0.35
     tolerance_joint_rad: float = 0.25
     support_filter_seconds: float = 0.10  # 支撑高度的一阶平滑时间常数，单位为秒。
+    foothold_adaptation: bool = False
 
 
 def reset_on_terrain(env, env_ids):

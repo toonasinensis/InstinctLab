@@ -63,6 +63,9 @@ class G1PGMTSuperMimicCfg:
     foot_contact: dict = asdict(ContactRewardCfg())
     analytic_foot: dict = asdict(AnalyticFootRewardCfg())
     termination_softness: dict = dict(height_m=0.03, tilt_cos=0.04, body_m=0.04)
+    progress_reward: dict = dict(
+        enabled=False, window_s=0.32, walk_speed=0.20, deadband_speed=0.05, full_fraction=0.50, weight=0.5
+    )
     flat_warmup_updates: int = 2000
     terrain_gate_ramp: int = 1
     initialize_checkpoint: str | None = None

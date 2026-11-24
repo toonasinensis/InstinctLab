@@ -362,3 +362,49 @@ class ReferenceDisplay {
   }
 }
 window.referenceDisplay = new ReferenceDisplay();
+
+class VideoRecording {
+  constructor() {
+    this.start = document.getElementById('record_start');
+    this.stop = document.getElementById('record_stop');
+    this.status = document.getElementById('record_status');
+    this.download = document.getElementById('record_download');
+    this.pending = null;
+    this.start.onclick = () => this.send('record_start');
+    this.stop.onclick = () => this.send('record_stop');
+  }
+
+  async send(command) {
+    this.pending = 'sending';
+    this.start.disabled = this.stop.disabled = true;
+    this.status.textContent = command === 'record_start' ? '正在启动录制…' : '正在保存 MP4…';
+    try {
+      const response = await fetch('/control', {method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({command})});
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || '视频录制操作失败');
+      this.pending = result.request_id;
+    } catch (error) {
+      this.pending = null;
+      this.update(this.state);
+      this.status.textContent = error.message;
+    }
+  }
+
+  update(state) {
+    this.state = state;
+    const recording = state?.recording;
+    if (!recording) return;
+    if (this.pending === recording.request_id) this.pending = null;
+    if (this.pending) return;
+    this.start.disabled = recording.active;
+    this.stop.disabled = !recording.active;
+    this.stop.classList.toggle('active', recording.active);
+    this.status.textContent = recording.error || (recording.active
+      ? `录制中 · ${recording.seconds.toFixed(1)} 秒${state.paused ? ' · 已暂停' : ''}`
+      : recording.file ? 'MP4 已保存' : '');
+    this.download.hidden = !recording.file;
+    if (recording.file) this.download.href = '/recordings/' + encodeURIComponent(recording.file);
+  }
+}
+window.videoRecording = new VideoRecording();

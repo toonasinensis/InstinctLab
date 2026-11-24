@@ -166,11 +166,26 @@ current level at each training update, including separate curves for the two ram
 and stair directions. A terrain with no matching environment has no sample for
 that update. Level 9 on this curve means at least one environment is on level 9.
 
-Set `PGMT_T3_27_MOTION_H5` to the original
-`moving_upright_middlespeed.h5` or another grouped 50 Hz T3 dataset.
+Use the default T3_27 training script for the configuration from DLC job 34984.
 
-Run the standard `$PROJECT_DIR/scripts/instinct_rl/train.py` entry point with the
-task ID. The motion path can also be set with
+```bash
+bash "$PROJECT_DIR/train_release_scripts/release_model_T3_27.sh"
+```
+
+The script starts fresh on one GPU with 4096 environments, 30000 iterations,
+and seed 42. It uses stairs up to 25 cm in both directions, equal upper- and
+lower-body tracking weights, and lower-body tracking sigmas widened by 50%.
+Stair progress reward gating is enabled, and normal completion of the reference
+motion can advance the curriculum without a minimum episode duration. Online
+foothold adaptation is disabled.
+
+The script uses `moving_upright_middlespeed.h5` from the sibling `supermimic`
+checkout and writes logs to the sibling `InstinctLab-local` directory by
+default. Set `PGMT_T3_27_MOTION_H5` to use a different grouped 50 Hz T3 dataset.
+`INSTINCTLAB_PYTHON`, `MAX_ITERATIONS`, `SEED`, and `LOGROOT` are optional overrides.
+
+When launching `scripts/instinct_rl/train.py` directly with the task ID, the
+motion path can also be set with
 `env.scene.motion_reference.motion_buffers.SOMA.path`. The optional
 `env.scene.motion_reference.motion_buffers.SOMA.motion_names` selects exact HDF5
 group names for a smaller run. The optional `cache_dir` in the same motion buffer
@@ -189,3 +204,32 @@ mesh. Disk lookup is keyed by source metadata and the preprocessing contract.
 The checkpoint data key also identifies byte-identical source files on different
 hosts. Allow about 3.3 GiB for the full motion tensors at 14 tracked bodies, plus
 the contact tensors and the memory used by simulation and training.
+
+Set `env.commands.motion.foothold_adaptation=true` to enable online T3 stair
+reference adaptation. The existing contact labels determine swing and stance
+windows. The planner searches near the source landing point and checks the
+center and corners of the URDF foot footprint against the shared height field.
+Swing lift anticipates a rising landing surface, and lowering starts later in
+the swing when the landing surface is below the takeoff surface. Bounded
+Jacobian corrections feed the existing ankle position and joint reference
+targets. The real environment and imagined rollout build those targets from
+the same motion frames, terrain field and episode placement. The source H5,
+reward weights, and course progression rules are kept as configured.
+
+To compare both settings from one trained run, set
+`agent.initialize_checkpoint` to its SuperMimic checkpoint. The initializer
+loads the actor, EMA actor, critic, world model and normalizers. The optimizers,
+replay and curriculum start from the new run's settings. Evaluate on paired
+motion phases across fixed levels and report ascent and descent separately.
+
+Set `agent.progress_reward.enabled=true` to gate positive rewards on stairs
+while the reference is moving. The default 0.32 s window uses the net XY
+displacement of the reference root to define the walking direction. The gate
+is active at reference speeds of at least 0.20 m/s. It scales positive rewards
+from zero at 0.05 m/s of projected robot progress to one at half the reference
+speed. Penalties keep their original values. A signed progress term, weighted
+at 0.5 and capped at the reference speed, preserves a gradient at zero progress.
+The native reward and imagined return use the same function. Replay carries
+the causal position history at each rollout start, with history padded using
+the current spawn pose after a reset. The base task configuration leaves the
+gate disabled. The default T3_27 training script enables it explicitly.

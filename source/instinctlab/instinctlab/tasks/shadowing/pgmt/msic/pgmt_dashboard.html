@@ -18,6 +18,7 @@ input{background:#0f1b27;color:#e1eaf4;border:1px solid #41596c;border-radius:5p
 <div><canvas id="terrain_map" width="480" height="450" aria-label="地形俯视图，点击或拖动选择机器人放置位置"></canvas><div class="map_legend"><span style="color:#ffc45d"><b>➜</b> 待放置位置 / 朝向</span><span style="color:#64e1bf"><b>➜</b> 当前机器人</span></div><small id="map_height">俯视图为地形世界坐标，单位 m。</small><p class="foot" id="scene_current">当前播放：—</p></div>
 </div><div class="reset_settings"><form id="reset_form" class="reset_row"><label for="reset_seconds">RESET 时间 / s</label><input id="reset_seconds" type="number" min="0" step="any" required aria-label="自动重置时间，0 表示关闭定时重置"><button id="apply_reset_time" type="submit">更新时间</button><span id="reset_clock">读取中…</span><span id="reset_feedback" role="status"></span></form><p class="foot">按本轮已播放的仿真秒数计时，暂停不计时。修改时间不重置姿态；0 = 关闭定时重置。失败、动作结束或离开地形块仍会重置。</p><p id="last_reset" class="foot">本次场景尚未自动 RESET。</p></div></section>
 <div class="controls"><button onclick="control('pause')" id="pause">暂停</button><button onclick="control('reset')">重置同一初态</button><button onclick="control('ghost')" id="ghost">参考机器人 开/关</button><button onclick="control('scan')">地面扫描 开/关</button></div>
+<div class="controls" style="align-items:center"><button id="record_start" type="button" disabled>开始录制</button><button id="record_stop" type="button" disabled>停止并保存</button><span id="record_status" role="status"></span><a id="record_download" hidden download>下载 MP4</a></div>
 <div class="controls" style="align-items:center"><label for="reference_display">参考机器人显示：</label><select id="reference_display"><option value="terrain">地形适配参考</option><option value="source">原始 NPZ（不抬高）</option></select><span id="reference_feedback" role="status" class="status"></span></div>
 <p class="foot" id="reference_help">两种显示均沿用当前机器人的 XY / yaw 对齐。切换立即生效，只改变青色参考，不重置播放。</p>
 <div class="controls"><span style="padding:8px">实际控制输入：</span><button data-mode="real" onclick="control('real')">真实地形</button><button data-mode="flat" onclick="control('flat')">压平高度</button><button data-mode="off" onclick="control('off')">屏蔽地形 token</button><button data-mode="shuffled" onclick="control('shuffled')">打乱空间</button></div>
@@ -47,6 +48,7 @@ $('mode_help').textContent=({real:'真实地形：正常使用 21×21 地形扫�
 window.sceneEditor?.update(s);
 window.resetTimer?.update(s);
 window.referenceDisplay?.update(s);
+window.videoRecording?.update(s);
 }
 $('head').onchange=()=>last&&draw(last);setInterval(async()=>{try{let r=await fetch('/state'),s=await r.json();if(!s.weights)return;if(!last||s.step!==last.step||s.paused)lastTime=Date.now();draw(s);$('status').textContent=(s.paused?'已暂停':Date.now()-lastTime>2500?'数据已停止更新':'实时连接')+' · step '+s.step}catch(e){$('status').textContent='连接已断开'}},150);
 </script><script src="/controls.js"></script></html>

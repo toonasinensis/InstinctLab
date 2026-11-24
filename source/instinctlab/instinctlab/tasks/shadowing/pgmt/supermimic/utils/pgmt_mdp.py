@@ -13,17 +13,27 @@ from instinctlab.tasks.shadowing.pgmt.tensor_math import quat_apply, quat_apply_
 
 from ..layouts import TensorLayout
 from ..pgmt_sim_context import ordinary
+from .pgmt_progress import StairProgressReward
 from .pgmt_terrain import TERRAIN_FAMILIES
 
 
 class PGMTMDP:
-    def __init__(self, rewards, normalizer, dynamics, history_length, reference_frames, softness):
+    def __init__(self, rewards, normalizer, dynamics, history_length, reference_frames, softness, progress_reward=None):
         self.rewards, self.normalizer, self.dynamics = rewards, normalizer, dynamics
         self.command = c = rewards.command
         self.layout = dynamics.representation.layout
         self.state_layout = self.layout.state
         self.history_length, self.reference_frames = history_length, reference_frames
         self.softness = softness
+        progress_cfg = progress_reward or {}
+        self.progress = (
+            StairProgressReward(
+                c.env.step_dt, **{key: value for key, value in progress_cfg.items() if key != "enabled"}
+            )
+            if progress_cfg.get("enabled")
+            else None
+        )
+        self.progress_history = None
         self.proprio_widths = dict(
             projected_gravity=self.layout.spatial,
             base_ang_vel=self.layout.spatial,
@@ -104,7 +114,17 @@ class PGMTMDP:
             family=c.terrain.family.clone(),
         )
 
-    def context(self, start, step=0):
+    def foothold_window(self, start, count):
+        return self.command.foothold_window(
+            start["motion"],
+            start["frame"],
+            count,
+            start["placement_rotation"],
+            start["placement_position"],
+            start["family"],
+        )
+
+    def context(self, start, step=0, footholds=None):
         ids, motion = start["env_id"], start["motion"]
         frames = start["frame"][:, None] + step + torch.arange(self.reference_frames, device=ids.device)
         lengths = self.command.label_lengths[motion, None]
@@ -123,12 +143,24 @@ class PGMTMDP:
         future_rotation = placement[:, None].expand_as(q)
         body_q = read("link_quat_w")[:, 0]
         body_rotation = placement[:, None].expand_as(body_q)
+        body_position = quat_apply(body_rotation, read("link_pos_w")[:, 0] - p[:, :1])
+        if footholds is None and self.command.cfg.foothold_adaptation:
+            footholds = self.foothold_window({**start, "frame": start["frame"] + step}, self.reference_frames)
+            plan_step = 0
+        else:
+            plan_step = step
+        if footholds is not None:
+            foot_position, dq, dqd = footholds
+            window = slice(plan_step, plan_step + self.reference_frames)
+            body_position[:, self.command.foot_ids] += foot_position[:, plan_step]
+            joint = joint + dq[:, window]
+            joint_velocity = joint_velocity + dqd[:, window]
         offset = torch.cat((start["placement_position"][:, :2], p.new_zeros(len(ids), 1)), -1)
         labels = self.command.label_starts[motion] + frames[:, 0]
         return dict(
             ref_position=quat_apply(placement, p[:, 0]) + offset,
             ref_rotation=quat_mul(placement, q[:, 0]),
-            ref_body_position=quat_apply(body_rotation, read("link_pos_w")[:, 0] - p[:, :1]),
+            ref_body_position=body_position,
             ref_body_rotation=quat_mul(body_rotation, body_q),
             ref_body_velocity=quat_apply(body_rotation, read("link_lin_vel_w")[:, 0]),
             ref_body_angular=quat_apply(body_rotation, read("link_ang_vel_w")[:, 0]),
@@ -257,6 +289,14 @@ class PGMTMDP:
             observation[:, : self.proprio_size], tuple(self.proprio_widths.values()), self.history_length
         )
 
+    def record_progress(self, state):
+        if self.progress is None:
+            return {}
+        c = self.command
+        position = self.progress.positions(state, c.anchor_pos_w)
+        self.progress_history = self.progress.record(self.progress_history, position, c.env.episode_length_buf == 0)
+        return {"progress_history": ordinary(self.progress_history)}
+
     def capture_transition(self, foot_rewards, analytic_foot, ids, dt):
         native = self.command.env
         command = self.command
@@ -297,4 +337,15 @@ class PGMTMDP:
             analytic_foot.memory.copy_(memory)
             analytic_foot.memory[native.reset_buf.bool()] = 0
             episode_terms.append(terminal["native_analytic_reward"])
-        return terminal, torch.cat(episode_terms, -1)
+        combined = torch.cat(episode_terms, -1)
+        if self.progress is not None:
+            positions = self.progress.positions(terminal["next_state"], terminal["ref_ref_position"])
+            combined = self.progress.apply(
+                combined[:, None], self.progress_history, positions[:, None], terminal["ref_family"][:, None]
+            )[:, 0]
+            names = ["native_reward", "native_foot_reward"]
+            if analytic_foot is not None:
+                names.append("native_analytic_reward")
+            values = combined.split([term.shape[-1] for term in episode_terms] + [1], dim=-1)
+            terminal.update(zip([*names, "native_progress_reward"], values, strict=True))
+        return terminal, combined

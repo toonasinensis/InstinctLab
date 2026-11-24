@@ -146,6 +146,7 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
             options.collection.history_length,
             reference_frames,
             cfg["termination_softness"],
+            cfg.get("progress_reward"),
         )
         width = mdp.observation_layout.width + layout.feature_width + context.shape[-1] + mdp.critic_context_width
         with torch.random.fork_rng(devices=[device]):
@@ -180,7 +181,8 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
         dynamics.predict_delta = compile_function(dynamics.predict_delta, True)
 
     def checkpoint_extra_contract(self):
-        return {}
+        progress = self.train_cfg.get("progress_reward")
+        return {"progress_reward": progress} if progress and progress.get("enabled") else {}
 
     def _build_logger(self, **kwargs):
         return PGMTLogger(self.env, self.mdp, self.foot_rewards, self.analytic_foot, self.log_root, **kwargs)
@@ -190,7 +192,15 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
 
     def _capture_transition(self, dt):
         self.terminal, terms = self.mdp.capture_transition(self.foot_rewards, self.analytic_foot, self.ids, dt)
-        self.logger.episode_rewards.add(terms, self.env.unwrapped.reset_buf.bool())
+        native = self.env.unwrapped
+        self.logger.episode_rewards.add(terms, native.reset_buf.bool())
+        if self.mdp.progress is None:
+            return None
+        groups = native.reward_manager.active_terms
+        values = self.terminal["native_reward"].split([len(names) for names in groups.values()], dim=-1)
+        rewards = {name: value.sum(-1) for name, value in zip(groups, values, strict=True)}
+        rewards["auxiliary"] += terms[:, self.terminal["native_reward"].shape[-1] :].sum(-1)
+        return rewards
 
     def _post_step_fields(self, dones, extras):
         return dict(
@@ -202,6 +212,7 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
         native = self.env.unwrapped
         if not self.warmup_complete and self.normalize_during_warmup:
             self.policy.normalizer.update(self.observation)
+        state = ordinary(self.rewards.state())
         record = dict(
             contact=ordinary(self.command.contacts.contact.float()),
             previous_action=ordinary(native.action_manager.action),
@@ -209,6 +220,7 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
             previous_ref_velocity=ordinary(self.command.contacts.previous_ref_velocity),
             history=ordinary(self.mdp.raw_history(self.observation)),
             episode_step=ordinary(native.episode_length_buf),
+            **self.mdp.record_progress(state),
             **{key: ordinary(value) for key, value in self.mdp.placement().items()},
         )
         noise = (
@@ -220,11 +232,10 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
         record.update(self._collection_fields())
         record["action_noise"] = ordinary(noise)
         action = self.policy.collect(self.observation) + noise
-        self.observation, _, done, info = self._step_and_store(
-            action, ordinary(self.rewards.state()), extra_fields=record
-        )
+        self.observation, reward, done, info = self._step_and_store(action, state, extra_fields=record)
         self._step_metrics = {key: ordinary(value) for key, value in info["step"].items()}
-        self.logger.process_env_step(self.terminal["native_reward"].sum(-1), done.bool(), info)
+        logged = reward.sum(-1) if self.mdp.progress is not None else self.terminal["native_reward"].sum(-1)
+        self.logger.process_env_step(logged, done.bool(), info)
         return self.env.num_envs
 
     def _finish_collection(self):

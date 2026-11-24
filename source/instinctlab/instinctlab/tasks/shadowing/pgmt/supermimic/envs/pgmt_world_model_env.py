@@ -35,8 +35,10 @@ class PGMTWorldModelEnv(MotionTrackingEnv):
 
     def prepare(self, data, generator):
         batch = len(data["env_id"])
+        start = self.start(data)
+        footholds = self.mdp.foothold_window(start, self.horizon + self.mdp.reference_frames)
         contexts = [
-            TensorDict(self.mdp.context(self.start(data), step), batch_size=[batch]) for step in range(self.horizon + 1)
+            TensorDict(self.mdp.context(start, step, footholds), batch_size=[batch]) for step in range(self.horizon + 1)
         ]
         observation = [self.mdp.draw_noise(batch, self.mdp.observation_widths, generator)]
         proprio = []
@@ -197,6 +199,7 @@ class PGMTWorldModelEnv(MotionTrackingEnv):
         derivative_valid[:, 0] = self.data["derivative_valid"][:, 0]
         bodies = self.bodies_forward(all_states.flatten(0, 1), ids[:, None].expand(-1, horizon + 1).flatten())
         features = torch.stack(self.feature_rows, 1)
+        progress_history = self.data["progress_history"][:, 0].contiguous() if self.mdp.progress is not None else None
         reward, survival, means = self.rewards_forward(
             all_states,
             torch.stack(self.actions, 1).flatten(0, 1),
@@ -208,6 +211,7 @@ class PGMTWorldModelEnv(MotionTrackingEnv):
             ids,
             bodies,
             torch.stack(self.logits, 1).flatten(0, 1) if self.logits else None,
+            progress_history,
         )
         return dict(features=features, rewards=reward, survival=survival, valid=self.valid, reward_means=means)
 
@@ -223,6 +227,7 @@ class PGMTWorldModelEnv(MotionTrackingEnv):
         ids,
         all_bodies,
         contact_logits=None,
+        progress_history=None,
     ):
         """Batched rewards and returns; keep gradients to every imagined step."""
         batch, steps = all_states.shape[:2]
@@ -247,12 +252,17 @@ class PGMTWorldModelEnv(MotionTrackingEnv):
             bodies=bodies,
             previous_bodies=previous_bodies,
         )
-        rewards, reward_means = self.augment_imagined_rewards(
+        rewards = self.augment_imagined_rewards(
             rewards, successor, reward_context, ids, horizon, bodies, contact_logits, previous_bodies, derivative_valid
-        )
-        rewards = rewards.sum(-1).reshape(batch, horizon)
+        ).reshape(batch, horizon, -1)
+        if self.mdp.progress is not None:
+            reference = reward_context["ref_position"].reshape(batch, horizon, 3)
+            positions = self.mdp.progress.positions(all_states[:, 1:], reference)
+            family = reward_context["family"].reshape(batch, horizon)
+            rewards = self.mdp.progress.apply(rewards, progress_history, positions, family)
+        reward_means = rewards.detach().flatten(0, 1).mean(0)
         survival = self.mdp.soft_survival(successor, supports, reward_context, bodies).reshape(batch, horizon)
-        return rewards, survival, reward_means
+        return rewards.sum(-1), survival, reward_means
 
     def augment_imagined_rewards(
         self, rewards, state, context, ids, horizon, bodies, logits, previous_bodies=None, derivative_valid=None
@@ -277,8 +287,7 @@ class PGMTWorldModelEnv(MotionTrackingEnv):
                 contact=logits.sigmoid(),
             )
             terms.append(analytic)
-        combined = torch.cat(terms, -1)
-        return combined, combined.detach().mean(0)
+        return torch.cat(terms, -1)
 
     def sample_initial_states(self):
         cfg, wm_cfg = self.options.policy, self.options.world_model
