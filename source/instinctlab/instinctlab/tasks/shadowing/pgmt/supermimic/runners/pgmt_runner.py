@@ -13,7 +13,9 @@ from isaaclab.utils import string_to_callable
 from instinctlab.tasks.shadowing.pgmt.analytic_foot_rewards import AnalyticFootRewards
 from instinctlab.tasks.shadowing.pgmt.foot_rewards import FootContactRewards
 from instinctlab.tasks.shadowing.pgmt.heightfield import HeightField
+from instinctlab.tasks.shadowing.pgmt.tensor_math import yaw_angle
 
+from ..actor_height_scan import ActorHeightScan
 from ..config import from_dict
 from ..envs.pgmt_world_model_env import PGMTWorldModelEnv
 from ..layouts import RobotLayout
@@ -47,6 +49,7 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
         self.warmup_complete = False
         self.normalize_during_warmup = self.options.collection.update_normalizer_during_warmup
         self.latest_metrics, self.terminal = {}, {}
+        self._actor_scan = self._actor_scan_pose = None
         cfg = SuperMimicRunnerCfg(
             max_iterations=train_cfg["max_iterations"],
             save_interval=train_cfg["save_interval"],
@@ -158,8 +161,21 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
             raise ValueError("Enabled contact rewards require the foot probability head")
         self.policy, self.mdp, self.value = policy, mdp, value
         self.foot_rewards, self.analytic_foot = foot_rewards, analytic_foot
+        scan_hz = cfg.get("actor_height_scan_hz")
+        self.actor_height_scan = (
+            ActorHeightScan(scan_hz, native.step_dt, mdp.observation_layout["terrain"]) if scan_hz is not None else None
+        )
+        if self.actor_height_scan is not None and mdp.observation_terms["terrain"].noise is not None:
+            raise ValueError("Actor heightscan replay requires a deterministic terrain observation")
         self.wm_env = self.imagination_type(
-            dynamics, mdp, context, self.replay_buffer, foot_rewards, analytic_foot, options
+            dynamics,
+            mdp,
+            context,
+            self.replay_buffer,
+            foot_rewards,
+            analytic_foot,
+            options,
+            actor_height_scan=self.actor_height_scan,
         )
         self.wm_env.sample_generator = self.generators["actor"]
         self.policy_learner = self.policy_learner_type(
@@ -182,7 +198,11 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
 
     def checkpoint_extra_contract(self):
         progress = self.train_cfg.get("progress_reward")
-        return {"progress_reward": progress} if progress and progress.get("enabled") else {}
+        contract = {"progress_reward": progress} if progress and progress.get("enabled") else {}
+        if self.actor_height_scan is not None:
+            contract["actor_height_scan_hz"] = self.train_cfg["actor_height_scan_hz"]
+            contract["actor_height_scan_period_steps"] = self.actor_height_scan.period
+        return contract
 
     def _build_logger(self, **kwargs):
         return PGMTLogger(self.env, self.mdp, self.foot_rewards, self.analytic_foot, self.log_root, **kwargs)
@@ -206,6 +226,21 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
         return dict(
             self.terminal, done=ordinary(dones.bool()), failure=ordinary(self.env.unwrapped.reset_terminated.bool())
         )
+
+    def _collection_actor_observation(self, state, record):
+        sampler = self.actor_height_scan
+        if sampler is None:
+            return self.observation
+        layout = self.mdp.state_layout
+        pose = torch.cat((state[:, layout["position"]], yaw_angle(state[:, layout["rotation"]])[:, None]), dim=-1)
+        scan = self.observation[:, sampler.section]
+        if self._actor_scan is None:
+            self._actor_scan, self._actor_scan_pose = scan, pose
+        else:
+            self._actor_scan = sampler.hold(self._actor_scan, scan, record["episode_step"])
+            self._actor_scan_pose = sampler.hold(self._actor_scan_pose, pose, record["episode_step"])
+        record["actor_scan_pose"] = ordinary(self._actor_scan_pose)
+        return sampler.observation(self.observation, self._actor_scan)
 
     @torch.inference_mode()
     def step(self):
@@ -231,7 +266,7 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
         )
         record.update(self._collection_fields())
         record["action_noise"] = ordinary(noise)
-        action = self.policy.collect(self.observation) + noise
+        action = self.policy.collect(self._collection_actor_observation(state, record)) + noise
         self.observation, reward, done, info = self._step_and_store(action, state, extra_fields=record)
         self._step_metrics = {key: ordinary(value) for key, value in info["step"].items()}
         logged = reward.sum(-1) if self.mdp.progress is not None else self.terminal["native_reward"].sum(-1)

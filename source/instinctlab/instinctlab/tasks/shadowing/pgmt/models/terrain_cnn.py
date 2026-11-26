@@ -16,10 +16,11 @@ def mlp(widths):
 
 
 class TerrainCNNActor(nn.Module):
-    def __init__(self, num_actions, scan_shape=(21, 21), non_terrain_width=1678):
+    def __init__(self, num_actions, scan_shape=(21, 21), non_terrain_width=1678, zero_height_scan=False):
         super().__init__()
         self.scan_shape = tuple(scan_shape)
         self.non_terrain_width = non_terrain_width
+        self.zero_height_scan = zero_height_scan
         pooled = ((scan_shape[0] + 3) // 4) * ((scan_shape[1] + 3) // 4) * 64
         self.amp = False
         self.amp_heads = True
@@ -37,6 +38,8 @@ class TerrainCNNActor(nn.Module):
         self.action_head = mlp((non_terrain_width + 32, 1024, 512, 256, num_actions))
 
     def encode(self, heights):
+        if self.zero_height_scan:
+            heights = torch.zeros_like(heights)
         return self.encoder(heights.reshape(-1, 1, *self.scan_shape))
 
     def inputs(self, obs):

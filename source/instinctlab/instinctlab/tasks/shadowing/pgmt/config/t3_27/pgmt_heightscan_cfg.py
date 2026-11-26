@@ -51,11 +51,13 @@ class T3_27PGMTHeightScanEnvCfg(G1PGMTScan187EnvCfg):
 @configclass
 class T3_27HeightScanActorCfg(HeightScanActorCfg):
     non_terrain_width: int = 1574
+    zero_height_scan: bool = False
 
 
 @configclass
 class T3_27PGMTSuperMimicCfg(G1PGMTSuperMimicCfg):
     policy: T3_27HeightScanActorCfg = T3_27HeightScanActorCfg()
+    actor_height_scan_hz: float | None = None
     foot_contact: dict = dict(asdict(ContactRewardCfg()), max_foot_vertices=32)
     experiment_name: str = "t3_27_pgmt_supermimic"
     run_name: str = "T3_27HeightScan"

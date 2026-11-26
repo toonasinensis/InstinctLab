@@ -21,16 +21,22 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
 export PYTHONPATH="$project_dir/source/instinctlab${PYTHONPATH:+:$PYTHONPATH}"
 unset LOCAL_RANK
 
-run_name="$(basename -- "${BASH_SOURCE[0]}" .sh)"
+run_name="${PGMT_TRAIN_RUN_NAME:-$(basename -- "${BASH_SOURCE[0]}" .sh)}"
 log_dir_name="$(TZ=CST-8 date +%Y%m%d_%H%M%S)_${run_name}_$$"
 log_root="${LOGROOT:-${project_dir%/*}/InstinctLab-local/logs/t3_27_pgmt_supermimic}"
 mkdir -p -- "$log_root/$log_dir_name"
+
+actor_scan_override=()
+if [[ -n "${PGMT_ACTOR_HEIGHT_SCAN_HZ:-}" ]]; then
+    actor_scan_override=("agent.actor_height_scan_hz=$PGMT_ACTOR_HEIGHT_SCAN_HZ")
+fi
 
 "${INSTINCTLAB_PYTHON:-python}" -u scripts/instinct_rl/train.py \
     --task Instinct-PGMT-SuperMimic-T3_27-Newton-v0 \
     --num_envs 4096 --device cuda:0 --viz none \
     --max_iterations "${MAX_ITERATIONS:-30000}" --seed "${SEED:-42}" \
     --run_name "$run_name" --logroot "$log_root" --log_dir_name "$log_dir_name" \
+    "${actor_scan_override[@]}" \
     agent.progress_reward.enabled=true \
     env.commands.motion.foothold_adaptation=false \
     env.commands.motion.curriculum_motion_end_min_s=null \

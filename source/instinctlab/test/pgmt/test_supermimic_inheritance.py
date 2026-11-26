@@ -38,6 +38,25 @@ class ToyWM(CoreWM):
 
 
 class InheritanceTests(unittest.TestCase):
+    def test_heightscan_actor_masks_at_encoder_without_modifying_observation(self):
+        from instinctlab.tasks.shadowing.pgmt.models.terrain_cnn import TerrainCNNActor
+
+        torch.manual_seed(7)
+        actor = TerrainCNNActor(27, scan_shape=(17, 11), non_terrain_width=1574)
+        masked = TerrainCNNActor(27, scan_shape=(17, 11), non_terrain_width=1574, zero_height_scan=True)
+        masked.load_state_dict(actor.state_dict(), strict=True)
+        history_reference = torch.randn(2, 1574)
+        raw_scan = torch.full((2, 187), -0.8)
+        zero_scan = torch.zeros_like(raw_scan)
+        observation = torch.cat((history_reference, raw_scan), -1)
+
+        with torch.no_grad():
+            expected = actor.action_from_inputs(history_reference, zero_scan)
+            self.assertFalse(torch.allclose(actor.action_from_inputs(history_reference, raw_scan), expected))
+            torch.testing.assert_close(masked(observation), expected)
+            torch.testing.assert_close(masked.action_from_inputs(history_reference, raw_scan), expected)
+        torch.testing.assert_close(observation[:, -187:], raw_scan)
+
     def test_upstream_math_keeps_wxyz_at_the_isaaclab_boundary(self):
         from instinctlab.tasks.shadowing.pgmt.supermimic.utils import math
 

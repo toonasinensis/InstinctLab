@@ -184,6 +184,15 @@ checkout and writes logs to the sibling `InstinctLab-local` directory by
 default. Set `PGMT_T3_27_MOTION_H5` to use a different grouped 50 Hz T3 dataset.
 `INSTINCTLAB_PYTHON`, `MAX_ITERATIONS`, `SEED`, and `LOGROOT` are optional overrides.
 
+Use `$PROJECT_DIR/train_release_scripts/release_model_T3_27_actor10hz.sh` for
+the 10 Hz actor heightscan release recipe. The actor still acts at 50 Hz and
+gets a fresh scan on the first step after a reset and every five steps after
+that. Proprioception and reference inputs update each step. The critic and
+world model receive the current scan at every step. Imagination starts with
+the real collection scan and episode phase from replay, then uses the same
+five-step refresh rule. Deployment inputs should follow the same cadence, as
+recorded in the checkpoint contract.
+
 When launching `scripts/instinct_rl/train.py` directly with the task ID, the
 motion path can also be set with
 `env.scene.motion_reference.motion_buffers.SOMA.path`. The optional
@@ -233,3 +242,40 @@ The native reward and imagined return use the same function. Replay carries
 the causal position history at each rollout start, with history padded using
 the current spawn pose after a reset. The base task configuration leaves the
 gate disabled. The default T3_27 training script enables it explicitly.
+
+### Export a T3_27 deployment bundle
+
+Use the project Python environment with `onnx` and `onnxruntime` installed.
+The exporter runs on CPU and uses the checkpoint's `params/env.yaml` and
+`params/agent.yaml`. Use `--params-dir` if those files are stored separately.
+The default destination is `$PROJECT_DIR/tmp/export/<run>/<checkpoint>_<weights>/`,
+where `<run>` is the checkpoint's parent directory name. Use `--output-dir` to
+choose another destination. The destination directory must be new.
+
+```bash
+python "$PROJECT_DIR/scripts/pgmt/export_policy.py" \
+  --checkpoint "$RUN_DIR/model_30000.pt"
+```
+
+- `policy.onnx` takes one `float32` observation of shape `[1, 1761]` and
+  returns one raw action of shape `[1, 27]`. The graph normalizes the
+  proprioception and reference terms and passes the raw heightscan through.
+  The exporter uses EMA weights by default. Use `--weights raw` for the
+  live training actor. The export checks the graph and compares its CPU
+  ONNX Runtime output with PyTorch before writing the final directory.
+- `metadata.json` records the exact observation slices, frames, units,
+  terrain scan geometry, policy period, ordered joint names, nominal PD
+  gains, action scale and offset, and joint bounds. The gain, effort and
+  velocity values come from the saved simulation config. Position bounds
+  come from the repository URDF, whose hash is also recorded. Hardware
+  motor IDs, encoder calibration and hardware limits belong to the robot
+  runtime.
+
+The runtime supplies proprioception, the reference motion window, root pose
+for reference velocity correction, and the local height grid. Build the input
+in metadata order and apply the recorded term clipping and scale. The graph
+applies the learned normalization. Convert its output with
+`q_target = action_offset_rad + action_scale * action`, then apply any recorded
+target clipping. The offset is the saved default posture for the default T3_27
+training recipe, and `delta_action` indicates whether the target also depends on
+the current joint position.

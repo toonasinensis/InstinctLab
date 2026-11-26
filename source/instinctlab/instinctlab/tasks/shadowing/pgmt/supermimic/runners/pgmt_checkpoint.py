@@ -111,6 +111,8 @@ def load(runner, path):
     payload = torch.load(path, map_location=runner.device, weights_only=True)["supermimic"]
     saved, current = payload["contract"], contract(runner)
     saved = {**saved, "sampling": rename_legacy_stair_columns(saved["sampling"], current["sampling"])}
+    if "zero_height_scan" in current["policy"]:
+        saved["policy"] = {"zero_height_scan": False, **saved["policy"]}
     if payload["environment"]["flat_warmup_active"] and runner.command.flat_warmup_active:
         field = "curriculum_motion_end_min_s"
         saved = {**saved, "sampling": {key: value for key, value in saved["sampling"].items() if key != field}}

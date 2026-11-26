@@ -13,11 +13,12 @@ from .motion_tracking_env import MotionTrackingEnv
 
 
 class PGMTWorldModelEnv(MotionTrackingEnv):
-    def __init__(self, dynamics, mdp, context, replay, foot_rewards, analytic_foot, options):
+    def __init__(self, dynamics, mdp, context, replay, foot_rewards, analytic_foot, options, actor_height_scan=None):
         self.dynamics, self.mdp, self.xi, self.replay_buffer = dynamics, mdp, context, replay
         self.representation = dynamics.representation
         self.rewards, self.foot_rewards, self.analytic_foot = mdp.rewards, foot_rewards, analytic_foot
         self.options, self.execution = options, options.execution
+        self.actor_height_scan = actor_height_scan
         self.horizon, self.num_envs = options.policy.horizon, options.policy.batch_size
         self.history_length = options.collection.history_length
         self.device = context.device
@@ -120,13 +121,26 @@ class PGMTWorldModelEnv(MotionTrackingEnv):
         self.feature_rows, self.states = [features], [self.state]
         self.actions, self.previous_actions, self.supports, self.logits = [], [], [], []
         self._rollout_step = 0
+        if self.actor_height_scan is not None:
+            pose = data["actor_scan_pose"][:, 0]
+            held_scan, valid = self.mdp.heightfield.local(pose[:, :3], pose[:, 3])
+            self.valid = self.valid & valid
+            self._initial_episode_step = data["episode_step"][:, 0]
+            self._actor_scan = self.actor_height_scan.hold(
+                self.mdp.process_observation(held_scan, "terrain"),
+                self.observation[:, self.actor_height_scan.section],
+                self._initial_episode_step,
+            )
 
     def _unpack_initial_states(self, inputs):
         state = inputs["data", "state"][:, 0].contiguous()
         return self.representation.extract_aux_state(state), self.representation.represent(state)
 
     def get_observations(self):
-        return TensorDict(dict(actor=self.observation, critic=self.feature_rows[-1]), batch_size=[len(self.ids)])
+        actor = self.observation
+        if self.actor_height_scan is not None:
+            actor = self.actor_height_scan.observation(actor, self._actor_scan)
+        return TensorDict(dict(actor=actor, critic=self.feature_rows[-1]), batch_size=[len(self.ids)])
 
     def _advance_history(self):
         # Native noised history is advanced once inside transition().
@@ -134,6 +148,12 @@ class PGMTWorldModelEnv(MotionTrackingEnv):
 
     def _compute_commands(self):
         self._rollout_step += 1
+        if self.actor_height_scan is not None:
+            self._actor_scan = self.actor_height_scan.hold(
+                self._actor_scan,
+                self.observation[:, self.actor_height_scan.section],
+                self._initial_episode_step + self._rollout_step,
+            )
 
     def _step_extras(self):
         return {"deferred_rewards": True}
