@@ -193,6 +193,22 @@ the real collection scan and episode phase from replay, then uses the same
 five-step refresh rule. Deployment inputs should follow the same cadence, as
 recorded in the checkpoint contract.
 
+Set `agent.actor_height_scan_noise_std_m` for independent Gaussian height
+noise on each actor scan and `agent.actor_height_scan_random_phase=true` for
+per-environment refresh phases. A reset samples a new phase and refreshes the
+initial scan. With a 10 Hz scan on the 50 Hz control loop, the next refresh is
+uniformly distributed over steps 1 through 5. Later refreshes are five steps
+apart. The actor holds the noisy scan between refreshes. The replay carries
+the refresh phase and the noise applied to the held scan so imagination starts
+with the same input. Critic and world model consume the current unperturbed
+scan at each step.
+
+Set `agent.actor_height_scan_flat_zero_probability=0.5` to zero the entire
+actor heightscan for half of flat episodes in expectation. This includes the
+flat warmup. Each flat environment draws once at reset and keeps that choice
+for the episode. Replay stores the choice for imagination. The current scan
+still goes to the critic and world model on every step.
+
 When launching `scripts/instinct_rl/train.py` directly with the task ID, the
 motion path can also be set with
 `env.scene.motion_reference.motion_buffers.SOMA.path`. The optional
@@ -264,7 +280,7 @@ python "$PROJECT_DIR/scripts/pgmt/export_policy.py" \
   live training actor. The export checks the graph and compares its CPU
   ONNX Runtime output with PyTorch before writing the final directory.
 - `metadata.json` records the exact observation slices, frames, units,
-  terrain scan geometry, policy period, ordered joint names, nominal PD
+  terrain scan geometry and refresh period, policy period, ordered joint names, nominal PD
   gains, action scale and offset, and joint bounds. The gain, effort and
   velocity values come from the saved simulation config. Position bounds
   come from the repository URDF, whose hash is also recorded. Hardware
@@ -273,8 +289,10 @@ python "$PROJECT_DIR/scripts/pgmt/export_policy.py" \
 
 The runtime supplies proprioception, the reference motion window, root pose
 for reference velocity correction, and the local height grid. Build the input
-in metadata order and apply the recorded term clipping and scale. The graph
-applies the learned normalization. Convert its output with
+in metadata order and apply the recorded term clipping and scale. Use
+`terrain_scan.update_interval_control_steps` to hold the same height grid
+across policy steps, and refresh the grid on reset. The graph applies the
+learned normalization. Convert its output with
 `q_target = action_offset_rad + action_scale * action`, then apply any recorded
 target clipping. The offset is the saved default posture for the default T3_27
 training recipe, and `delta_action` indicates whether the target also depends on

@@ -50,6 +50,8 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
         self.normalize_during_warmup = self.options.collection.update_normalizer_during_warmup
         self.latest_metrics, self.terminal = {}, {}
         self._actor_scan = self._actor_scan_pose = None
+        self._actor_scan_phase = self._actor_scan_noise = None
+        self._actor_scan_zero_mask = None
         cfg = SuperMimicRunnerCfg(
             max_iterations=train_cfg["max_iterations"],
             save_interval=train_cfg["save_interval"],
@@ -162,8 +164,23 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
         self.policy, self.mdp, self.value = policy, mdp, value
         self.foot_rewards, self.analytic_foot = foot_rewards, analytic_foot
         scan_hz = cfg.get("actor_height_scan_hz")
+        scan_noise = cfg.get("actor_height_scan_noise_std_m", 0.0)
+        random_scan_phase = cfg.get("actor_height_scan_random_phase", False)
+        flat_zero_probability = cfg.get("actor_height_scan_flat_zero_probability", 0.0)
+        randomized_scan = scan_noise or random_scan_phase or flat_zero_probability
+        if scan_hz is None and randomized_scan:
+            raise ValueError("Actor heightscan randomization requires a refresh frequency")
         self.actor_height_scan = (
-            ActorHeightScan(scan_hz, native.step_dt, mdp.observation_layout["terrain"]) if scan_hz is not None else None
+            ActorHeightScan(
+                scan_hz,
+                native.step_dt,
+                mdp.observation_layout["terrain"],
+                scan_noise,
+                random_scan_phase,
+                flat_zero_probability,
+            )
+            if scan_hz is not None
+            else None
         )
         if self.actor_height_scan is not None and mdp.observation_terms["terrain"].noise is not None:
             raise ValueError("Actor heightscan replay requires a deterministic terrain observation")
@@ -178,6 +195,9 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
             actor_height_scan=self.actor_height_scan,
         )
         self.wm_env.sample_generator = self.generators["actor"]
+        if randomized_scan:
+            self.generators["actor_height_scan"] = torch.Generator(device=device).manual_seed(cfg["seed"] + 1_000_000)
+            self.wm_env.actor_scan_generator = self.generators["actor_height_scan"]
         self.policy_learner = self.policy_learner_type(
             policy,
             value,
@@ -202,6 +222,12 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
         if self.actor_height_scan is not None:
             contract["actor_height_scan_hz"] = self.train_cfg["actor_height_scan_hz"]
             contract["actor_height_scan_period_steps"] = self.actor_height_scan.period
+            if self.actor_height_scan.noise_std_m:
+                contract["actor_height_scan_noise_std_m"] = self.actor_height_scan.noise_std_m
+            if self.actor_height_scan.random_phase:
+                contract["actor_height_scan_random_phase"] = True
+            if self.actor_height_scan.flat_zero_probability:
+                contract["actor_height_scan_flat_zero_probability"] = self.actor_height_scan.flat_zero_probability
         return contract
 
     def _build_logger(self, **kwargs):
@@ -233,14 +259,37 @@ class PGMTSuperMimicRunner(SuperMimicRunner):
             return self.observation
         layout = self.mdp.state_layout
         pose = torch.cat((state[:, layout["position"]], yaw_angle(state[:, layout["rotation"]])[:, None]), dim=-1)
+        step = record["episode_step"]
         scan = self.observation[:, sampler.section]
+        phase, noise = 0, None
+        if sampler.random_phase:
+            draw = torch.randint(
+                sampler.period, step.shape, device=step.device, generator=self.generators["actor_height_scan"]
+            )
+            self._actor_scan_phase = (
+                draw if self._actor_scan_phase is None else torch.where(step == 0, draw, self._actor_scan_phase)
+            )
+            phase = self._actor_scan_phase
+            record["actor_scan_phase"] = ordinary(phase.to(torch.int32))
+        if sampler.noise_std_m:
+            noise = sampler.draw_noise(scan.shape, scan.device, self.generators["actor_height_scan"])
+            self._actor_scan_noise = (
+                noise if self._actor_scan_noise is None else sampler.hold(self._actor_scan_noise, noise, step, phase)
+            )
+            record["actor_scan_noise"] = ordinary(self._actor_scan_noise)
+        scan = sampler.add_noise(scan, noise)
         if self._actor_scan is None:
             self._actor_scan, self._actor_scan_pose = scan, pose
         else:
-            self._actor_scan = sampler.hold(self._actor_scan, scan, record["episode_step"])
-            self._actor_scan_pose = sampler.hold(self._actor_scan_pose, pose, record["episode_step"])
+            self._actor_scan = sampler.hold(self._actor_scan, scan, step, phase)
+            self._actor_scan_pose = sampler.hold(self._actor_scan_pose, pose, step, phase)
         record["actor_scan_pose"] = ordinary(self._actor_scan_pose)
-        return sampler.observation(self.observation, self._actor_scan)
+        if sampler.flat_zero_probability:
+            self._actor_scan_zero_mask = sampler.flat_zero_mask(
+                self._actor_scan_zero_mask, record["family"], step, self.generators["actor_height_scan"]
+            )
+            record["actor_scan_zero_mask"] = ordinary(self._actor_scan_zero_mask)
+        return sampler.observation(self.observation, self._actor_scan, self._actor_scan_zero_mask)
 
     @torch.inference_mode()
     def step(self):

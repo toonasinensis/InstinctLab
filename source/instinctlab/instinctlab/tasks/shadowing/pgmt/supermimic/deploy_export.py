@@ -283,7 +283,8 @@ def export_policy(checkpoint, output_dir, params_dir, weights):
     if saved.get("infos", {}).get("schema") != T3_SCHEMA or env.get("mdp_schema") != T3_SCHEMA:
         raise ValueError("Expected matching T3_27 heightscan checkpoint and environment schema")
     payload = saved["supermimic"]
-    policy_cfg = dict(payload["contract"]["policy"])
+    contract = payload["contract"]
+    policy_cfg = dict(contract["policy"])
     if payload["schema"] != SCHEMA or policy_cfg != agent["policy"] or policy_cfg.pop("class_name") != ACTOR_CLASS:
         raise ValueError("Expected the saved SuperMimic TerrainCNNActor configuration")
     if saved["scan187"]["scan"] != env["height_scan"]:
@@ -298,6 +299,20 @@ def export_policy(checkpoint, output_dir, params_dir, weights):
     scan_width = math.prod(scan_shape)
     width = non_terrain + scan_width
     observations = observation_metadata(env, names, scan_shape, non_terrain, step_s)
+    update_steps = contract.get("actor_height_scan_period_steps", 1)
+    if type(update_steps) is not int or update_steps < 1:
+        raise ValueError("Saved actor heightscan interval must be a positive number of control steps")
+    update_hz = 1.0 / (step_s * update_steps)
+    if not math.isclose(update_hz, contract.get("actor_height_scan_hz", update_hz)):
+        raise ValueError("Saved actor heightscan rate disagrees with the policy timestep and scan period")
+    observations["terrain_scan"].update(
+        update_frequency_hz=update_hz,
+        update_interval_control_steps=update_steps,
+        refresh_on_reset=True,
+        sample_and_hold_in_runtime=update_steps > 1,
+        training_noise_std_m=contract.get("actor_height_scan_noise_std_m", 0.0),
+        random_phase_on_reset_during_training=contract.get("actor_height_scan_random_phase", False),
+    )
     actor = TerrainCNNActor(len(names), **policy_cfg)
     state = (
         saved["scan187"]["actor_ema"]

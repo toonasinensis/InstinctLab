@@ -58,6 +58,9 @@ class T3_27HeightScanActorCfg(HeightScanActorCfg):
 class T3_27PGMTSuperMimicCfg(G1PGMTSuperMimicCfg):
     policy: T3_27HeightScanActorCfg = T3_27HeightScanActorCfg()
     actor_height_scan_hz: float | None = None
+    actor_height_scan_noise_std_m: float = 0.0
+    actor_height_scan_random_phase: bool = False
+    actor_height_scan_flat_zero_probability: float = 0.0
     foot_contact: dict = dict(asdict(ContactRewardCfg()), max_foot_vertices=32)
     experiment_name: str = "t3_27_pgmt_supermimic"
     run_name: str = "T3_27HeightScan"

@@ -46,7 +46,7 @@ class PGMTWorldModelEnv(MotionTrackingEnv):
         for _ in range(self.horizon):
             proprio.append(self.mdp.draw_noise(batch, self.mdp.proprio_widths, generator))
             observation.append(self.mdp.draw_noise(batch, self.mdp.observation_widths, generator))
-        return TensorDict(
+        inputs = TensorDict(
             dict(
                 data=TensorDict(data, batch_size=[]),
                 prev_action=data["previous_action"][:, 0],
@@ -57,6 +57,12 @@ class PGMTWorldModelEnv(MotionTrackingEnv):
             ),
             batch_size=[],
         )
+        sampler = self.actor_height_scan
+        if sampler is not None and sampler.noise_std_m:
+            inputs["actor_scan_rollout_noise"] = sampler.draw_noise(
+                (self.horizon, batch, self.mdp.observation_widths["terrain"]), self.device, self.actor_scan_generator
+            )
+        return inputs
 
     def features(self, state, history, support, context, ids, noise):
         obs, valid = self.mdp.observations(state, history, support, context, noise)
@@ -121,15 +127,21 @@ class PGMTWorldModelEnv(MotionTrackingEnv):
         self.feature_rows, self.states = [features], [self.state]
         self.actions, self.previous_actions, self.supports, self.logits = [], [], [], []
         self._rollout_step = 0
-        if self.actor_height_scan is not None:
+        sampler = self.actor_height_scan
+        if sampler is not None:
             pose = data["actor_scan_pose"][:, 0]
             held_scan, valid = self.mdp.heightfield.local(pose[:, :3], pose[:, 3])
             self.valid = self.valid & valid
             self._initial_episode_step = data["episode_step"][:, 0]
-            self._actor_scan = self.actor_height_scan.hold(
-                self.mdp.process_observation(held_scan, "terrain"),
-                self.observation[:, self.actor_height_scan.section],
+            self._actor_scan_phase = data["actor_scan_phase"][:, 0] if sampler.random_phase else 0
+            self._actor_scan_zero_mask = data["actor_scan_zero_mask"][:, 0] if sampler.flat_zero_probability else None
+            self._actor_scan_rollout_noise = inputs.get("actor_scan_rollout_noise")
+            noise = data["actor_scan_noise"][:, 0] if sampler.noise_std_m else None
+            self._actor_scan = sampler.hold(
+                sampler.add_noise(self.mdp.process_observation(held_scan, "terrain"), noise),
+                sampler.add_noise(self.observation[:, sampler.section], noise),
                 self._initial_episode_step,
+                self._actor_scan_phase,
             )
 
     def _unpack_initial_states(self, inputs):
@@ -139,7 +151,7 @@ class PGMTWorldModelEnv(MotionTrackingEnv):
     def get_observations(self):
         actor = self.observation
         if self.actor_height_scan is not None:
-            actor = self.actor_height_scan.observation(actor, self._actor_scan)
+            actor = self.actor_height_scan.observation(actor, self._actor_scan, self._actor_scan_zero_mask)
         return TensorDict(dict(actor=actor, critic=self.feature_rows[-1]), batch_size=[len(self.ids)])
 
     def _advance_history(self):
@@ -148,11 +160,14 @@ class PGMTWorldModelEnv(MotionTrackingEnv):
 
     def _compute_commands(self):
         self._rollout_step += 1
-        if self.actor_height_scan is not None:
-            self._actor_scan = self.actor_height_scan.hold(
+        sampler = self.actor_height_scan
+        if sampler is not None:
+            noise = self._actor_scan_rollout_noise[self._rollout_step - 1] if sampler.noise_std_m else None
+            self._actor_scan = sampler.hold(
                 self._actor_scan,
-                self.observation[:, self.actor_height_scan.section],
+                sampler.add_noise(self.observation[:, sampler.section], noise),
                 self._initial_episode_step + self._rollout_step,
+                self._actor_scan_phase,
             )
 
     def _step_extras(self):
